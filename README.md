@@ -32,6 +32,16 @@ CEO
 - A live tree in the terminal shows the org chart growing, each agent's
   narration, and the latest tool call per node. An event log under the tree
   shows decisions in order.
+- **Blockers are first-class.** Any agent (worker or manager) can call
+  `report_blocker(reason, needs, partial_progress)` instead of `complete`. The
+  parent receives a structured `{"status": "blocked", ...}` from
+  `await_results` and can choose to: rehire / fire-and-hire a different
+  subordinate, re-assign with new context, change scope — or escalate by
+  calling `report_blocker` themselves. If the CEO escalates, the main loop
+  pauses, surfaces the blocker, and prompts you for guidance. Your reply is
+  appended to the CEO's message history and the loop resumes — prior
+  subordinates and their state are still available, so the CEO can re-engage
+  them with the new info.
 
 ## Requirements
 

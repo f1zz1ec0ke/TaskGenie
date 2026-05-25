@@ -12,11 +12,13 @@ from rich.rule import Rule
 from taskgenie.agent import Agent
 from taskgenie.config import CONFIG
 from taskgenie.prompts import CEO_ROLE_PROMPT
+from taskgenie.result import RunResult
 from taskgenie.tui import TUI
 
+ABANDON_TOKENS = {"", "quit", "exit", "abandon", "stop"}
 
-async def _run(task: str) -> int:
-    console = Console()
+
+def _print_banner(console: Console) -> None:
     console.print(
         Panel.fit(
             f"[bold]Endpoint:[/] {CONFIG.base_url}\n"
@@ -28,24 +30,102 @@ async def _run(task: str) -> int:
         )
     )
 
-    ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
-    ceo_task = asyncio.create_task(ceo.run(task), name="ceo")
-    tui = TUI(task=task)
-    tui_task = asyncio.create_task(tui.run(stop_when=ceo_task), name="tui")
 
+def _print_blocker(console: Console, result: RunResult) -> None:
+    body = (
+        f"[bold]Reason:[/] {result.reason or '(none)'}\n\n"
+        f"[bold]Needs from you:[/] {result.needs or '(none)'}\n\n"
+        f"[bold]Partial progress:[/] {result.partial_progress or '(none reported)'}"
+    )
+    console.print(Rule(style="yellow"))
+    console.print(
+        Panel(
+            body,
+            title="[bold yellow]CEO is blocked — needs your input[/]",
+            border_style="yellow",
+        )
+    )
+
+
+def _read_unblock_input(console: Console) -> str | None:
+    console.print(
+        "[dim]Reply with guidance to resume, or empty/'abandon' to stop.[/]"
+    )
     try:
-        final = await ceo_task
-    except KeyboardInterrupt:
-        console.print("[yellow]interrupted[/]")
-        ceo_task.cancel()
-        await asyncio.gather(tui_task, return_exceptions=True)
-        return 130
+        response = console.input("[bold yellow]you > [/] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if response.lower() in ABANDON_TOKENS:
+        return None
+    return response
 
-    await tui_task
 
-    console.print(Rule(style="green"))
-    console.print(Panel(Markdown(final or "(no answer)"), title="Final answer", border_style="green"))
-    return 0
+async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
+    ceo_task = asyncio.create_task(ceo.run(message), name="ceo")
+    tui_task = asyncio.create_task(tui.run(stop_when=ceo_task), name="tui")
+    try:
+        result = await ceo_task
+    finally:
+        await tui_task
+    return result
+
+
+async def _run(task: str) -> int:
+    console = Console()
+    _print_banner(console)
+
+    ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
+    tui = TUI(task=task)
+    message = task
+
+    while True:
+        try:
+            result = await _run_session(ceo, tui, message)
+        except KeyboardInterrupt:
+            console.print("[yellow]interrupted[/]")
+            return 130
+
+        if result.kind == "done":
+            console.print(Rule(style="green"))
+            console.print(
+                Panel(
+                    Markdown(result.report or "(no answer)"),
+                    title="Final answer",
+                    border_style="green",
+                )
+            )
+            return 0
+
+        if result.kind == "blocked":
+            _print_blocker(console, result)
+            user_response = _read_unblock_input(console)
+            if user_response is None:
+                console.print("[yellow]Task abandoned.[/]")
+                console.print(
+                    Panel(
+                        result.partial_progress or "(no partial progress reported)",
+                        title="Partial progress",
+                        border_style="yellow",
+                    )
+                )
+                return 2
+            message = (
+                "USER UNBLOCK: " + user_response + "\n\n"
+                "Resume your work using your existing subordinates and memory. "
+                "You may hire new agents, rehire existing ones, or re-assign with "
+                "the new context. Call `complete` when you have the final answer."
+            )
+            continue
+
+        # exhausted / error
+        console.print(
+            Panel(
+                f"[red]{result.kind.upper()}[/]\n\n{result.error or '(no detail)'}",
+                title="Run ended",
+                border_style="red",
+            )
+        )
+        return 1
 
 
 def cli() -> None:

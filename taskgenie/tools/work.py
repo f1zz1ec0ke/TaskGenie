@@ -76,6 +76,37 @@ WORK_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_blocker",
+            "description": (
+                "Declare that you cannot complete your task and need help to proceed. Ends your run. "
+                "The blocker bubbles up to whoever assigned you. Use this when a tool you need "
+                "doesn't work, you lack information, or the task is impossible with your current "
+                "abilities. Do NOT fabricate results to avoid reporting a blocker — an honest "
+                "blocker is more valuable than a fake completion."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "What is blocking you? Be specific (e.g., 'brave_search returns 401 on every query', 'I need to run python but exec_code is stubbed').",
+                    },
+                    "needs": {
+                        "type": "string",
+                        "description": "What specifically would unblock you? (e.g., 'a working brave_search', 'sandboxed python execution', 'clarification on X').",
+                    },
+                    "partial_progress": {
+                        "type": "string",
+                        "description": "What you did manage to accomplish before getting stuck. Concrete findings, not narration.",
+                    },
+                },
+                "required": ["reason", "needs"],
+            },
+        },
+    },
 ]
 
 

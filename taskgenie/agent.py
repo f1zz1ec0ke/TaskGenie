@@ -9,11 +9,12 @@ from taskgenie.config import CONFIG
 from taskgenie.events import BUS, Event
 from taskgenie.llm import LLM
 from taskgenie.prompts import manager_prompt, worker_prompt
+from taskgenie.result import RunResult
 from taskgenie.tools import MANAGEMENT_TOOLS, WORK_TOOLS
 from taskgenie.tools.work import exec_code, read_file, scratch_for, write_file
 
 RoleType = Literal["ceo", "manager", "worker"]
-Status = Literal["idle", "working", "done", "fired", "exhausted", "error"]
+Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
 
 
 class Agent:
@@ -36,7 +37,7 @@ class Agent:
         self.children: list[Agent] = []
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         self.status: Status = "idle"
-        self.task_assignments: dict[str, asyncio.Task[str]] = {}
+        self.task_assignments: dict[str, asyncio.Task[RunResult]] = {}
         self.task_targets: dict[str, str] = {}
         self.scratch_dir = scratch_for(self.id)
         Agent.REGISTRY[self.id] = self
@@ -68,18 +69,18 @@ class Agent:
         self.status = status
         self._emit("state", status=status, **extra)
 
-    async def run(self, task: str) -> str:
+    async def run(self, task: str) -> RunResult:
         self.messages.append({"role": "user", "content": task})
         self._set_status("working", task=task)
 
         empty_turn_count = 0
-        for turn in range(CONFIG.max_turns_per_agent):
+        for _turn in range(CONFIG.max_turns_per_agent):
             try:
                 response = await LLM.chat(self.messages, tools=self.tools)
             except Exception as e:
                 self._set_status("error", error=str(e))
                 self._emit("error", message=f"LLM call failed: {e}")
-                return f"[ERROR] {self.name} failed: {e}"
+                return RunResult(kind="error", error=f"{self.name} LLM failure: {e}")
 
             content = response.get("content", "") or ""
             tool_calls = response.get("tool_calls", []) or []
@@ -93,13 +94,14 @@ class Agent:
                 if empty_turn_count >= 2:
                     self._set_status("done", report=content)
                     self._emit("complete", report=content)
-                    return content or "[no output]"
+                    return RunResult(kind="done", report=content or "[no output]")
                 self.messages.append(
                     {
                         "role": "user",
                         "content": (
                             "You did not call a tool. Continue your work by calling a tool, "
-                            "or call `complete` with your final report if you are done."
+                            "or call `complete` with your final report if you are done. "
+                            "If you cannot make progress, call `report_blocker`."
                         ),
                     }
                 )
@@ -124,13 +126,31 @@ class Agent:
                     report = args.get("report", content or "")
                     self._set_status("done", report=report)
                     self._emit("complete", report=report)
-                    return report
+                    return RunResult(kind="done", report=report)
+
+                if name == "report_blocker":
+                    reason = args.get("reason", "")
+                    needs = args.get("needs", "")
+                    partial = args.get("partial_progress", "")
+                    self._set_status("blocked", reason=reason, needs=needs)
+                    self._emit(
+                        "blocked",
+                        reason=reason,
+                        needs=needs,
+                        partial_progress=partial,
+                    )
+                    return RunResult(
+                        kind="blocked",
+                        reason=reason,
+                        needs=needs,
+                        partial_progress=partial,
+                    )
 
                 try:
                     result = await self._execute_tool(name, args)
                 except Exception as e:
                     result = f"[tool_error] {type(e).__name__}: {e}"
-                    self._emit("error", message=result)
+                    self._emit("error", message=str(result))
 
                 result_str = result if isinstance(result, str) else json.dumps(result)
                 self.messages.append(
@@ -139,7 +159,10 @@ class Agent:
                 self._emit("tool_result", tool=name, result=result_str)
 
         self._set_status("exhausted")
-        return f"[{self.name} exhausted turn limit of {CONFIG.max_turns_per_agent}]"
+        return RunResult(
+            kind="exhausted",
+            error=f"{self.name} exhausted turn limit of {CONFIG.max_turns_per_agent}",
+        )
 
     def _build_assistant_message(
         self, content: str, tool_calls: list[dict[str, Any]]
@@ -232,19 +255,23 @@ class Agent:
         )
         return {"task_handle": task_handle, "agent_id": agent_id, "agent_name": child.name}
 
-    async def _tool_await_results(self, task_handles: list[str]) -> dict[str, str]:
-        results: dict[str, str] = {}
+    async def _tool_await_results(self, task_handles: list[str]) -> dict[str, dict[str, Any]]:
+        results: dict[str, dict[str, Any]] = {}
         for h in task_handles:
             t = self.task_assignments.get(h)
             if not t:
-                results[h] = "[error] unknown task_handle"
+                results[h] = {"status": "error", "error": "unknown task_handle"}
                 continue
             try:
-                results[h] = await t
+                r = await t
+                results[h] = r.to_tool_payload() if isinstance(r, RunResult) else {
+                    "status": "done",
+                    "report": str(r),
+                }
             except asyncio.CancelledError:
-                results[h] = "[cancelled]"
+                results[h] = {"status": "cancelled"}
             except Exception as e:
-                results[h] = f"[error] {type(e).__name__}: {e}"
+                results[h] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         return results
 
     def _tool_review(self, task_handle: str, accepted: bool, feedback: str) -> str:

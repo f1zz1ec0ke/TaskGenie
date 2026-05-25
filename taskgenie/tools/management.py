@@ -153,4 +153,36 @@ MANAGEMENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_blocker",
+            "description": (
+                "Declare that you cannot complete your task and need help to proceed. Ends your run. "
+                "The blocker bubbles up to whoever assigned you. Your parent will either resolve it "
+                "(by re-scoping, rehiring, or hiring different subordinates) or escalate it further. "
+                "If the CEO calls this, the user is prompted to provide whatever is needed and your "
+                "work then resumes. Use this when you've genuinely exhausted your options — not for "
+                "minor friction. Do NOT fabricate results to avoid reporting a blocker."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "What is blocking you? Be specific (e.g., 'all my workers reported that the brave_search tool returns 401 errors').",
+                    },
+                    "needs": {
+                        "type": "string",
+                        "description": "What specifically would unblock you? (e.g., 'a working web-search tool', 'clarification on whether to include enterprise-only options', 'a code execution sandbox').",
+                    },
+                    "partial_progress": {
+                        "type": "string",
+                        "description": "What you accomplished before getting stuck. Helps your parent decide whether to keep your work or start fresh.",
+                    },
+                },
+                "required": ["reason", "needs"],
+            },
+        },
+    },
 ]

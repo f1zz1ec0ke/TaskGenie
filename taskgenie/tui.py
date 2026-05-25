@@ -15,6 +15,7 @@ STATUS_STYLE = {
     "idle": "dim",
     "working": "yellow",
     "done": "green",
+    "blocked": "bold orange1",
     "fired": "red strike",
     "exhausted": "magenta",
     "error": "red",
@@ -38,6 +39,8 @@ class AgentView:
         self.last_tool_args: dict[str, Any] = {}
         self.task: str = ""
         self.report: str = ""
+        self.blocker_reason: str = ""
+        self.blocker_needs: str = ""
         self.children_ids: list[str] = []
 
 
@@ -116,6 +119,15 @@ class TUI:
             view.report = data.get("report", "")
             view.status = "done"
             self._log(f"[green]{view.name} complete[/]")
+        elif kind == "blocked":
+            view.blocker_reason = data.get("reason", "")
+            view.blocker_needs = data.get("needs", "")
+            view.status = "blocked"
+            self._log(
+                f"[orange1]{view.name} BLOCKED[/] — "
+                f"{_trunc(view.blocker_reason, 70)} "
+                f"[dim](needs: {_trunc(view.blocker_needs, 50)})[/]"
+            )
         elif kind == "error":
             self._log(f"[red]error in {view.name}[/]: {_trunc(data.get('message', ''), 100)}")
 
@@ -157,6 +169,12 @@ class TUI:
         if v.report and v.status == "done":
             sub.append("\n  ⮑ ", style="green dim")
             sub.append(_trunc(v.report, 220), style="green")
+        if v.status == "blocked":
+            sub.append("\n  ! ", style="orange1 bold")
+            sub.append(_trunc(v.blocker_reason, 200), style="orange1")
+            if v.blocker_needs:
+                sub.append("\n  needs: ", style="orange1 dim")
+                sub.append(_trunc(v.blocker_needs, 200), style="orange1")
 
         node = parent_node.add(label + sub)
         for cid in v.children_ids:
