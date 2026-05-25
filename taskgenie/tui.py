@@ -72,6 +72,26 @@ class AgentView:
         self.last_activity: float = time.time()
 
 
+def _fmt_count(n: int) -> str:
+    """Compact integer: 1234 -> '1.2k', 84200 -> '84.2k', 1230000 -> '1.2M'."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
 class TUI:
     def __init__(self, task: str) -> None:
         self.task = task
@@ -80,6 +100,11 @@ class TUI:
         self.recent_events: list[str] = []
         self.focus_id: str | None = None
         self.console = Console(force_terminal=True, color_system="auto")
+        self.llm_calls: int = 0
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.tool_calls_total: int = 0
+        self.start_time: float = time.time()
 
     # ---- event handling ----------------------------------------------------
 
@@ -130,8 +155,13 @@ class TUI:
             args = data.get("args", {}) or {}
             view.last_tool = tool
             view.last_tool_args = args
+            self.tool_calls_total += 1
             self._log(f"[cyan]{view.name}[/] -> {tool}({_short_args(args)})")
             self._touch(view)
+        elif kind == "llm_call":
+            self.llm_calls += 1
+            self.prompt_tokens += int(data.get("prompt_tokens", 0) or 0)
+            self.completion_tokens += int(data.get("completion_tokens", 0) or 0)
         elif kind == "hire":
             self._log(
                 f"[green]{view.name}[/] hired [bold]{data.get('child_name')}[/] "
@@ -395,6 +425,55 @@ class TUI:
             border_style=style,
         )
 
+    def _build_header(self) -> Panel:
+        """One-line live status: agent counts, LLM calls, tokens, elapsed."""
+        counts: dict[str, int] = {}
+        for v in self.agents.values():
+            counts[v.status] = counts.get(v.status, 0) + 1
+        total = len(self.agents)
+        elapsed = time.time() - self.start_time
+
+        line = Text()
+        line.append(_trunc(self.task, 60), style="italic")
+        line.append("   ")
+        line.append("agents ", style="dim")
+        line.append(f"{total}", style="bold")
+        parts: list[tuple[str, str]] = []
+        if counts.get("working"):
+            parts.append((str(counts["working"]) + "w", "yellow"))
+        if counts.get("done"):
+            parts.append((str(counts["done"]) + "d", "green"))
+        if counts.get("blocked"):
+            parts.append((str(counts["blocked"]) + "b", "orange1"))
+        if counts.get("asking"):
+            parts.append((str(counts["asking"]) + "a", "cyan"))
+        if counts.get("exhausted"):
+            parts.append((str(counts["exhausted"]) + "x", "magenta"))
+        if counts.get("fired"):
+            parts.append((str(counts["fired"]) + "f", "red"))
+        if parts:
+            line.append(" (", style="dim")
+            for i, (text, style) in enumerate(parts):
+                if i:
+                    line.append(" ", style="dim")
+                line.append(text, style=style)
+            line.append(")", style="dim")
+        line.append("   ·   ", style="dim")
+        line.append("LLM ", style="dim")
+        line.append(f"{self.llm_calls}", style="bold")
+        line.append(" calls   ·   ", style="dim")
+        line.append("tok ", style="dim")
+        line.append(f"{_fmt_count(self.prompt_tokens)}↑", style="bold")
+        line.append("/", style="dim")
+        line.append(f"{_fmt_count(self.completion_tokens)}↓", style="bold")
+        line.append("   ·   ", style="dim")
+        line.append("tools ", style="dim")
+        line.append(f"{self.tool_calls_total}", style="bold")
+        line.append("   ·   ", style="dim")
+        line.append("elapsed ", style="dim")
+        line.append(_fmt_duration(elapsed), style="bold")
+        return Panel(line, border_style="cyan", title="TaskGenie")
+
     def _build_log(self) -> Panel:
         if not self.recent_events:
             body: Text = Text("(waiting for events)", style="dim italic")
@@ -403,12 +482,14 @@ class TUI:
         return Panel(body, title="event log", border_style="dim")
 
     def _render(self) -> Layout:
-        """2x2 grid:
+        """Header strip + 2x2 grid:
+            header (live counters)
             focus    | hierarchy
             active   | event log
         """
         layout = Layout()
         layout.split_column(
+            Layout(name="header", size=3),
             Layout(name="top", ratio=1),
             Layout(name="bottom", ratio=1),
         )
@@ -420,6 +501,7 @@ class TUI:
             Layout(name="active", ratio=1),
             Layout(name="log", ratio=1),
         )
+        layout["header"].update(self._build_header())
         layout["focus"].update(self._build_focus())
         layout["tree"].update(
             Panel(self._build_tree(), border_style="cyan", title="hierarchy")

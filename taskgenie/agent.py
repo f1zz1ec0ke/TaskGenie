@@ -185,6 +185,14 @@ class Agent:
                 self._emit("error", message=f"LLM call failed: {e}")
                 return RunResult(kind="error", error=f"{self.name} LLM failure: {e}")
 
+            usage = response.get("usage") or {}
+            self._emit(
+                "llm_call",
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                duration_ms=response.get("duration_ms", 0.0),
+            )
+
             content = response.get("content", "") or ""
             tool_calls = response.get("tool_calls", []) or []
             self.messages.append(self._build_assistant_message(content, tool_calls))
