@@ -270,15 +270,20 @@ class TUI:
         return tree
 
     def _add_node(self, parent_node: Tree, agent_id: str, now: float) -> None:
-        """Render a node and its descendants.
+        """Render the management skeleton + a spotlight worker per manager.
 
-        Two policies keep the tree from blowing up on big runs:
-          - Collapse: if a node is done AND all descendants are terminal,
-            render just the node with "(N done)" inline. No recursion.
-          - Cap: at most 6 expanded children per node, with active ones
-            preferred; any remainder shows as "+K more active / +M done"
-            footer lines. Keeps every top-level manager visible even when
-            one of them fans out to 20 workers.
+        Tree policy:
+          - Show CEO + every manager / sub-manager as expanded nodes.
+          - Summarise each agent's worker children inline on the parent's
+            label as "[Nw Md] workers" so all managers stay visible regardless
+            of fan-out.
+          - Under each manager, also expand ONE spotlight worker -- the most
+            recently active working one -- with their narration in quotes,
+            so the user can see WHICH worker is currently generating without
+            having to read the active panel. If no worker is currently
+            working under this manager, no spotlight line is added.
+          - Done subtrees with no active descendants collapse to one line
+            with "(N done)" inline.
         """
         v = self.agents[agent_id]
         label = self._agent_label(v, now)
@@ -290,32 +295,70 @@ class TUI:
             parent_node.add(label)
             return
 
-        done = [c for c in known_children if c.status in ("done", "fired")]
-        active = [c for c in known_children if c.status not in ("done", "fired")]
+        managers = [c for c in known_children if c.role_type in ("manager", "ceo")]
+        workers = [c for c in known_children if c.role_type == "worker"]
 
-        if v.status == "done" and not active:
-            summary = Text()
-            summary.append_text(label)
-            summary.append(f"  ({len(done)} done)", style="green dim")
-            parent_node.add(summary)
+        active_managers = [c for c in managers if c.status not in ("done", "fired")]
+        done_managers = [c for c in managers if c.status in ("done", "fired")]
+        active_workers = [c for c in workers if c.status not in ("done", "fired")]
+        done_workers = [c for c in workers if c.status in ("done", "fired")]
+        blocked_workers = [c for c in workers if c.status in ("blocked", "asking")]
+        working_workers = [c for c in workers if c.status == "working"]
+
+        # Collapse a fully-done subtree to one line.
+        if v.status == "done" and not active_managers and not active_workers:
+            collapsed = Text()
+            collapsed.append_text(label)
+            total_done = len(done_managers) + len(done_workers)
+            if total_done:
+                collapsed.append(f"  ({total_done} done)", style="green dim")
+            parent_node.add(collapsed)
             return
 
+        # Inline worker summary on this node's label.
+        if workers:
+            label.append("  ")
+            label.append("[", style="dim")
+            if active_workers:
+                label.append(f"{len(active_workers)}↻", style="yellow")
+            if blocked_workers:
+                if active_workers:
+                    label.append(" ", style="dim")
+                label.append(f"{len(blocked_workers)}!", style="orange1")
+            if done_workers:
+                if active_workers or blocked_workers:
+                    label.append(" ", style="dim")
+                label.append(f"{len(done_workers)}✓", style="green")
+            label.append(" workers]", style="dim")
+
         node = parent_node.add(label)
-        cap = 6
-        visible_active = active[:cap]
-        for child in visible_active:
+
+        # Spotlight: show the one worker most likely to be "currently
+        # generating" right now under this manager. Pick the working worker
+        # with the most recent last_activity so the line points at whoever's
+        # mid-tool-call or mid-narration, not a stale entry.
+        if working_workers:
+            spotlight = max(working_workers, key=lambda w: w.last_activity)
+            activity = spotlight.narration or spotlight.last_tool or ""
+            sline = Text()
+            sline.append(_spinner_char(now) + " ", style="yellow")
+            sline.append(spotlight.name, style="bold")
+            if activity:
+                sline.append("  ")
+                sline.append(_trunc(activity, 60), style="italic dim")
+            node.add(sline)
+
+        # Recurse into manager children. Cap to keep deep ragged trees
+        # bounded, but in practice the cap rarely triggers because managers
+        # don't fan out as wide as workers do.
+        cap = 10
+        ordered_managers = active_managers + done_managers
+        for child in ordered_managers[:cap]:
             self._add_node(node, child.id, now)
-        hidden_active = len(active) - len(visible_active)
-        if hidden_active > 0:
+        hidden = len(ordered_managers) - min(cap, len(ordered_managers))
+        if hidden > 0:
             node.add(
-                Text(
-                    f"…+{hidden_active} more active",
-                    style="yellow dim italic",
-                )
-            )
-        if done:
-            node.add(
-                Text(f"…+{len(done)} done", style="green dim italic")
+                Text(f"…+{hidden} more managers", style="dim italic")
             )
 
     def _agent_action_summary(self, v: "AgentView") -> Text:
