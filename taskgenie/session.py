@@ -1,0 +1,227 @@
+"""Persistence: snapshot a TaskGenie run to disk and resume it later.
+
+Conservative checkpointing: only saves at clean quiescent points (after the
+CEO's run loop returns). State is JSON for readability; the per-agent scratch
+directories live alongside.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import secrets
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from taskgenie.config import CONFIG
+from taskgenie.tools.registry import REGISTRY
+
+STATE_FILE = "state.json"
+EVENTS_FILE = "events.jsonl"
+
+
+def make_session_id(task: str) -> str:
+    date = _dt.date.today().isoformat()
+    words = re.findall(r"\w+", task.lower())[:6]
+    slug = "-".join(words)[:40] or "session"
+    suffix = secrets.token_hex(2)
+    return f"{date}-{slug}-{suffix}"
+
+
+@dataclass
+class HistoryEntry:
+    kind: str  # "task" | "blocker" | "unblock" | "done" | "abandoned"
+    ts: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
+    text: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SessionData:
+    session_id: str
+    task: str
+    started_at: str
+    last_saved_at: str
+    status: str  # "running" | "blocked" | "done" | "abandoned" | "error"
+    ceo_id: str | None
+    agents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    history: list[dict[str, Any]] = field(default_factory=list)
+    tool_signature: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def add_history(self, entry: HistoryEntry) -> None:
+        self.history.append(asdict(entry))
+
+
+class Session:
+    """One TaskGenie session on disk. Owns the state.json + scratch dirs + event log."""
+
+    def __init__(self, data: SessionData) -> None:
+        self.data = data
+
+    @property
+    def session_id(self) -> str:
+        return self.data.session_id
+
+    @property
+    def root_dir(self) -> Path:
+        return CONFIG.sessions_dir / self.session_id
+
+    @property
+    def state_path(self) -> Path:
+        return self.root_dir / STATE_FILE
+
+    @property
+    def events_path(self) -> Path:
+        return self.root_dir / EVENTS_FILE
+
+    @property
+    def scratch_root(self) -> Path:
+        return self.root_dir / "scratch"
+
+    @classmethod
+    def create(cls, task: str) -> "Session":
+        session_id = make_session_id(task)
+        now = _dt.datetime.now().isoformat(timespec="seconds")
+        data = SessionData(
+            session_id=session_id,
+            task=task,
+            started_at=now,
+            last_saved_at=now,
+            status="running",
+            ceo_id=None,
+        )
+        data.add_history(HistoryEntry(kind="task", text=task))
+        session = cls(data)
+        session.root_dir.mkdir(parents=True, exist_ok=True)
+        session.scratch_root.mkdir(parents=True, exist_ok=True)
+        return session
+
+    @classmethod
+    def load(cls, session_id: str) -> "Session":
+        path = CONFIG.sessions_dir / session_id / STATE_FILE
+        if not path.exists():
+            raise FileNotFoundError(f"no session: {session_id}")
+        raw = json.loads(path.read_text())
+        data = SessionData(**raw)
+        return cls(data)
+
+    @classmethod
+    def load_latest(cls) -> "Session | None":
+        sessions = cls.list_all()
+        if not sessions:
+            return None
+        return cls.load(sessions[0]["session_id"])
+
+    @classmethod
+    def list_all(cls) -> list[dict[str, Any]]:
+        root = CONFIG.sessions_dir
+        if not root.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for sub in root.iterdir():
+            state = sub / STATE_FILE
+            if not state.exists():
+                continue
+            try:
+                d = json.loads(state.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            rows.append(
+                {
+                    "session_id": d.get("session_id", sub.name),
+                    "task": d.get("task", ""),
+                    "started_at": d.get("started_at", ""),
+                    "last_saved_at": d.get("last_saved_at", ""),
+                    "status": d.get("status", "?"),
+                }
+            )
+        rows.sort(key=lambda r: r["last_saved_at"], reverse=True)
+        return rows
+
+    def save(self) -> None:
+        self.data.last_saved_at = _dt.datetime.now().isoformat(timespec="seconds")
+        self.data.tool_signature = {
+            "management": REGISTRY.signature("management"),
+            "work": REGISTRY.signature("work"),
+        }
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic write.
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=self.root_dir,
+            prefix=".state-",
+            suffix=".json.tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            json.dump(asdict(self.data), tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = tmp.name
+        os.replace(tmp_path, self.state_path)
+
+    def snapshot_agents(self, agents: dict[str, dict[str, Any]]) -> None:
+        self.data.agents = agents
+
+    def set_ceo(self, ceo_id: str) -> None:
+        self.data.ceo_id = ceo_id
+
+    def mark_blocked(self, blocker_payload: dict[str, Any]) -> None:
+        self.data.status = "blocked"
+        self.data.add_history(HistoryEntry(kind="blocker", payload=blocker_payload))
+
+    def mark_unblock(self, user_response: str) -> None:
+        self.data.status = "running"
+        self.data.add_history(HistoryEntry(kind="unblock", text=user_response))
+
+    def mark_done(self, report: str) -> None:
+        self.data.status = "done"
+        self.data.add_history(HistoryEntry(kind="done", text=report))
+
+    def mark_abandoned(self) -> None:
+        self.data.status = "abandoned"
+        self.data.add_history(HistoryEntry(kind="abandoned"))
+
+    def mark_error(self, error: str) -> None:
+        self.data.status = "error"
+        self.data.add_history(HistoryEntry(kind="error", text=error))
+
+    def diff_tools_against(
+        self,
+        current_mgmt: dict[str, str],
+        current_work: dict[str, str],
+    ) -> str | None:
+        """Compare a current tool signature against the one stored at save time.
+        Returns a short human-readable summary, or None if nothing changed."""
+        saved_mgmt = self.data.tool_signature.get("management", {})
+        saved_work = self.data.tool_signature.get("work", {})
+
+        def diff(saved: dict[str, str], current: dict[str, str]) -> list[str]:
+            lines: list[str] = []
+            saved_keys = set(saved)
+            current_keys = set(current)
+            for name in sorted(current_keys - saved_keys):
+                lines.append(f"  + {name} (new since last run)")
+            for name in sorted(saved_keys - current_keys):
+                lines.append(f"  - {name} (removed since last run)")
+            for name in sorted(saved_keys & current_keys):
+                if saved[name] != current[name]:
+                    lines.append(f"  ~ {name} (updated since last run)")
+            return lines
+
+        mgmt_diff = diff(saved_mgmt, current_mgmt)
+        work_diff = diff(saved_work, current_work)
+        if not mgmt_diff and not work_diff:
+            return None
+
+        out = ["Tool changes since this session was paused:"]
+        if mgmt_diff:
+            out.append("Management tools:")
+            out.extend(mgmt_diff)
+        if work_diff:
+            out.append("Worker tools:")
+            out.extend(work_diff)
+        return "\n".join(out)

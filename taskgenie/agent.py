@@ -10,8 +10,8 @@ from taskgenie.events import BUS, Event
 from taskgenie.llm import LLM
 from taskgenie.prompts import manager_prompt, worker_prompt
 from taskgenie.result import RunResult
-from taskgenie.tools import MANAGEMENT_TOOLS, WORK_TOOLS
-from taskgenie.tools.work import exec_code, read_file, scratch_for, write_file
+from taskgenie.tools import REGISTRY
+from taskgenie.tools.work import scratch_for
 
 RoleType = Literal["ceo", "manager", "worker"]
 Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
@@ -19,6 +19,9 @@ Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "er
 
 class Agent:
     REGISTRY: dict[str, "Agent"] = {}
+    # Optional scratch root injected by the active session; if None, falls back
+    # to CONFIG.scratch_dir-derived behaviour.
+    SCRATCH_ROOT: str | None = None
 
     def __init__(
         self,
@@ -27,8 +30,9 @@ class Agent:
         system_prompt: str,
         parent: "Agent | None" = None,
         depth: int = 0,
+        agent_id: str | None = None,
     ) -> None:
-        self.id = f"{name}-{uuid.uuid4().hex[:6]}"
+        self.id = agent_id or f"{name}-{uuid.uuid4().hex[:6]}"
         self.name = name
         self.role_type: RoleType = role_type
         self.system_prompt = system_prompt
@@ -39,7 +43,9 @@ class Agent:
         self.status: Status = "idle"
         self.task_assignments: dict[str, asyncio.Task[RunResult]] = {}
         self.task_targets: dict[str, str] = {}
-        self.scratch_dir = scratch_for(self.id)
+        self.blocker_reason: str = ""
+        self.blocker_needs: str = ""
+        self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
         Agent.REGISTRY[self.id] = self
         BUS.publish(
             Event(
@@ -56,11 +62,102 @@ class Agent:
             )
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role_type": self.role_type,
+            "system_prompt": self.system_prompt,
+            "parent_id": self.parent.id if self.parent else None,
+            "child_ids": [c.id for c in self.children],
+            "depth": self.depth,
+            "status": self.status,
+            "messages": self.messages,
+            "scratch_dir": self.scratch_dir,
+            "blocker_reason": self.blocker_reason,
+            "blocker_needs": self.blocker_needs,
+        }
+
+    @classmethod
+    def _rehydrate_one(cls, d: dict[str, Any]) -> "Agent":
+        agent = cls.__new__(cls)
+        agent.id = d["id"]
+        agent.name = d["name"]
+        agent.role_type = d["role_type"]
+        agent.system_prompt = d["system_prompt"]
+        agent.parent = None  # patched by bulk_load
+        agent.depth = d["depth"]
+        agent.children = []  # patched by bulk_load
+        agent.messages = d["messages"]
+        agent.status = d["status"]
+        agent.task_assignments = {}
+        agent.task_targets = {}
+        agent.blocker_reason = d.get("blocker_reason", "")
+        agent.blocker_needs = d.get("blocker_needs", "")
+        agent.scratch_dir = d["scratch_dir"]
+        cls.REGISTRY[agent.id] = agent
+        return agent
+
+    @classmethod
+    def bulk_load(cls, agents: dict[str, dict[str, Any]]) -> None:
+        """Rehydrate a previously-saved set of agents into REGISTRY.
+        Resets REGISTRY first so a fresh process starts clean."""
+        cls.REGISTRY.clear()
+        # Two passes: instantiate all, then patch parent/child links so order
+        # doesn't matter.
+        for d in agents.values():
+            cls._rehydrate_one(d)
+        for d in agents.values():
+            agent = cls.REGISTRY[d["id"]]
+            parent_id = d.get("parent_id")
+            if parent_id:
+                agent.parent = cls.REGISTRY.get(parent_id)
+            agent.children = [
+                cls.REGISTRY[cid] for cid in d.get("child_ids", []) if cid in cls.REGISTRY
+            ]
+            # Re-emit a spawn event so any subscriber (e.g. a TUI bootstrapping
+            # from the bus) can paint the rehydrated tree.
+            BUS.publish(
+                Event(
+                    "spawn",
+                    agent.id,
+                    agent.name,
+                    data={
+                        "role_type": agent.role_type,
+                        "parent_id": agent.parent.id if agent.parent else None,
+                        "parent_name": agent.parent.name if agent.parent else None,
+                        "depth": agent.depth,
+                        "system_prompt": agent.system_prompt,
+                    },
+                )
+            )
+            BUS.publish(
+                Event(
+                    "state",
+                    agent.id,
+                    agent.name,
+                    data={"status": agent.status},
+                )
+            )
+            if agent.status == "blocked":
+                BUS.publish(
+                    Event(
+                        "blocked",
+                        agent.id,
+                        agent.name,
+                        data={
+                            "reason": agent.blocker_reason,
+                            "needs": agent.blocker_needs,
+                            "partial_progress": "",
+                        },
+                    )
+                )
+
     @property
     def tools(self) -> list[dict[str, Any]]:
         if self.role_type == "worker":
-            return WORK_TOOLS
-        return MANAGEMENT_TOOLS
+            return REGISTRY.work_tools()
+        return REGISTRY.management_tools()
 
     def _emit(self, kind: str, **data: Any) -> None:
         BUS.publish(Event(kind, self.id, self.name, data=data))  # type: ignore[arg-type]
@@ -132,6 +229,8 @@ class Agent:
                     reason = args.get("reason", "")
                     needs = args.get("needs", "")
                     partial = args.get("partial_progress", "")
+                    self.blocker_reason = reason
+                    self.blocker_needs = needs
                     self._set_status("blocked", reason=reason, needs=needs)
                     self._emit(
                         "blocked",
@@ -192,12 +291,9 @@ class Agent:
             return self._tool_rehire(**args)
         if name == "fire":
             return self._tool_fire(**args)
-        if name == "read_file":
-            return read_file(self.scratch_dir, args["path"])
-        if name == "write_file":
-            return write_file(self.scratch_dir, args["path"], args["content"])
-        if name == "exec_code":
-            return exec_code(args["language"], args["code"])
+        dispatcher = REGISTRY.dispatcher(name)
+        if dispatcher is not None:
+            return await dispatcher(self, args)
         return f"[unknown_tool] {name}"
 
     def _tool_hire(self, name: str, role_type: str, role_prompt: str) -> dict[str, Any]:
@@ -241,6 +337,13 @@ class Agent:
             return {"error": child}
         if child.status == "fired":
             return {"error": f"{child.name} was fired and cannot be assigned tasks"}
+        if child.status == "working":
+            return {
+                "error": (
+                    f"{child.name} is already running another task. "
+                    "Call `await_results` on the existing task_handle before re-assigning."
+                )
+            }
 
         task_handle = f"task-{uuid.uuid4().hex[:6]}"
         coro_task = asyncio.create_task(child.run(task), name=task_handle)

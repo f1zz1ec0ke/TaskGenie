@@ -39,6 +39,12 @@ class EventBus:
         self._subscribers.append(q)
         return q
 
+    def unsubscribe(self, q: asyncio.Queue[Event]) -> None:
+        try:
+            self._subscribers.remove(q)
+        except ValueError:
+            pass
+
     def publish(self, event: Event) -> None:
         for q in self._subscribers:
             q.put_nowait(event)
