@@ -399,28 +399,32 @@ class TUI:
         if not self.recent_events:
             body = Text("(waiting for events)", style="dim italic")
         else:
-            body = Text("\n".join(self.recent_events[-10:]))
+            body = Text("\n".join(self.recent_events[-20:]))
         return Panel(body, title="event log", border_style="dim")
 
     def _render(self) -> Layout:
+        """2x2 grid:
+            focus    | hierarchy
+            active   | event log
+        """
         layout = Layout()
         layout.split_column(
-            Layout(name="main", ratio=3),
-            Layout(name="log", size=10),
+            Layout(name="top", ratio=1),
+            Layout(name="bottom", ratio=1),
         )
-        layout["main"].split_row(
-            Layout(name="tree", ratio=3),
-            Layout(name="right", ratio=3),
+        layout["top"].split_row(
+            Layout(name="focus", ratio=1),
+            Layout(name="tree", ratio=1),
         )
-        layout["right"].split_column(
-            Layout(name="active", ratio=2),
-            Layout(name="focus", ratio=2),
+        layout["bottom"].split_row(
+            Layout(name="active", ratio=1),
+            Layout(name="log", ratio=1),
         )
+        layout["focus"].update(self._build_focus())
         layout["tree"].update(
             Panel(self._build_tree(), border_style="cyan", title="hierarchy")
         )
         layout["active"].update(self._build_active_panel())
-        layout["focus"].update(self._build_focus())
         layout["log"].update(self._build_log())
         return layout
 
