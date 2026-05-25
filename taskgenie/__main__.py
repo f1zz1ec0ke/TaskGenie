@@ -14,6 +14,7 @@ from rich.table import Table
 from taskgenie.agent import Agent
 from taskgenie.config import CONFIG
 from taskgenie.event_logger import JSONLEventLogger
+from taskgenie import stats as stats_module
 from taskgenie.mcp_client import MCPClient
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
@@ -79,6 +80,21 @@ def _snapshot(session: Session, ceo: Agent) -> None:
     session.save()
 
 
+async def _render_stats_panel(
+    console: Console,
+    session: Session,
+    ceo: Agent,
+    logger: JSONLEventLogger | None,
+) -> None:
+    if logger is not None:
+        await logger.drain()
+    try:
+        stats = stats_module.compute(session.events_path, ceo_id=ceo.id)
+    except Exception:
+        return
+    console.print(stats_module.render_panel(stats))
+
+
 async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
     ceo_task = asyncio.create_task(ceo.run(message), name="ceo")
     tui_task = asyncio.create_task(tui.run(stop_when=ceo_task), name="tui")
@@ -110,6 +126,7 @@ async def _drive_session(
     ceo: Agent,
     tui: TUI,
     first_message: str,
+    logger: JSONLEventLogger | None = None,
 ) -> int:
     message = first_message
     while True:
@@ -132,6 +149,7 @@ async def _drive_session(
                     border_style="green",
                 )
             )
+            await _render_stats_panel(console, session, ceo, logger)
             console.print(
                 f"[dim]Session saved as[/] [bold]{session.session_id}[/]"
             )
@@ -197,7 +215,7 @@ async def _run_new(task: str) -> int:
         _print_banner(console, session, mcp)
         ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
         tui = TUI(task=task)
-        return await _drive_session(console, session, mcp, ceo, tui, task)
+        return await _drive_session(console, session, mcp, ceo, tui, task, logger)
     finally:
         if logger is not None:
             await logger.stop()
@@ -262,7 +280,7 @@ async def _run_resume(session_id: str | None) -> int:
         message = _build_unblock_message(user_response, tool_diff)
 
         tui = TUI(task=session.data.task)
-        return await _drive_session(console, session, mcp, ceo, tui, message)
+        return await _drive_session(console, session, mcp, ceo, tui, message, logger)
     finally:
         if logger is not None:
             await logger.stop()

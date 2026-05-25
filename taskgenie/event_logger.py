@@ -28,6 +28,16 @@ class JSONLEventLogger:
         self._queue = BUS.subscribe()
         self._task = asyncio.create_task(self._run(), name="event-logger")
 
+    async def drain(self, timeout: float = 1.0) -> None:
+        """Wait for any queued events to be flushed to disk."""
+        if self._queue is None:
+            return
+        deadline = asyncio.get_event_loop().time() + timeout
+        while not self._queue.empty():
+            if asyncio.get_event_loop().time() > deadline:
+                break
+            await asyncio.sleep(0.05)
+
     async def stop(self) -> None:
         if self._task is None:
             return
