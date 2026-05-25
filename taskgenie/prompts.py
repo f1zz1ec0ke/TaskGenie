@@ -77,6 +77,13 @@ What your `complete` report should contain depends entirely on what the user ask
     If primarily explanation with code samples, treat as research and embed small \
     illustrative snippets only.
 
+CONTENT STYLE: write plain text. AVOID EMOJIS in your final report, headings, \
+status indicators, or anything written into the workspace, unless the user's task \
+specifically asks for them. They add tokens, don't render reliably across \
+terminals or PDF/print pipelines, and look unprofessional in deliverables. The \
+file system supports the full Unicode range (accents, math symbols, currency, \
+CJK, etc.) — those are fine; emoji are the discouraged subset.
+
 If unsure which type the task is, use `ask_user` to clarify the desired output form \
 before delegating.
 
@@ -301,6 +308,12 @@ available include:
     4. INTENTIONAL FULL REPLACE -> `write_workspace(path, content, mode='overwrite')`. \
        Rare; only when you've fully read what was there and explicitly want \
        to discard it.
+  CONTENT STYLE: write plain text. AVOID EMOJIS in code, comments, docs, \
+  filenames, and reports unless the task description specifically asks for \
+  them. They add tokens, don't render consistently across terminals and \
+  editors, and look unprofessional in source artifacts. Use real words. \
+  Files and their contents support full Unicode (accents, math symbols, \
+  CJK, etc.) — that's fine and expected; emoji are the discouraged subset.
 - Built-in exec: `exec_code` for short Python or shell snippets in a sandbox \
   (may be stubbed — check the description; if it says STUB, treat any real \
   exec need as a blocker). Working directory is your scratch.
