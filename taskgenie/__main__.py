@@ -30,6 +30,7 @@ ABANDON_TOKENS = {"", "quit", "exit", "abandon", "stop"}
 def _print_banner(console: Console, session: Session, mcp: MCPClient) -> None:
     lines = [
         f"[bold]Session:[/] {session.session_id}",
+        f"[bold]Workspace:[/] {session.workspace_dir}",
         f"[bold]Endpoint:[/] {CONFIG.base_url}",
         f"[bold]Model:[/] {CONFIG.model or '(auto-detect)'}",
         f"[bold]Max depth:[/] {CONFIG.max_depth}",
@@ -169,6 +170,28 @@ def _build_answer_message(user_answer: str) -> str:
     )
 
 
+def _print_workspace_panel(console: Console, session: Session) -> None:
+    """If the team produced real files, show a tree of what's in the workspace."""
+    base = session.workspace_dir
+    if not base.exists():
+        return
+    files = sorted(p for p in base.rglob("*") if p.is_file())
+    if not files:
+        return
+    lines = [f"[bold]Workspace:[/] {base}", ""]
+    for p in files:
+        rel = p.relative_to(base)
+        size = p.stat().st_size
+        lines.append(f"  [cyan]{rel}[/]  [dim]({size} bytes)[/]")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"Deliverables ({len(files)} files)",
+            border_style="green",
+        )
+    )
+
+
 async def _compute_stats_for_artifact(
     session: Session, ceo: Agent, logger: JSONLEventLogger | None
 ) -> dict | None:
@@ -213,6 +236,7 @@ async def _drive_session(
                 )
             )
             await _render_stats_panel(console, session, ceo, logger)
+            _print_workspace_panel(console, session)
             stats_dict = await _compute_stats_for_artifact(session, ceo, logger)
             try:
                 paths = write_final(
@@ -311,6 +335,8 @@ async def _run_new(task: str, extra_output: Path | None = None) -> int:
     try:
         session = Session.create(task)
         Agent.SCRATCH_ROOT = str(session.scratch_root)
+        Agent.WORKSPACE_ROOT = str(session.workspace_dir)
+        session.workspace_dir.mkdir(parents=True, exist_ok=True)
         logger = JSONLEventLogger(session.events_path)
         logger.start()
         _print_banner(console, session, mcp)
@@ -342,6 +368,8 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             )
 
         Agent.SCRATCH_ROOT = str(session.scratch_root)
+        Agent.WORKSPACE_ROOT = str(session.workspace_dir)
+        session.workspace_dir.mkdir(parents=True, exist_ok=True)
         logger = JSONLEventLogger(session.events_path)
         logger.start()
         Agent.bulk_load(session.data.agents)

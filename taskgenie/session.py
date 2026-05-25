@@ -81,6 +81,14 @@ class Session:
     def scratch_root(self) -> Path:
         return self.root_dir / "scratch"
 
+    @property
+    def workspace_dir(self) -> Path:
+        """The shared, deliverable-style file directory for this session.
+        Workers write actual artifacts (code, docs, art) here so the CEO
+        can point the user at real files instead of inlining everything
+        into a markdown report."""
+        return self.root_dir / "workspace"
+
     @classmethod
     def create(cls, task: str) -> "Session":
         session_id = make_session_id(task)
@@ -97,6 +105,7 @@ class Session:
         session = cls(data)
         session.root_dir.mkdir(parents=True, exist_ok=True)
         session.scratch_root.mkdir(parents=True, exist_ok=True)
+        session.workspace_dir.mkdir(parents=True, exist_ok=True)
         return session
 
     @classmethod

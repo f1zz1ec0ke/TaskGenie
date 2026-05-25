@@ -22,6 +22,10 @@ class Agent:
     # Optional scratch root injected by the active session; if None, falls back
     # to CONFIG.scratch_dir-derived behaviour.
     SCRATCH_ROOT: str | None = None
+    # Shared workspace for deliverable-style artifacts (code, docs, etc.).
+    # Workers write here via write_workspace; everyone can read via
+    # read_workspace / list_workspace.
+    WORKSPACE_ROOT: str | None = None
 
     def __init__(
         self,
@@ -47,6 +51,7 @@ class Agent:
         self.blocker_needs: str = ""
         self.follow_ups: list[dict[str, Any]] = []
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
+        self.workspace_dir = Agent.WORKSPACE_ROOT
         Agent.REGISTRY[self.id] = self
         BUS.publish(
             Event(
@@ -98,6 +103,7 @@ class Agent:
         agent.blocker_needs = d.get("blocker_needs", "")
         agent.follow_ups = d.get("follow_ups", [])
         agent.scratch_dir = d["scratch_dir"]
+        agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
         return agent
 
