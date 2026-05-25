@@ -245,6 +245,75 @@ class TUI:
         for cid in v.children_ids:
             self._add_node(node, cid, now)
 
+    def _agent_action_summary(self, v: "AgentView") -> Text:
+        """One-line current-action summary for the active panel."""
+        text = Text()
+        if v.status == "blocked":
+            text.append("⚠ ", style="orange1 bold")
+            text.append(_trunc(v.blocker_reason or "blocked", 30), style="orange1")
+        elif v.status == "asking":
+            text.append("? ", style="cyan bold")
+            text.append(_trunc(v.question or "asking user", 30), style="cyan")
+        elif v.last_tool:
+            text.append(v.last_tool, style="cyan bold")
+            if v.last_tool_args:
+                short = _short_args(v.last_tool_args)
+                text.append(f"({_trunc(short, 28)})", style="dim")
+        elif v.narration:
+            text.append(f"“{_trunc(v.narration, 34)}”", style="italic dim")
+        else:
+            text.append("(starting up)", style="dim")
+        return text
+
+    def _build_active_panel(self) -> Panel:
+        """All currently-active (not idle/done/fired) agents in one place.
+
+        Sorts deepest-first so workers (who actually do visible work) lead
+        instead of being drowned out by orchestrating managers.
+        """
+        now = time.time()
+        active = [
+            v for v in self.agents.values()
+            if v.status in ("working", "blocked", "asking", "exhausted")
+        ]
+        # Count summary for the title.
+        counts: dict[str, int] = {}
+        for v in active:
+            counts[v.status] = counts.get(v.status, 0) + 1
+        title_bits = [f"{counts[k]}{k[0]}" for k in ("working", "blocked", "asking", "exhausted") if counts.get(k)]
+        title = "active" + (f" ({' '.join(title_bits)})" if title_bits else "")
+
+        if not active:
+            return Panel(
+                Text("(no active agents)", style="dim italic"),
+                title=title,
+                border_style="dim",
+            )
+
+        active.sort(key=lambda v: (-v.depth, -v.last_activity))
+        cap = 14
+        lines: list[Any] = []
+        for v in active[:cap]:
+            style = STATUS_STYLE.get(v.status, "white")
+            line = Text()
+            if v.status == "working":
+                line.append(_spinner_char(now) + " ", style=style)
+            else:
+                line.append("● ", style=style)
+            role_tag = {"ceo": "C", "manager": "M", "worker": "W"}.get(v.role_type, "?")
+            line.append(f"[{role_tag}] ", style="dim")
+            indent = "  " * min(v.depth, 4)
+            line.append(f"{indent}{v.name}", style="bold")
+            line.append("  ", style="dim")
+            line.append_text(self._agent_action_summary(v))
+            lines.append(line)
+        if len(active) > cap:
+            lines.append(
+                Text(f"  …and {len(active) - cap} more active", style="dim italic")
+            )
+
+        return Panel(Group(*lines), title=title, border_style="yellow")
+
     def _build_focus(self) -> Panel:
         if not self.focus_id or self.focus_id not in self.agents:
             return Panel(
@@ -330,20 +399,27 @@ class TUI:
         if not self.recent_events:
             body = Text("(waiting for events)", style="dim italic")
         else:
-            body = Text("\n".join(self.recent_events[-12:]))
+            body = Text("\n".join(self.recent_events[-10:]))
         return Panel(body, title="event log", border_style="dim")
 
     def _render(self) -> Layout:
         layout = Layout()
         layout.split_column(
             Layout(name="main", ratio=3),
-            Layout(name="log", size=14),
+            Layout(name="log", size=10),
         )
         layout["main"].split_row(
-            Layout(name="tree", ratio=2),
-            Layout(name="focus", ratio=1),
+            Layout(name="tree", ratio=3),
+            Layout(name="right", ratio=3),
         )
-        layout["tree"].update(Panel(self._build_tree(), border_style="cyan"))
+        layout["right"].split_column(
+            Layout(name="active", ratio=2),
+            Layout(name="focus", ratio=2),
+        )
+        layout["tree"].update(
+            Panel(self._build_tree(), border_style="cyan", title="hierarchy")
+        )
+        layout["active"].update(self._build_active_panel())
         layout["focus"].update(self._build_focus())
         layout["log"].update(self._build_log())
         return layout
@@ -352,14 +428,19 @@ class TUI:
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         q = BUS.subscribe()
+        # Alt-screen mode prevents flicker when the layout outgrows the
+        # terminal height; fall back to inline mode when stdout isn't a tty
+        # (tests, CI capture, piped output).
+        use_screen = bool(getattr(self.console, "is_terminal", False))
         try:
             with Live(
                 self._render(),
                 console=self.console,
-                refresh_per_second=12,
-                screen=False,
+                refresh_per_second=8,
+                screen=use_screen,
                 redirect_stdout=False,
                 redirect_stderr=False,
+                vertical_overflow="crop",
             ) as live:
                 while True:
                     try:
