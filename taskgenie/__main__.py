@@ -5,6 +5,7 @@ import asyncio
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -16,6 +17,7 @@ from taskgenie.agent import Agent
 from taskgenie.artifacts import write_final
 from taskgenie.config import CONFIG
 from taskgenie.event_logger import JSONLEventLogger
+from taskgenie.events import BUS, Event
 from taskgenie import stats as stats_module
 from taskgenie.mcp_client import MCPClient
 from taskgenie.prompts import CEO_ROLE_PROMPT
@@ -148,6 +150,99 @@ async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
     return result
 
 
+FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset"}
+
+
+def _read_followup_input(console: Console) -> str | None:
+    """Prompt the user for a follow-up task or slash command after CEO
+    completes a turn. Returns None on EOF/Ctrl+C/empty input."""
+    console.print(
+        "[dim]Type a follow-up task, or one of: "
+        "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/][/]"
+    )
+    try:
+        response = console.input("[bold cyan]you > [/] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return response or None
+
+
+def _build_followup_message(user_text: str) -> str:
+    return (
+        f"USER FOLLOW-UP: {user_text}\n\n"
+        "The team you previously hired and the workspace files all persist. "
+        "Decide whether to re-assign existing managers (they keep their "
+        "memory of what they built), hire new managers/workers for new "
+        "facets of this follow-up, or `fire` and replace if a previous "
+        "role is now wrong. Call `list_workspace` first if you need to "
+        "see what's currently in the project before deciding. "
+        "Call `complete` when this follow-up is addressed."
+    )
+
+
+def _reset_team(session: Session, ceo: Agent, console: Console) -> int:
+    """Fire every subordinate (recursively), but keep the CEO and the
+    workspace files. The CEO is told the team is gone; the next user
+    task is effectively a fresh start with the existing workspace as
+    context."""
+    fired_count = 0
+    for agent in list(Agent.REGISTRY.values()):
+        if agent.id == ceo.id:
+            continue
+        if agent.status != "fired":
+            agent.status = "fired"
+            BUS.publish(
+                Event("state", agent.id, agent.name, data={"status": "fired"})
+            )
+            fired_count += 1
+    ceo.children = []
+    ceo.task_assignments = {}
+    ceo.task_targets = {}
+    ceo.messages.append(
+        {
+            "role": "user",
+            "content": (
+                "USER COMMAND: /reset. Your previous team has been disbanded. "
+                "The workspace files persist (call `list_workspace` to see). "
+                "Treat the next task as a fresh start, but the workspace is "
+                "available as context."
+            ),
+        }
+    )
+    session.mark_reset(fired_count)
+    console.print(
+        f"[yellow]/reset:[/] fired {fired_count} subordinate agents. "
+        "Workspace preserved."
+    )
+    return fired_count
+
+
+async def _print_status_panel(
+    console: Console, session: Session, ceo: Agent, logger: JSONLEventLogger | None
+) -> None:
+    """Show the current agent tree + stats without giving a new task."""
+    from rich.tree import Tree as RTree
+
+    if ceo.id not in Agent.REGISTRY:
+        console.print("[red]CEO is no longer in the registry.[/]")
+        return
+    root_label = f"[bold]{ceo.name}[/] [dim]{ceo.role_type}/{ceo.status}[/]"
+    rtree = RTree(root_label)
+
+    def _walk(parent_node: Any, agent: Agent) -> None:
+        for child in agent.children:
+            label = (
+                f"[bold]{child.name}[/]  "
+                f"[dim]{child.role_type}/{child.status}[/]"
+            )
+            node = parent_node.add(label)
+            _walk(node, child)
+
+    _walk(rtree, ceo)
+    console.print(Panel(rtree, title="Current hierarchy", border_style="cyan"))
+    await _render_stats_panel(console, session, ceo, logger)
+
+
 def _build_unblock_message(user_response: str, tool_diff: str | None) -> str:
     parts = ["USER UNBLOCK: " + user_response]
     if tool_diff:
@@ -235,6 +330,7 @@ async def _drive_session(
     extra_output: Path | None = None,
 ) -> int:
     message = first_message
+    last_followup: str | None = None
     while True:
         try:
             result = await _run_session(ceo, tui, message)
@@ -280,7 +376,49 @@ async def _drive_session(
             console.print(
                 f"[dim]Session saved as[/] [bold]{session.session_id}[/]"
             )
-            return 0
+
+            # Follow-up loop. Stay until user types /done or sends EOF.
+            next_followup: str | None = None
+            while next_followup is None:
+                console.print(Rule(style="cyan"))
+                raw = _read_followup_input(console)
+                if raw is None or raw == "/done":
+                    console.print(
+                        f"[dim]Resume any time with[/] "
+                        f"[cyan]taskgenie --resume {session.session_id}[/]"
+                    )
+                    return 0
+                if raw == "/status":
+                    await _print_status_panel(console, session, ceo, logger)
+                    continue
+                if raw == "/retry":
+                    if last_followup is None:
+                        console.print(
+                            "[yellow]No previous follow-up to retry.[/]"
+                        )
+                        continue
+                    console.print(
+                        f"[dim]/retry — replaying:[/] {last_followup}"
+                    )
+                    next_followup = last_followup
+                    break
+                if raw == "/reset":
+                    _reset_team(session, ceo, console)
+                    _snapshot(session, ceo)
+                    continue  # back to prompt; next non-command input is the fresh task
+                if raw.startswith("/"):
+                    console.print(
+                        f"[yellow]Unknown command:[/] {raw}. "
+                        f"Try {', '.join(sorted(FOLLOWUP_COMMANDS))}."
+                    )
+                    continue
+                next_followup = raw
+
+            last_followup = next_followup
+            session.mark_followup(next_followup)
+            _snapshot(session, ceo)
+            message = _build_followup_message(next_followup)
+            continue
 
         if result.kind == "question":
             session.mark_question(
@@ -411,7 +549,8 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
         if tool_diff:
             console.print(Panel(tool_diff, title="Tool changes", border_style="cyan"))
 
-        # Was this session paused on a question, a blocker, or neither?
+        # Was this session paused on a question / blocker, or completed
+        # (and we're resuming to give a follow-up)?
         last_pause = next(
             (
                 h for h in reversed(session.data.history)
@@ -436,6 +575,24 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                 return 0
             session.mark_answer(user_answer)
             message = _build_answer_message(user_answer)
+        elif session.data.status == "done":
+            # Session previously completed -- resume into a follow-up turn
+            # rather than the blocker-style "what unblocks you?" prompt.
+            console.print(
+                Panel(
+                    f"[bold]Last answer:[/] this session was last marked done. "
+                    "Give a follow-up task to extend or refine the work, or "
+                    "type [cyan]/done[/] to leave it as-is.",
+                    title="Session was completed",
+                    border_style="green",
+                )
+            )
+            followup = _read_followup_input(console)
+            if followup is None or followup == "/done":
+                console.print("[dim]Nothing changed.[/]")
+                return 0
+            session.mark_followup(followup)
+            message = _build_followup_message(followup)
         else:
             if last_pause and last_pause["kind"] == "blocker":
                 payload = last_pause.get("payload", {})

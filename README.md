@@ -132,6 +132,32 @@ hiring sub-agents in real time, and any mid-task questions the CEO
 asks. Ctrl+C at any time saves state — `--resume` picks up exactly
 where you left off.
 
+### Interactive follow-ups
+
+When the CEO completes, you stay in the session and can give
+follow-up tasks. The CEO's team and the workspace files persist
+between turns:
+
+```
+> Anything else? (/done /status /retry /reset, or a follow-up task)
+you > make the level harder, double the ball pit count
+```
+
+The CEO sees the workspace, decides whether to re-assign existing
+managers (they remember what they built) or hire new ones, and
+returns when the follow-up is done. Artifacts (`final.md`,
+`README.md` in the project dir) regenerate after every turn so the
+latest state is always on disk.
+
+Slash commands:
+
+| command | what it does |
+|---|---|
+| `/done` | end the session cleanly. `--resume` can revive it later. |
+| `/status` | print the current agent tree + stats without giving a new task. |
+| `/retry` | replay your previous follow-up unchanged (e.g. if the team got something wrong). |
+| `/reset` | fire every subordinate agent (workspace files persist). Treat the next task as a fresh start with the existing workspace as context. |
+
 ## Where files land
 
 After a run named `Build a physics game`:
