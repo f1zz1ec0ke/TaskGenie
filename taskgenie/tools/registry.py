@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any, Awaitable, Callable, Literal
 
-ToolKind = Literal["management", "work", "both"]
+ToolKind = Literal["management", "work", "both", "ceo"]
 
 # A dispatcher receives (agent, args) and returns a result (str or jsonable).
 # Workers' tools just need `args`, but for symmetry every dispatcher gets the
@@ -69,6 +69,8 @@ class ToolRegistry:
         kinds: set[str]
         if kind == "both":
             kinds = {"management", "work"}
+        elif kind == "ceo":
+            kinds = {"ceo"}
         else:
             kinds = {kind}
         self._kinds[name] = kinds
@@ -89,6 +91,9 @@ class ToolRegistry:
     def work_tools(self) -> list[dict[str, Any]]:
         return [t for n, t in self._tools.items() if "work" in self._kinds[n]]
 
+    def ceo_only_tools(self) -> list[dict[str, Any]]:
+        return [t for n, t in self._tools.items() if "ceo" in self._kinds[n]]
+
     def get(self, name: str) -> dict[str, Any] | None:
         return self._tools.get(name)
 
@@ -98,9 +103,14 @@ class ToolRegistry:
     def is_intercepted(self, name: str) -> bool:
         return name in self._intercepted
 
-    def signature(self, kind: Literal["management", "work"]) -> dict[str, str]:
+    def signature(self, kind: Literal["management", "work", "ceo"]) -> dict[str, str]:
         """A {name: schema_hash} mapping used for resume-time diffs."""
-        tools = self.management_tools() if kind == "management" else self.work_tools()
+        if kind == "management":
+            tools = self.management_tools()
+        elif kind == "work":
+            tools = self.work_tools()
+        else:
+            tools = self.ceo_only_tools()
         return {t["function"]["name"]: t["function"]["schema_hash"] for t in tools}
 
     def describe_tool(self, name: str) -> str:

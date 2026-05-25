@@ -22,6 +22,10 @@ class Agent:
     # Optional scratch root injected by the active session; if None, falls back
     # to CONFIG.scratch_dir-derived behaviour.
     SCRATCH_ROOT: str | None = None
+    # Shared workspace for deliverable-style artifacts (code, docs, etc.).
+    # Workers write here via write_workspace; everyone can read via
+    # read_workspace / list_workspace.
+    WORKSPACE_ROOT: str | None = None
 
     def __init__(
         self,
@@ -45,7 +49,9 @@ class Agent:
         self.task_targets: dict[str, str] = {}
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
+        self.follow_ups: list[dict[str, Any]] = []
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
+        self.workspace_dir = Agent.WORKSPACE_ROOT
         Agent.REGISTRY[self.id] = self
         BUS.publish(
             Event(
@@ -76,6 +82,7 @@ class Agent:
             "scratch_dir": self.scratch_dir,
             "blocker_reason": self.blocker_reason,
             "blocker_needs": self.blocker_needs,
+            "follow_ups": self.follow_ups,
         }
 
     @classmethod
@@ -94,7 +101,9 @@ class Agent:
         agent.task_targets = {}
         agent.blocker_reason = d.get("blocker_reason", "")
         agent.blocker_needs = d.get("blocker_needs", "")
+        agent.follow_ups = d.get("follow_ups", [])
         agent.scratch_dir = d["scratch_dir"]
+        agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
         return agent
 
@@ -157,7 +166,10 @@ class Agent:
     def tools(self) -> list[dict[str, Any]]:
         if self.role_type == "worker":
             return REGISTRY.work_tools()
-        return REGISTRY.management_tools()
+        tools = list(REGISTRY.management_tools())
+        if self.role_type == "ceo":
+            tools.extend(REGISTRY.ceo_only_tools())
+        return tools
 
     def _emit(self, kind: str, **data: Any) -> None:
         BUS.publish(Event(kind, self.id, self.name, data=data))  # type: ignore[arg-type]
@@ -178,6 +190,14 @@ class Agent:
                 self._set_status("error", error=str(e))
                 self._emit("error", message=f"LLM call failed: {e}")
                 return RunResult(kind="error", error=f"{self.name} LLM failure: {e}")
+
+            usage = response.get("usage") or {}
+            self._emit(
+                "llm_call",
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                duration_ms=response.get("duration_ms", 0.0),
+            )
 
             content = response.get("content", "") or ""
             tool_calls = response.get("tool_calls", []) or []
@@ -223,7 +243,9 @@ class Agent:
                     report = args.get("report", content or "")
                     self._set_status("done", report=report)
                     self._emit("complete", report=report)
-                    return RunResult(kind="done", report=report)
+                    return RunResult(
+                        kind="done", report=report, follow_ups=list(self.follow_ups)
+                    )
 
                 if name == "report_blocker":
                     reason = args.get("reason", "")
@@ -243,7 +265,48 @@ class Agent:
                         reason=reason,
                         needs=needs,
                         partial_progress=partial,
+                        follow_ups=list(self.follow_ups),
                     )
+
+                if name == "ask_user":
+                    question = args.get("question", "")
+                    options = args.get("options", []) or []
+                    qctx = args.get("context", "")
+                    self._set_status("blocked", question=question)
+                    self._emit(
+                        "question",
+                        question=question,
+                        options=options,
+                        context=qctx,
+                    )
+                    return RunResult(
+                        kind="question",
+                        question=question,
+                        options=list(options),
+                        context=qctx,
+                        follow_ups=list(self.follow_ups),
+                    )
+
+                if name == "suggest_follow_up":
+                    entry = {
+                        "what": args.get("what_is_needed", ""),
+                        "rationale": args.get("rationale", ""),
+                        "who": args.get("who_should_do_it", ""),
+                    }
+                    self.follow_ups.append(entry)
+                    self._emit("follow_up_suggested", **entry)
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": (
+                                f"Follow-up recorded: {entry['what']}. "
+                                "It will be passed to your parent when you complete. "
+                                "Keep working on your assigned task."
+                            ),
+                        }
+                    )
+                    continue
 
                 try:
                     result = await self._execute_tool(name, args)

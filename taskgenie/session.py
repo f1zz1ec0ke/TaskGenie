@@ -81,6 +81,14 @@ class Session:
     def scratch_root(self) -> Path:
         return self.root_dir / "scratch"
 
+    @property
+    def workspace_dir(self) -> Path:
+        """The shared, deliverable-style file directory for this session.
+        Workers write actual artifacts (code, docs, art) here so the CEO
+        can point the user at real files instead of inlining everything
+        into a markdown report."""
+        return self.root_dir / "workspace"
+
     @classmethod
     def create(cls, task: str) -> "Session":
         session_id = make_session_id(task)
@@ -97,6 +105,7 @@ class Session:
         session = cls(data)
         session.root_dir.mkdir(parents=True, exist_ok=True)
         session.scratch_root.mkdir(parents=True, exist_ok=True)
+        session.workspace_dir.mkdir(parents=True, exist_ok=True)
         return session
 
     @classmethod
@@ -176,6 +185,14 @@ class Session:
     def mark_unblock(self, user_response: str) -> None:
         self.data.status = "running"
         self.data.add_history(HistoryEntry(kind="unblock", text=user_response))
+
+    def mark_question(self, question_payload: dict[str, Any]) -> None:
+        self.data.status = "asking"
+        self.data.add_history(HistoryEntry(kind="question", payload=question_payload))
+
+    def mark_answer(self, user_answer: str) -> None:
+        self.data.status = "running"
+        self.data.add_history(HistoryEntry(kind="answer", text=user_answer))
 
     def mark_done(self, report: str) -> None:
         self.data.status = "done"

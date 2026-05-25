@@ -54,6 +54,69 @@ _WRITE_FILE_SCHEMA = {
     },
 }
 
+_READ_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "read_workspace",
+        "description": (
+            "Read a file from the SHARED WORKSPACE. The workspace is where the team's "
+            "deliverable artifacts live -- code, docs, art, anything the user will keep. "
+            "Use this to verify what other agents have produced, or to extend an existing "
+            "file. Distinct from `read_file` (your private scratch)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root.",
+                }
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+_WRITE_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "write_workspace",
+        "description": (
+            "Write a file into the SHARED WORKSPACE -- the directory of REAL deliverables "
+            "the user will end up with (e.g. game.py, index.html, README.md, assets/...). "
+            "Workers use this when the task is producing software, documents, art, or any "
+            "file artifact. Creates parent directories as needed; overwrites if exists. "
+            "Distinct from `write_file` (your private scratch for intermediate work). "
+            "Use scratch for thinking, workspace for shipping."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root, e.g. 'src/game.py' or 'README.md'.",
+                },
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+_LIST_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "list_workspace",
+        "description": (
+            "List every file currently in the shared workspace, with byte sizes. Use this "
+            "to discover what teammates have produced, to verify a subordinate actually "
+            "delivered files (not just claimed to in their report), or to plan how a new "
+            "file should fit alongside the existing ones."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 _EXEC_CODE_SCHEMA = {
     "type": "function",
     "function": {
@@ -99,6 +162,48 @@ async def _write_file(agent: Any, args: dict[str, Any]) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(args["content"])
     return f"wrote {len(args['content'])} chars to {args['path']}"
+
+
+def _workspace_or_error(agent: Any) -> Path | str:
+    if not getattr(agent, "workspace_dir", None):
+        return "ERROR: workspace is not configured for this session"
+    base = Path(agent.workspace_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+async def _read_workspace(agent: Any, args: dict[str, Any]) -> str:
+    base = _workspace_or_error(agent)
+    if isinstance(base, str):
+        return base
+    p = _safe_path(str(base), args["path"])
+    if not p.exists():
+        return f"ERROR: file does not exist in workspace: {args['path']}"
+    return p.read_text()
+
+
+async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
+    base = _workspace_or_error(agent)
+    if isinstance(base, str):
+        return base
+    p = _safe_path(str(base), args["path"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(args["content"])
+    return f"wrote {len(args['content'])} chars to workspace/{args['path']}"
+
+
+async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
+    base = _workspace_or_error(agent)
+    if isinstance(base, str):
+        return base
+    files = sorted(p for p in base.rglob("*") if p.is_file())
+    if not files:
+        return "(workspace is empty)"
+    lines = [f"workspace root: {base}"]
+    for p in files:
+        rel = p.relative_to(base)
+        lines.append(f"  {rel}  ({p.stat().st_size} bytes)")
+    return "\n".join(lines)
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -185,6 +290,11 @@ def register_builtin_work_tools() -> None:
     REGISTRY.register(_READ_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_read_file)
     REGISTRY.register(_WRITE_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_write_file)
     REGISTRY.register(_EXEC_CODE_SCHEMA, kind="work", version="0.1", dispatcher=_exec_code)
+    # Workspace is shared across all agents in a session: workers write to it,
+    # managers and CEO read it to verify deliverables.
+    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_write_workspace)
+    REGISTRY.register(_READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace)
+    REGISTRY.register(_LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace)
 
 
 register_builtin_work_tools()

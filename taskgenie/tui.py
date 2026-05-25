@@ -18,6 +18,7 @@ STATUS_STYLE = {
     "working": "yellow",
     "done": "green",
     "blocked": "bold orange1",
+    "asking": "bold cyan",
     "fired": "red strike",
     "exhausted": "magenta",
     "error": "red",
@@ -62,9 +63,33 @@ class AgentView:
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
         self.partial_progress: str = ""
+        self.follow_ups: list[dict[str, str]] = []
+        self.question: str = ""
+        self.question_options: list[str] = []
+        self.question_context: str = ""
         self.children_ids: list[str] = []
         self.spawn_time: float = time.time()
         self.last_activity: float = time.time()
+
+
+def _fmt_count(n: int) -> str:
+    """Compact integer: 1234 -> '1.2k', 84200 -> '84.2k', 1230000 -> '1.2M'."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
 
 
 class TUI:
@@ -75,6 +100,11 @@ class TUI:
         self.recent_events: list[str] = []
         self.focus_id: str | None = None
         self.console = Console(force_terminal=True, color_system="auto")
+        self.llm_calls: int = 0
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.tool_calls_total: int = 0
+        self.start_time: float = time.time()
 
     # ---- event handling ----------------------------------------------------
 
@@ -125,8 +155,13 @@ class TUI:
             args = data.get("args", {}) or {}
             view.last_tool = tool
             view.last_tool_args = args
+            self.tool_calls_total += 1
             self._log(f"[cyan]{view.name}[/] -> {tool}({_short_args(args)})")
             self._touch(view)
+        elif kind == "llm_call":
+            self.llm_calls += 1
+            self.prompt_tokens += int(data.get("prompt_tokens", 0) or 0)
+            self.completion_tokens += int(data.get("completion_tokens", 0) or 0)
         elif kind == "hire":
             self._log(
                 f"[green]{view.name}[/] hired [bold]{data.get('child_name')}[/] "
@@ -156,6 +191,19 @@ class TUI:
             view.status = "done"
             self._log(f"[green]{view.name} complete[/]")
             self._touch(view)
+        elif kind == "follow_up_suggested":
+            view.follow_ups.append(
+                {
+                    "what": data.get("what", ""),
+                    "rationale": data.get("rationale", ""),
+                    "who": data.get("who", ""),
+                }
+            )
+            self._log(
+                f"[magenta]{view.name} ↑ follow-up[/]: "
+                f"{_trunc(data.get('what', ''), 80)}"
+            )
+            self._touch(view)
         elif kind == "blocked":
             view.blocker_reason = data.get("reason", "")
             view.blocker_needs = data.get("needs", "")
@@ -165,6 +213,16 @@ class TUI:
                 f"[orange1]{view.name} BLOCKED[/] -- "
                 f"{_trunc(view.blocker_reason, 70)} "
                 f"[dim](needs: {_trunc(view.blocker_needs, 50)})[/]"
+            )
+            self._touch(view)
+        elif kind == "question":
+            view.question = data.get("question", "")
+            view.question_options = list(data.get("options", []) or [])
+            view.question_context = data.get("context", "")
+            view.status = "asking"
+            self._log(
+                f"[cyan]{view.name} ASKING USER[/]: "
+                f"{_trunc(view.question, 90)}"
             )
             self._touch(view)
         elif kind == "error":
@@ -196,6 +254,8 @@ class TUI:
 
         label.append(f"  {view.role_type}/", style="dim")
         label.append(view.status, style=style)
+        if view.follow_ups:
+            label.append(f"  +{len(view.follow_ups)}", style="magenta")
         return label
 
     def _build_tree(self) -> Tree:
@@ -214,6 +274,75 @@ class TUI:
         node = parent_node.add(self._agent_label(v, now))
         for cid in v.children_ids:
             self._add_node(node, cid, now)
+
+    def _agent_action_summary(self, v: "AgentView") -> Text:
+        """One-line current-action summary for the active panel."""
+        text = Text()
+        if v.status == "blocked":
+            text.append("⚠ ", style="orange1 bold")
+            text.append(_trunc(v.blocker_reason or "blocked", 30), style="orange1")
+        elif v.status == "asking":
+            text.append("? ", style="cyan bold")
+            text.append(_trunc(v.question or "asking user", 30), style="cyan")
+        elif v.last_tool:
+            text.append(v.last_tool, style="cyan bold")
+            if v.last_tool_args:
+                short = _short_args(v.last_tool_args)
+                text.append(f"({_trunc(short, 28)})", style="dim")
+        elif v.narration:
+            text.append(f"“{_trunc(v.narration, 34)}”", style="italic dim")
+        else:
+            text.append("(starting up)", style="dim")
+        return text
+
+    def _build_active_panel(self) -> Panel:
+        """All currently-active (not idle/done/fired) agents in one place.
+
+        Sorts deepest-first so workers (who actually do visible work) lead
+        instead of being drowned out by orchestrating managers.
+        """
+        now = time.time()
+        active = [
+            v for v in self.agents.values()
+            if v.status in ("working", "blocked", "asking", "exhausted")
+        ]
+        # Count summary for the title.
+        counts: dict[str, int] = {}
+        for v in active:
+            counts[v.status] = counts.get(v.status, 0) + 1
+        title_bits = [f"{counts[k]}{k[0]}" for k in ("working", "blocked", "asking", "exhausted") if counts.get(k)]
+        title = "active" + (f" ({' '.join(title_bits)})" if title_bits else "")
+
+        if not active:
+            return Panel(
+                Text("(no active agents)", style="dim italic"),
+                title=title,
+                border_style="dim",
+            )
+
+        active.sort(key=lambda v: (-v.depth, -v.last_activity))
+        cap = 14
+        lines: list[Any] = []
+        for v in active[:cap]:
+            style = STATUS_STYLE.get(v.status, "white")
+            line = Text()
+            if v.status == "working":
+                line.append(_spinner_char(now) + " ", style=style)
+            else:
+                line.append("● ", style=style)
+            role_tag = {"ceo": "C", "manager": "M", "worker": "W"}.get(v.role_type, "?")
+            line.append(f"[{role_tag}] ", style="dim")
+            indent = "  " * min(v.depth, 4)
+            line.append(f"{indent}{v.name}", style="bold")
+            line.append("  ", style="dim")
+            line.append_text(self._agent_action_summary(v))
+            lines.append(line)
+        if len(active) > cap:
+            lines.append(
+                Text(f"  …and {len(active) - cap} more active", style="dim italic")
+            )
+
+        return Panel(Group(*lines), title=title, border_style="yellow")
 
     def _build_focus(self) -> Panel:
         if not self.focus_id or self.focus_id not in self.agents:
@@ -257,9 +386,38 @@ class TUI:
             if v.partial_progress:
                 body_parts.append(Text(f"partial: {v.partial_progress}", style="orange1 dim"))
 
+        if v.status == "asking" or v.question:
+            body_parts.append(Text("QUESTION FOR USER", style="bold cyan"))
+            body_parts.append(Text(v.question, style="cyan"))
+            if v.question_context:
+                body_parts.append(
+                    Text(f"context: {_trunc(v.question_context, 400)}", style="cyan dim")
+                )
+            if v.question_options:
+                body_parts.append(Text("options:", style="cyan dim"))
+                for i, opt in enumerate(v.question_options, 1):
+                    body_parts.append(Text(f"  {i}. {opt}", style="cyan"))
+
         if v.status == "done" and v.report:
             body_parts.append(Text("report:", style="green dim"))
             body_parts.append(Text(_trunc(v.report, 800), style="green"))
+
+        if v.follow_ups:
+            body_parts.append(Text(""))
+            body_parts.append(
+                Text(f"follow-ups suggested ({len(v.follow_ups)}):", style="magenta dim")
+            )
+            for i, fu in enumerate(v.follow_ups[:5], 1):
+                line = Text()
+                line.append(f"  {i}. ", style="magenta dim")
+                line.append(_trunc(fu.get("what", ""), 90), style="magenta")
+                if fu.get("rationale"):
+                    line.append(f" -- {_trunc(fu['rationale'], 60)}", style="magenta dim")
+                body_parts.append(line)
+            if len(v.follow_ups) > 5:
+                body_parts.append(
+                    Text(f"  ... and {len(v.follow_ups) - 5} more", style="magenta dim")
+                )
 
         return Panel(
             Group(*body_parts),
@@ -267,25 +425,88 @@ class TUI:
             border_style=style,
         )
 
+    def _build_header(self) -> Panel:
+        """One-line live status: agent counts, LLM calls, tokens, elapsed."""
+        counts: dict[str, int] = {}
+        for v in self.agents.values():
+            counts[v.status] = counts.get(v.status, 0) + 1
+        total = len(self.agents)
+        elapsed = time.time() - self.start_time
+
+        line = Text()
+        line.append(_trunc(self.task, 60), style="italic")
+        line.append("   ")
+        line.append("agents ", style="dim")
+        line.append(f"{total}", style="bold")
+        parts: list[tuple[str, str]] = []
+        if counts.get("working"):
+            parts.append((str(counts["working"]) + "w", "yellow"))
+        if counts.get("done"):
+            parts.append((str(counts["done"]) + "d", "green"))
+        if counts.get("blocked"):
+            parts.append((str(counts["blocked"]) + "b", "orange1"))
+        if counts.get("asking"):
+            parts.append((str(counts["asking"]) + "a", "cyan"))
+        if counts.get("exhausted"):
+            parts.append((str(counts["exhausted"]) + "x", "magenta"))
+        if counts.get("fired"):
+            parts.append((str(counts["fired"]) + "f", "red"))
+        if parts:
+            line.append(" (", style="dim")
+            for i, (text, style) in enumerate(parts):
+                if i:
+                    line.append(" ", style="dim")
+                line.append(text, style=style)
+            line.append(")", style="dim")
+        line.append("   ·   ", style="dim")
+        line.append("LLM ", style="dim")
+        line.append(f"{self.llm_calls}", style="bold")
+        line.append(" calls   ·   ", style="dim")
+        line.append("tok ", style="dim")
+        line.append(f"{_fmt_count(self.prompt_tokens)}↑", style="bold")
+        line.append("/", style="dim")
+        line.append(f"{_fmt_count(self.completion_tokens)}↓", style="bold")
+        line.append("   ·   ", style="dim")
+        line.append("tools ", style="dim")
+        line.append(f"{self.tool_calls_total}", style="bold")
+        line.append("   ·   ", style="dim")
+        line.append("elapsed ", style="dim")
+        line.append(_fmt_duration(elapsed), style="bold")
+        return Panel(line, border_style="cyan", title="TaskGenie")
+
     def _build_log(self) -> Panel:
         if not self.recent_events:
-            body = Text("(waiting for events)", style="dim italic")
+            body: Text = Text("(waiting for events)", style="dim italic")
         else:
-            body = Text("\n".join(self.recent_events[-12:]))
+            body = Text.from_markup("\n".join(self.recent_events[-20:]))
         return Panel(body, title="event log", border_style="dim")
 
     def _render(self) -> Layout:
+        """Header strip + 2x2 grid:
+            header (live counters)
+            focus    | hierarchy
+            active   | event log
+        """
         layout = Layout()
         layout.split_column(
-            Layout(name="main", ratio=3),
-            Layout(name="log", size=14),
+            Layout(name="header", size=3),
+            Layout(name="top", ratio=1),
+            Layout(name="bottom", ratio=1),
         )
-        layout["main"].split_row(
-            Layout(name="tree", ratio=2),
+        layout["top"].split_row(
             Layout(name="focus", ratio=1),
+            Layout(name="tree", ratio=1),
         )
-        layout["tree"].update(Panel(self._build_tree(), border_style="cyan"))
+        layout["bottom"].split_row(
+            Layout(name="active", ratio=1),
+            Layout(name="log", ratio=1),
+        )
+        layout["header"].update(self._build_header())
         layout["focus"].update(self._build_focus())
+        layout["tree"].update(
+            Panel(self._build_tree(), border_style="cyan", title="hierarchy")
+        )
+        layout["active"].update(self._build_active_panel())
         layout["log"].update(self._build_log())
         return layout
 
@@ -293,14 +514,19 @@ class TUI:
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         q = BUS.subscribe()
+        # Alt-screen mode prevents flicker when the layout outgrows the
+        # terminal height; fall back to inline mode when stdout isn't a tty
+        # (tests, CI capture, piped output).
+        use_screen = bool(getattr(self.console, "is_terminal", False))
         try:
             with Live(
                 self._render(),
                 console=self.console,
-                refresh_per_second=12,
-                screen=False,
+                refresh_per_second=8,
+                screen=use_screen,
                 redirect_stdout=False,
                 redirect_stderr=False,
+                vertical_overflow="crop",
             ) as live:
                 while True:
                     try:

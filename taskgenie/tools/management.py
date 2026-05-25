@@ -201,6 +201,77 @@ _REPORT_BLOCKER_SCHEMA = {
     },
 }
 
+_ASK_USER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": (
+            "Pause your run and ask the user a question. Ends your run; the user is "
+            "prompted, and once they answer your work resumes with their reply appended "
+            "to your history. Use this when guessing wrong would invalidate significant "
+            "downstream work — output format, audience, scope ambiguity, choice between "
+            "two reasonable interpretations. Do NOT use for trivial decisions you can "
+            "make yourself, or for things the user already specified in their original "
+            "request. Cheaper to ask once now than rebuild 300 steps of work later. "
+            "Only the CEO should use this — managers and workers escalate via "
+            "`report_blocker` if they need user input."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The specific question to put to the user. Phrase it so they can answer in one sentence.",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional shortlist of suggested answers the user can pick from.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Brief context: what you've decided so far, why you're asking, what's at stake. One paragraph max.",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+_SUGGEST_FOLLOW_UP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "suggest_follow_up",
+        "description": (
+            "Buffer a suggestion for additional work that should be done. Does NOT end your "
+            "run — you keep working after calling this. When you eventually `complete`, your "
+            "buffered suggestions ride along to your parent in the follow_ups field. The "
+            "parent decides whether to spawn a new sibling, expand their own scope, or relay "
+            "the suggestion further up the chain. Use this when you notice work that's "
+            "ADJACENT to your assigned task but out of your direct scope — genuine gaps, "
+            "not vague ideas."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "what_is_needed": {
+                    "type": "string",
+                    "description": "Specifically what additional work should be done.",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this matters — what gap or opportunity you noticed.",
+                },
+                "who_should_do_it": {
+                    "type": "string",
+                    "description": "Optional hint about who should pick this up (e.g. 'a sub-manager focused on X', 'a worker who can do Y').",
+                },
+            },
+            "required": ["what_is_needed", "rationale"],
+        },
+    },
+}
+
 
 def register_management_tools() -> None:
     for schema in [
@@ -214,6 +285,8 @@ def register_management_tools() -> None:
         REGISTRY.register(schema, kind="management", version="1.0")
     REGISTRY.register(_COMPLETE_SCHEMA, kind="both", version="1.0")
     REGISTRY.register(_REPORT_BLOCKER_SCHEMA, kind="both", version="1.0")
+    REGISTRY.register(_SUGGEST_FOLLOW_UP_SCHEMA, kind="both", version="1.0")
+    REGISTRY.register(_ASK_USER_SCHEMA, kind="ceo", version="1.0")
 
 
 register_management_tools()
