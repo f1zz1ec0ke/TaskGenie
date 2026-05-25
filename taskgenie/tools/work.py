@@ -211,13 +211,13 @@ async def _read_file(agent: Any, args: dict[str, Any]) -> str:
     p = _safe_path(agent.scratch_dir, args["path"])
     if not p.exists():
         return f"ERROR: file does not exist: {args['path']}"
-    return p.read_text()
+    return p.read_text(encoding="utf-8")
 
 
 async def _write_file(agent: Any, args: dict[str, Any]) -> str:
     p = _safe_path(agent.scratch_dir, args["path"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(args["content"])
+    p.write_text(args["content"], encoding="utf-8")
     return f"wrote {len(args['content'])} chars to {args['path']}"
 
 
@@ -236,7 +236,7 @@ async def _read_workspace(agent: Any, args: dict[str, Any]) -> str:
     p = _safe_path(str(base), args["path"])
     if not p.exists():
         return f"ERROR: file does not exist in workspace: {args['path']}"
-    return p.read_text()
+    return p.read_text(encoding="utf-8")
 
 
 async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
@@ -255,11 +255,11 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
                 "Use `edit_workspace` to modify it, or pass mode='overwrite' if you "
                 "really intend to discard the current contents."
             )
-        p.write_text(content)
+        p.write_text(content, encoding="utf-8")
         return f"wrote (created) {len(content)} chars to workspace/{args['path']}"
 
     if mode == "overwrite":
-        p.write_text(content)
+        p.write_text(content, encoding="utf-8")
         return f"wrote (overwrote) {len(content)} chars to workspace/{args['path']}"
 
     if mode == "append":
@@ -283,7 +283,7 @@ async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
             f"ERROR: workspace/{args['path']} does not exist. "
             "Use `write_workspace(mode='create')` for a new file."
         )
-    current = p.read_text()
+    current = p.read_text(encoding="utf-8")
     old = args["old_text"]
     new = args["new_text"]
     count = current.count(old)
@@ -303,7 +303,7 @@ async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
     # Atomic-ish replace: write to a sibling temp then rename. Avoids leaving a
     # half-written file if the process dies mid-write.
     tmp = p.with_suffix(p.suffix + ".tg-edit-tmp")
-    tmp.write_text(updated)
+    tmp.write_text(updated, encoding="utf-8")
     tmp.replace(p)
     return (
         f"edited workspace/{args['path']} "

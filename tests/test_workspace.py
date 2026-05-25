@@ -252,6 +252,85 @@ def test_project_dir_layout(tmp_path: Path) -> None:
     print("[project_dir_layout] OK")
 
 
+async def test_utf8_roundtrip(tmp_path: Path) -> None:
+    """All workspace/scratch reads & writes are explicit UTF-8 so non-ASCII
+    content (accents, math symbols, CJK, emoji) survives the round-trip.
+
+    The bug being prevented: Path.write_text / read_text without an explicit
+    encoding falls back to locale.getpreferredencoding() which on Windows is
+    cp1252 and can't encode anything outside Latin-1 -- so any agent writing
+    a file containing e.g. an arrow character would silently fail."""
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path))
+    CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects-utf8")
+    Agent.REGISTRY.clear()
+    session = Session.create("utf8 task")
+    Agent.SCRATCH_ROOT = str(session.scratch_root)
+    Agent.WORKSPACE_ROOT = str(session.project_dir)
+
+    worker = Agent(name="W", role_type="worker", system_prompt="...")
+    write = REGISTRY.dispatcher("write_workspace")
+    read = REGISTRY.dispatcher("read_workspace")
+    edit = REGISTRY.dispatcher("edit_workspace")
+    write_scratch = REGISTRY.dispatcher("write_file")
+    read_scratch = REGISTRY.dispatcher("read_file")
+
+    # A spread of non-ASCII Unicode that locale=cp1252 would reject:
+    # arrows, math symbols, accented Latin, CJK, an emoji.
+    payload = (
+        "# Résumé\n"
+        "Flow: A → B → C (∑ steps = ∞)\n"
+        "Approx π ≈ 3.14159, σ² = variance\n"
+        "Greeting: 你好 / こんにちは / 안녕\n"
+        "Emoji though discouraged: 🎮\n"
+        "Currency: €100, ¥500\n"
+    )
+
+    # write -> file content matches exactly
+    res = await write(worker, {"path": "doc.md", "content": payload})
+    assert "created" in res, res
+    assert (session.project_dir / "doc.md").read_text(encoding="utf-8") == payload
+
+    # read -> string matches what we wrote
+    got = await read(worker, {"path": "doc.md"})
+    assert got == payload
+
+    # edit on unicode old_text + unicode new_text
+    res = await edit(
+        worker,
+        {
+            "path": "doc.md",
+            "old_text": "Flow: A → B → C",
+            "new_text": "Flow: α → β → γ",
+        },
+    )
+    assert "edited" in res, res
+    got2 = await read(worker, {"path": "doc.md"})
+    assert "α → β → γ" in got2
+    assert "A → B → C" not in got2
+
+    # append mode preserves utf-8 too
+    res = await write(
+        worker,
+        {"path": "log.txt", "content": "ñoño\n", "mode": "append"},
+    )
+    assert "appended" in res
+    res = await write(
+        worker,
+        {"path": "log.txt", "content": "Größe\n", "mode": "append"},
+    )
+    assert "appended" in res
+    assert (session.project_dir / "log.txt").read_text(encoding="utf-8") == "ñoño\nGröße\n"
+
+    # Scratch file ops use utf-8 too
+    res = await write_scratch(worker, {"path": "notes.txt", "content": payload})
+    assert "wrote" in res
+    scratch_back = await read_scratch(worker, {"path": "notes.txt"})
+    assert scratch_back == payload
+
+    print("[utf8_roundtrip] OK")
+
+
 async def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         await test_worker_writes_workspace(Path(d))
@@ -262,6 +341,8 @@ async def main() -> int:
         await test_edit_workspace(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_project_dir_layout(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        await test_utf8_roundtrip(Path(d))
     print("\nAll workspace tests passed.")
     return 0
 
