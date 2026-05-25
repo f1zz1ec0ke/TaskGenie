@@ -201,6 +201,43 @@ _REPORT_BLOCKER_SCHEMA = {
     },
 }
 
+_ASK_USER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": (
+            "Pause your run and ask the user a question. Ends your run; the user is "
+            "prompted, and once they answer your work resumes with their reply appended "
+            "to your history. Use this when guessing wrong would invalidate significant "
+            "downstream work — output format, audience, scope ambiguity, choice between "
+            "two reasonable interpretations. Do NOT use for trivial decisions you can "
+            "make yourself, or for things the user already specified in their original "
+            "request. Cheaper to ask once now than rebuild 300 steps of work later. "
+            "Only the CEO should use this — managers and workers escalate via "
+            "`report_blocker` if they need user input."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The specific question to put to the user. Phrase it so they can answer in one sentence.",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional shortlist of suggested answers the user can pick from.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Brief context: what you've decided so far, why you're asking, what's at stake. One paragraph max.",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+}
+
 _SUGGEST_FOLLOW_UP_SCHEMA = {
     "type": "function",
     "function": {
@@ -249,6 +286,7 @@ def register_management_tools() -> None:
     REGISTRY.register(_COMPLETE_SCHEMA, kind="both", version="1.0")
     REGISTRY.register(_REPORT_BLOCKER_SCHEMA, kind="both", version="1.0")
     REGISTRY.register(_SUGGEST_FOLLOW_UP_SCHEMA, kind="both", version="1.0")
+    REGISTRY.register(_ASK_USER_SCHEMA, kind="ceo", version="1.0")
 
 
 register_management_tools()

@@ -160,7 +160,10 @@ class Agent:
     def tools(self) -> list[dict[str, Any]]:
         if self.role_type == "worker":
             return REGISTRY.work_tools()
-        return REGISTRY.management_tools()
+        tools = list(REGISTRY.management_tools())
+        if self.role_type == "ceo":
+            tools.extend(REGISTRY.ceo_only_tools())
+        return tools
 
     def _emit(self, kind: str, **data: Any) -> None:
         BUS.publish(Event(kind, self.id, self.name, data=data))  # type: ignore[arg-type]
@@ -248,6 +251,25 @@ class Agent:
                         reason=reason,
                         needs=needs,
                         partial_progress=partial,
+                        follow_ups=list(self.follow_ups),
+                    )
+
+                if name == "ask_user":
+                    question = args.get("question", "")
+                    options = args.get("options", []) or []
+                    qctx = args.get("context", "")
+                    self._set_status("blocked", question=question)
+                    self._emit(
+                        "question",
+                        question=question,
+                        options=options,
+                        context=qctx,
+                    )
+                    return RunResult(
+                        kind="question",
+                        question=question,
+                        options=list(options),
+                        context=qctx,
                         follow_ups=list(self.follow_ups),
                     )
 

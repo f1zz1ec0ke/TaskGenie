@@ -18,6 +18,7 @@ STATUS_STYLE = {
     "working": "yellow",
     "done": "green",
     "blocked": "bold orange1",
+    "asking": "bold cyan",
     "fired": "red strike",
     "exhausted": "magenta",
     "error": "red",
@@ -63,6 +64,9 @@ class AgentView:
         self.blocker_needs: str = ""
         self.partial_progress: str = ""
         self.follow_ups: list[dict[str, str]] = []
+        self.question: str = ""
+        self.question_options: list[str] = []
+        self.question_context: str = ""
         self.children_ids: list[str] = []
         self.spawn_time: float = time.time()
         self.last_activity: float = time.time()
@@ -181,6 +185,16 @@ class TUI:
                 f"[dim](needs: {_trunc(view.blocker_needs, 50)})[/]"
             )
             self._touch(view)
+        elif kind == "question":
+            view.question = data.get("question", "")
+            view.question_options = list(data.get("options", []) or [])
+            view.question_context = data.get("context", "")
+            view.status = "asking"
+            self._log(
+                f"[cyan]{view.name} ASKING USER[/]: "
+                f"{_trunc(view.question, 90)}"
+            )
+            self._touch(view)
         elif kind == "error":
             self._log(f"[red]error in {view.name}[/]: {_trunc(data.get('message', ''), 100)}")
 
@@ -272,6 +286,18 @@ class TUI:
             body_parts.append(Text(f"needs:  {v.blocker_needs}", style="orange1"))
             if v.partial_progress:
                 body_parts.append(Text(f"partial: {v.partial_progress}", style="orange1 dim"))
+
+        if v.status == "asking" or v.question:
+            body_parts.append(Text("QUESTION FOR USER", style="bold cyan"))
+            body_parts.append(Text(v.question, style="cyan"))
+            if v.question_context:
+                body_parts.append(
+                    Text(f"context: {_trunc(v.question_context, 400)}", style="cyan dim")
+                )
+            if v.question_options:
+                body_parts.append(Text("options:", style="cyan dim"))
+                for i, opt in enumerate(v.question_options, 1):
+                    body_parts.append(Text(f"  {i}. {opt}", style="cyan"))
 
         if v.status == "done" and v.report:
             body_parts.append(Text("report:", style="green dim"))
