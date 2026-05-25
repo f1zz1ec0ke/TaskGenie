@@ -397,9 +397,9 @@ class TUI:
 
     def _build_log(self) -> Panel:
         if not self.recent_events:
-            body = Text("(waiting for events)", style="dim italic")
+            body: Text = Text("(waiting for events)", style="dim italic")
         else:
-            body = Text("\n".join(self.recent_events[-20:]))
+            body = Text.from_markup("\n".join(self.recent_events[-20:]))
         return Panel(body, title="event log", border_style="dim")
 
     def _render(self) -> Layout:
