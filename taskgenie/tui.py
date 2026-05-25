@@ -112,6 +112,50 @@ class TUI:
         view.last_activity = time.time()
         self.focus_id = view.id
 
+    def _snapshot_initial_agents(self) -> None:
+        """Populate self.agents from Agent.REGISTRY at startup.
+
+        The CEO is created BEFORE tui.run() is scheduled, so its spawn
+        event fires before any TUI subscriber exists -- the BUS doesn't
+        buffer for late subscribers, so the event is lost. The first
+        manager that subsequently spawns has parent_id=CEO.id which the
+        TUI doesn't recognise, so it gets set as root_id one after
+        another, hiding the CEO entirely.
+
+        Also fires on resume, where Agent.bulk_load re-emits spawn
+        events for every persisted agent before tui.run() exists.
+
+        Two passes (instantiate views, then wire parent/child links) so
+        ordering of REGISTRY iteration doesn't matter.
+        """
+        from taskgenie.agent import Agent as _Agent
+
+        for aid, agent in _Agent.REGISTRY.items():
+            if aid in self.agents:
+                continue
+            view = AgentView(
+                agent_id=aid,
+                name=agent.name,
+                role_type=agent.role_type,
+                depth=agent.depth,
+            )
+            view.status = agent.status
+            view.blocker_reason = getattr(agent, "blocker_reason", "")
+            view.blocker_needs = getattr(agent, "blocker_needs", "")
+            view.follow_ups = list(getattr(agent, "follow_ups", []) or [])
+            self.agents[aid] = view
+
+        for aid, agent in _Agent.REGISTRY.items():
+            view = self.agents.get(aid)
+            if view is None:
+                continue
+            parent = getattr(agent, "parent", None)
+            if parent is None:
+                self.root_id = aid
+            elif parent.id in self.agents:
+                if aid not in self.agents[parent.id].children_ids:
+                    self.agents[parent.id].children_ids.append(aid)
+
     def _handle_event(self, event: Event) -> None:
         kind = event.kind
         aid = event.agent_id
@@ -632,6 +676,14 @@ class TUI:
     # ---- main loop ---------------------------------------------------------
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
+        # Snapshot any agents that exist BEFORE we subscribe. The CEO is
+        # always one of them (created in __main__ before tui.run() is
+        # scheduled), and on --resume every rehydrated agent is too.
+        # Without this, their spawn events are lost (BUS has no
+        # buffering for late subscribers) and they never appear in the
+        # tree -- which makes subsequent manager spawns orphans that get
+        # set as root_id one after another, hiding the CEO entirely.
+        self._snapshot_initial_agents()
         q = BUS.subscribe()
         # Alt-screen mode prevents flicker when the layout outgrows the
         # terminal height; fall back to inline mode when stdout isn't a tty

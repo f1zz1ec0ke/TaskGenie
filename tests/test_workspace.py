@@ -395,6 +395,63 @@ async def test_overwrite_after_read_warns(tmp_path: Path) -> None:
     print("[overwrite_after_read_warns] OK")
 
 
+async def test_tui_sees_ceo(tmp_path: Path) -> None:
+    """The CEO is created before tui.run() is scheduled, so its spawn
+    event fires before any TUI subscriber exists. Without the startup
+    snapshot, the CEO is invisible in the hierarchy panel and the first
+    manager becomes the de-facto root.
+    """
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path))
+    CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects-tui")
+    Agent.REGISTRY.clear()
+
+    # Spin up a CEO + manager + worker, then construct the TUI
+    # AFTERWARDS to mimic the production order in __main__.py.
+    session = Session.create("tui ceo task")
+    Agent.SCRATCH_ROOT = str(session.scratch_root)
+    Agent.WORKSPACE_ROOT = str(session.project_dir)
+    ceo = Agent(name="CEO", role_type="ceo", system_prompt="...")
+    mgr = Agent(
+        name="VisualsPolishManager",
+        role_type="manager",
+        system_prompt="...",
+        parent=ceo,
+        depth=1,
+    )
+    ceo.children.append(mgr)
+    worker = Agent(
+        name="UIOverlayWorker",
+        role_type="worker",
+        system_prompt="...",
+        parent=mgr,
+        depth=2,
+    )
+    mgr.children.append(worker)
+
+    from taskgenie.tui import TUI
+
+    tui = TUI(task="dummy")
+    # All spawn events fired BEFORE tui exists; they're lost to BUS.
+    assert tui.root_id is None
+    assert tui.agents == {}
+
+    # The snapshot call is what tui.run() runs first; verify it
+    # populates self.agents from REGISTRY and sets root to the CEO.
+    tui._snapshot_initial_agents()
+    assert tui.root_id == ceo.id
+    assert ceo.id in tui.agents
+    assert mgr.id in tui.agents
+    assert worker.id in tui.agents
+    assert tui.agents[ceo.id].children_ids == [mgr.id]
+    assert tui.agents[mgr.id].children_ids == [worker.id]
+    # Idempotent on re-call -- doesn't double-link
+    tui._snapshot_initial_agents()
+    assert tui.agents[ceo.id].children_ids == [mgr.id]
+
+    print("[tui_sees_ceo] OK")
+
+
 def test_safe_jsonable() -> None:
     """The artifact json writer must survive bundles that contain tuple
     keys, datetimes, sets, and other JSON-hostile objects -- final.json
@@ -449,6 +506,8 @@ async def main() -> int:
         await test_utf8_roundtrip(Path(d))
     with tempfile.TemporaryDirectory() as d:
         await test_overwrite_after_read_warns(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        await test_tui_sees_ceo(Path(d))
     test_safe_jsonable()
     print("\nAll workspace tests passed.")
     return 0
