@@ -270,10 +270,53 @@ class TUI:
         return tree
 
     def _add_node(self, parent_node: Tree, agent_id: str, now: float) -> None:
+        """Render a node and its descendants.
+
+        Two policies keep the tree from blowing up on big runs:
+          - Collapse: if a node is done AND all descendants are terminal,
+            render just the node with "(N done)" inline. No recursion.
+          - Cap: at most 6 expanded children per node, with active ones
+            preferred; any remainder shows as "+K more active / +M done"
+            footer lines. Keeps every top-level manager visible even when
+            one of them fans out to 20 workers.
+        """
         v = self.agents[agent_id]
-        node = parent_node.add(self._agent_label(v, now))
-        for cid in v.children_ids:
-            self._add_node(node, cid, now)
+        label = self._agent_label(v, now)
+
+        known_children = [
+            self.agents[cid] for cid in v.children_ids if cid in self.agents
+        ]
+        if not known_children:
+            parent_node.add(label)
+            return
+
+        done = [c for c in known_children if c.status in ("done", "fired")]
+        active = [c for c in known_children if c.status not in ("done", "fired")]
+
+        if v.status == "done" and not active:
+            summary = Text()
+            summary.append_text(label)
+            summary.append(f"  ({len(done)} done)", style="green dim")
+            parent_node.add(summary)
+            return
+
+        node = parent_node.add(label)
+        cap = 6
+        visible_active = active[:cap]
+        for child in visible_active:
+            self._add_node(node, child.id, now)
+        hidden_active = len(active) - len(visible_active)
+        if hidden_active > 0:
+            node.add(
+                Text(
+                    f"…+{hidden_active} more active",
+                    style="yellow dim italic",
+                )
+            )
+        if done:
+            node.add(
+                Text(f"…+{len(done)} done", style="green dim italic")
+            )
 
     def _agent_action_summary(self, v: "AgentView") -> Text:
         """One-line current-action summary for the active panel."""

@@ -35,6 +35,7 @@ def _reset(mock_llm, data_dir):
 async def test_save_load_resume() -> None:
     tmp = tempfile.mkdtemp(prefix="tg-test-")
     os.environ["TASKGENIE_DATA_DIR"] = tmp
+    os.environ["TASKGENIE_PROJECTS_DIR"] = tmp + "/projects"
     # Re-import config so it picks up the override.
     from importlib import reload
     from taskgenie import config as cfg_module
@@ -130,6 +131,7 @@ async def test_tool_diff_on_resume() -> None:
     surfaces tools as added/removed/updated."""
     tmp = tempfile.mkdtemp(prefix="tg-tooldiff-")
     os.environ["TASKGENIE_DATA_DIR"] = tmp
+    os.environ["TASKGENIE_PROJECTS_DIR"] = tmp + "/projects"
     from importlib import reload
     from taskgenie import config as cfg_module
     reload(cfg_module)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -26,7 +27,7 @@ from taskgenie.artifacts import write_final
 from taskgenie.config import CONFIG
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
-from taskgenie.session import Session
+from taskgenie.session import Session, PROJECTS_ROOT_ENV
 
 from tests.test_loop import ScriptedLLM, tc
 
@@ -81,6 +82,7 @@ async def test_ask_user_round_trip(tmp_path: Path) -> None:
     # Point session/artifact files at a temp dir.
     object.__setattr__(CONFIG, "data_dir", str(tmp_path))
     CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects")
 
     session = Session.create("test interactivity task")
     Agent.SCRATCH_ROOT = str(session.scratch_root)
@@ -158,6 +160,7 @@ def test_artifact_extensions(tmp_path: Path) -> None:
     """write_final infers format from --output extension: .md / .html / .json / fallback."""
     object.__setattr__(CONFIG, "data_dir", str(tmp_path))
     CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects")
     Agent.REGISTRY.clear()
     session = Session.create("artifact extension task")
     Agent.SCRATCH_ROOT = str(session.scratch_root)
