@@ -85,9 +85,18 @@ _WRITE_WORKSPACE_SCHEMA = {
             "Write a file into the SHARED WORKSPACE -- the directory of REAL deliverables "
             "the user will end up with (e.g. game.py, index.html, README.md, assets/...). "
             "Workers use this when the task is producing software, documents, art, or any "
-            "file artifact. Creates parent directories as needed; overwrites if exists. "
-            "Distinct from `write_file` (your private scratch for intermediate work). "
-            "Use scratch for thinking, workspace for shipping."
+            "file artifact. Creates parent directories as needed. Distinct from "
+            "`write_file` (your private scratch for intermediate work). Use scratch for "
+            "thinking, workspace for shipping. "
+            "\n\n"
+            "MODES (chooses how to handle an existing file at the same path):\n"
+            "  - 'create' (default): FAILS if the file already exists. Use for new files. "
+            "Catches accidental clobbers loud rather than silent. If you got 'file exists', "
+            "you probably want `edit_workspace` instead -- not a brute overwrite.\n"
+            "  - 'overwrite': replaces existing content. Use ONLY when you genuinely "
+            "intend to discard whatever was there.\n"
+            "  - 'append': appends to the existing file (creates if missing). Safe for "
+            "log-style additions."
         ),
         "parameters": {
             "type": "object",
@@ -97,8 +106,56 @@ _WRITE_WORKSPACE_SCHEMA = {
                     "description": "Path relative to the workspace root, e.g. 'src/game.py' or 'README.md'.",
                 },
                 "content": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["create", "overwrite", "append"],
+                    "description": "How to handle an existing file. Defaults to 'create'.",
+                },
             },
             "required": ["path", "content"],
+        },
+    },
+}
+
+_EDIT_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "edit_workspace",
+        "description": (
+            "Make a SURGICAL edit to an existing workspace file: replace exactly one "
+            "occurrence of `old_text` with `new_text`. Reads the file, validates that "
+            "`old_text` appears EXACTLY ONCE, then atomically writes the modified content "
+            "back. \n\n"
+            "Use this for: modifying existing files (a teammate's draft, a config, a "
+            "code section). Always preferable to `write_workspace(mode='overwrite')` for "
+            "edits because it can't accidentally discard work you didn't read.\n\n"
+            "FAILURE MODES:\n"
+            "  - file doesn't exist -> use `write_workspace(mode='create')`\n"
+            "  - old_text not found -> the file changed since you read it (another worker "
+            "edited it), OR your old_text is wrong. Re-read the file and try again.\n"
+            "  - old_text found multiple times -> ambiguous. Include more surrounding "
+            "context in old_text to make it unique.\n\n"
+            "This is your safe tool for read-modify-write cycles; concurrent edits to the "
+            "same file will surface as conflict errors (you re-read, you retry) rather "
+            "than as silent data loss."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root.",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact text to find. Must appear in the file exactly once.",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text.",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
         },
     },
 }
@@ -188,8 +245,70 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
         return base
     p = _safe_path(str(base), args["path"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(args["content"])
-    return f"wrote {len(args['content'])} chars to workspace/{args['path']}"
+    content = args["content"]
+    mode = args.get("mode", "create")
+
+    if mode == "create":
+        if p.exists():
+            return (
+                f"ERROR: workspace/{args['path']} already exists. "
+                "Use `edit_workspace` to modify it, or pass mode='overwrite' if you "
+                "really intend to discard the current contents."
+            )
+        p.write_text(content)
+        return f"wrote (created) {len(content)} chars to workspace/{args['path']}"
+
+    if mode == "overwrite":
+        p.write_text(content)
+        return f"wrote (overwrote) {len(content)} chars to workspace/{args['path']}"
+
+    if mode == "append":
+        # Open in append mode so concurrent appends from multiple agents
+        # interleave cleanly at the OS write boundary instead of stomping
+        # each other.
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(content)
+        return f"appended {len(content)} chars to workspace/{args['path']}"
+
+    return f"ERROR: unknown mode {mode!r}; expected one of create / overwrite / append"
+
+
+async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
+    base = _workspace_or_error(agent)
+    if isinstance(base, str):
+        return base
+    p = _safe_path(str(base), args["path"])
+    if not p.exists():
+        return (
+            f"ERROR: workspace/{args['path']} does not exist. "
+            "Use `write_workspace(mode='create')` for a new file."
+        )
+    current = p.read_text()
+    old = args["old_text"]
+    new = args["new_text"]
+    count = current.count(old)
+    if count == 0:
+        return (
+            f"ERROR: old_text not found in workspace/{args['path']}. "
+            "The file may have been modified by another agent since you last read it -- "
+            "re-read the file and retry with the actual current text."
+        )
+    if count > 1:
+        return (
+            f"ERROR: old_text appears {count} times in workspace/{args['path']}; "
+            "the edit is ambiguous. Include more surrounding context in old_text so "
+            "it matches exactly once."
+        )
+    updated = current.replace(old, new, 1)
+    # Atomic-ish replace: write to a sibling temp then rename. Avoids leaving a
+    # half-written file if the process dies mid-write.
+    tmp = p.with_suffix(p.suffix + ".tg-edit-tmp")
+    tmp.write_text(updated)
+    tmp.replace(p)
+    return (
+        f"edited workspace/{args['path']} "
+        f"({len(old)} chars -> {len(new)} chars)"
+    )
 
 
 async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
@@ -290,9 +409,10 @@ def register_builtin_work_tools() -> None:
     REGISTRY.register(_READ_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_read_file)
     REGISTRY.register(_WRITE_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_write_file)
     REGISTRY.register(_EXEC_CODE_SCHEMA, kind="work", version="0.1", dispatcher=_exec_code)
-    # Workspace is shared across all agents in a session: workers write to it,
-    # managers and CEO read it to verify deliverables.
-    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_write_workspace)
+    # Workspace is shared across all agents in a session: workers write/edit,
+    # managers and CEO read to verify deliverables.
+    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.1", dispatcher=_write_workspace)
+    REGISTRY.register(_EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace)
     REGISTRY.register(_READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace)
     REGISTRY.register(_LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace)
 

@@ -153,7 +153,15 @@ actual workspace artifacts is rubber-stamping.
 When briefing workers who produce files, tell them EXPLICITLY: which file path to \
 write to (e.g. "write the main game loop to game.py"), what should go in it, and \
 any constraints (style, dependencies). Coordinate across workers so they don't \
-overwrite each other — assign disjoint paths.
+overwrite each other — assign disjoint paths whenever possible.
+
+If two workers MUST touch the same file (e.g. a "coder" creates it and a \
+"polisher" adds comments), serialize the work: assign the creator first, await \
+their completion, then assign the polisher with instructions to use \
+`edit_workspace` rather than `write_workspace(mode='overwrite')`. Running them \
+in parallel risks one's work overwriting the other's. The tool layer surfaces \
+conflicts as errors (loud) rather than as silent data loss (quiet), but the \
+right design is partition-first.
 
 HANDLING SUBORDINATE RESULTS
 Each entry in await_results carries `status` plus payload:
@@ -195,12 +203,28 @@ available include:
 - Built-in scratch: `read_file` and `write_file` for the per-agent scratch \
   directory — your private workspace for intermediate notes and drafts. \
   Nobody else sees these.
-- Built-in shared workspace: `write_workspace`, `read_workspace`, and \
-  `list_workspace` operate on the SESSION-WIDE shared workspace where REAL \
-  deliverable files live. If the task is producing software, documents, art, \
-  or any file artifact the user will keep, write the deliverable here (e.g. \
-  `write_workspace(path="game.py", content=...)`). Distinct from scratch: \
-  scratch is for thinking, workspace is for shipping.
+- Built-in shared workspace: `write_workspace`, `edit_workspace`, \
+  `read_workspace`, and `list_workspace` operate on the SESSION-WIDE shared \
+  workspace where REAL deliverable files live. If the task is producing \
+  software, documents, art, or any file artifact the user will keep, write \
+  the deliverable here. Distinct from scratch: scratch is for thinking, \
+  workspace is for shipping.
+  CHOOSING THE RIGHT WORKSPACE WRITE TOOL:
+    1. NEW file -> `write_workspace(path, content)`. Default mode is "create" \
+       which FAILS if a file already exists at that path. If it fails, \
+       another worker got there first — read what's there, then decide \
+       whether to extend (use `edit_workspace`) or pick a different path.
+    2. MODIFYING an existing file -> `edit_workspace(path, old_text, new_text)`. \
+       Surgical replacement; old_text must appear exactly once. Safer than \
+       write_workspace(mode='overwrite') because it cannot silently discard \
+       another worker's changes — if the file changed since you last read \
+       it, old_text won't match and the edit fails loud (re-read, retry).
+    3. APPENDING to a log-style file -> \
+       `write_workspace(path, content, mode='append')`. Concurrent appends \
+       from multiple agents interleave cleanly at the OS write boundary.
+    4. INTENTIONAL FULL REPLACE -> `write_workspace(path, content, mode='overwrite')`. \
+       Rare; only when you've fully read what was there and explicitly want \
+       to discard it.
 - Built-in exec: `exec_code` for short Python or shell snippets in a sandbox \
   (may be stubbed — check the description; if it says STUB, treat any real \
   exec need as a blocker). Working directory is your scratch.

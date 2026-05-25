@@ -97,6 +97,126 @@ async def test_workspace_tool_kinds() -> None:
     print("[workspace_tool_kinds] OK")
 
 
+async def test_write_modes(tmp_path: Path) -> None:
+    """write_workspace mode flag: create / overwrite / append all behave correctly."""
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path))
+    CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects")
+    Agent.REGISTRY.clear()
+    session = Session.create("modes task")
+    Agent.SCRATCH_ROOT = str(session.scratch_root)
+    Agent.WORKSPACE_ROOT = str(session.project_dir)
+
+    worker = Agent(name="W", role_type="worker", system_prompt="...")
+    write = REGISTRY.dispatcher("write_workspace")
+    assert write is not None
+
+    # mode='create' (default): writes a new file
+    res = await write(worker, {"path": "game.py", "content": "print(1)\n"})
+    assert "created" in res
+
+    # mode='create' on existing file FAILS loudly
+    res = await write(worker, {"path": "game.py", "content": "print(99)\n"})
+    assert "already exists" in res
+    # And the original content is preserved
+    assert (session.project_dir / "game.py").read_text() == "print(1)\n"
+
+    # mode='overwrite' explicitly replaces
+    res = await write(
+        worker, {"path": "game.py", "content": "print(2)\n", "mode": "overwrite"}
+    )
+    assert "overwrote" in res
+    assert (session.project_dir / "game.py").read_text() == "print(2)\n"
+
+    # mode='append' adds to existing
+    res = await write(
+        worker, {"path": "log.txt", "content": "line1\n", "mode": "append"}
+    )
+    res2 = await write(
+        worker, {"path": "log.txt", "content": "line2\n", "mode": "append"}
+    )
+    assert "appended" in res and "appended" in res2
+    assert (session.project_dir / "log.txt").read_text() == "line1\nline2\n"
+
+    # Unknown mode error
+    res = await write(
+        worker, {"path": "x.txt", "content": "x", "mode": "smash"}
+    )
+    assert "unknown mode" in res.lower()
+
+    print("[write_modes] OK")
+
+
+async def test_edit_workspace(tmp_path: Path) -> None:
+    """edit_workspace: exactly-once matching, conflict detection, file-not-found."""
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path))
+    CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects-edit")
+    Agent.REGISTRY.clear()
+    session = Session.create("edit task")
+    Agent.SCRATCH_ROOT = str(session.scratch_root)
+    Agent.WORKSPACE_ROOT = str(session.project_dir)
+
+    worker = Agent(name="W", role_type="worker", system_prompt="...")
+    write = REGISTRY.dispatcher("write_workspace")
+    edit = REGISTRY.dispatcher("edit_workspace")
+    assert edit is not None
+
+    # Edit on missing file fails with a helpful message
+    res = await edit(
+        worker, {"path": "missing.py", "old_text": "x", "new_text": "y"}
+    )
+    assert "does not exist" in res
+
+    # Set up a file
+    await write(
+        worker,
+        {
+            "path": "game.py",
+            "content": "def fire():\n    return 'pew'\n\ndef move():\n    return 'wobble'\n",
+        },
+    )
+
+    # Successful edit: old_text appears exactly once
+    res = await edit(
+        worker,
+        {
+            "path": "game.py",
+            "old_text": "return 'pew'",
+            "new_text": "return 'BANG'",
+        },
+    )
+    assert "edited" in res
+    contents = (session.project_dir / "game.py").read_text()
+    assert "'BANG'" in contents
+    assert "'pew'" not in contents
+    # Other function untouched
+    assert "return 'wobble'" in contents
+
+    # old_text not found: conflict-style error
+    res = await edit(
+        worker,
+        {"path": "game.py", "old_text": "this is not in the file", "new_text": "x"},
+    )
+    assert "not found" in res
+
+    # old_text ambiguous (appears more than once)
+    await write(
+        worker,
+        {
+            "path": "dup.py",
+            "content": "return 1\nreturn 1\n",
+            "mode": "overwrite",
+        },
+    )
+    res = await edit(
+        worker, {"path": "dup.py", "old_text": "return 1", "new_text": "return 2"}
+    )
+    assert "ambiguous" in res or "appears 2 times" in res
+
+    print("[edit_workspace] OK")
+
+
 def test_project_dir_layout(tmp_path: Path) -> None:
     """Sessions land workspaces in ./TaskGenie/<project>/, not in the session dir."""
     object.__setattr__(CONFIG, "data_dir", str(tmp_path / "data"))
@@ -136,6 +256,10 @@ async def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         await test_worker_writes_workspace(Path(d))
     await test_workspace_tool_kinds()
+    with tempfile.TemporaryDirectory() as d:
+        await test_write_modes(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        await test_edit_workspace(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_project_dir_layout(Path(d))
     print("\nAll workspace tests passed.")
