@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from rich.console import Console, Group
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
@@ -21,10 +23,28 @@ STATUS_STYLE = {
     "error": "red",
 }
 
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPAWN_FLASH_SECONDS = 1.2
+
 
 def _trunc(text: str, n: int) -> str:
     text = text.strip().replace("\n", " ")
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _spinner_char(now: float | None = None) -> str:
+    t = now if now is not None else time.time()
+    return SPINNER_FRAMES[int(t * 10) % len(SPINNER_FRAMES)]
+
+
+def _short_args(args: dict[str, Any]) -> str:
+    parts = []
+    for k, v in args.items():
+        sv = str(v)
+        if len(sv) > 40:
+            sv = sv[:37] + "…"
+        parts.append(f"{k}={sv}")
+    return ", ".join(parts)
 
 
 class AgentView:
@@ -41,7 +61,10 @@ class AgentView:
         self.report: str = ""
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
+        self.partial_progress: str = ""
         self.children_ids: list[str] = []
+        self.spawn_time: float = time.time()
+        self.last_activity: float = time.time()
 
 
 class TUI:
@@ -50,7 +73,14 @@ class TUI:
         self.agents: dict[str, AgentView] = {}
         self.root_id: str | None = None
         self.recent_events: list[str] = []
-        self.console = Console()
+        self.focus_id: str | None = None
+        self.console = Console(force_terminal=True, color_system="auto")
+
+    # ---- event handling ----------------------------------------------------
+
+    def _touch(self, view: AgentView) -> None:
+        view.last_activity = time.time()
+        self.focus_id = view.id
 
     def _handle_event(self, event: Event) -> None:
         kind = event.kind
@@ -58,6 +88,9 @@ class TUI:
         data = event.data
 
         if kind == "spawn":
+            if aid in self.agents:
+                # Already loaded via rehydrate — skip duplicate spawn from replay.
+                return
             view = AgentView(
                 agent_id=aid,
                 name=event.agent_name,
@@ -67,10 +100,12 @@ class TUI:
             self.agents[aid] = view
             parent_id = data.get("parent_id")
             if parent_id and parent_id in self.agents:
-                self.agents[parent_id].children_ids.append(aid)
+                if aid not in self.agents[parent_id].children_ids:
+                    self.agents[parent_id].children_ids.append(aid)
             else:
                 self.root_id = aid
             self._log(f"[dim]spawn[/] {event.agent_name} ({view.role_type})")
+            self.focus_id = aid
             return
 
         view = self.agents.get(aid)
@@ -81,16 +116,17 @@ class TUI:
             view.status = data.get("status", view.status)
             if "task" in data:
                 view.task = data["task"]
+            self._touch(view)
         elif kind == "narrate":
             view.narration = data.get("text", "")
+            self._touch(view)
         elif kind == "tool_call":
             tool = data.get("tool", "")
             args = data.get("args", {}) or {}
             view.last_tool = tool
             view.last_tool_args = args
-            self._log(f"[cyan]{view.name}[/] → {tool}({_short_args(args)})")
-        elif kind == "tool_result":
-            pass
+            self._log(f"[cyan]{view.name}[/] -> {tool}({_short_args(args)})")
+            self._touch(view)
         elif kind == "hire":
             self._log(
                 f"[green]{view.name}[/] hired [bold]{data.get('child_name')}[/] "
@@ -110,7 +146,7 @@ class TUI:
             )
         elif kind == "fire":
             self._log(
-                f"[red]{view.name} fired {data.get('agent_name')}[/] — "
+                f"[red]{view.name} fired {data.get('agent_name')}[/] -- "
                 f"{_trunc(data.get('reason', ''), 80)}"
             )
         elif kind == "rehire":
@@ -119,80 +155,156 @@ class TUI:
             view.report = data.get("report", "")
             view.status = "done"
             self._log(f"[green]{view.name} complete[/]")
+            self._touch(view)
         elif kind == "blocked":
             view.blocker_reason = data.get("reason", "")
             view.blocker_needs = data.get("needs", "")
+            view.partial_progress = data.get("partial_progress", "")
             view.status = "blocked"
             self._log(
-                f"[orange1]{view.name} BLOCKED[/] — "
+                f"[orange1]{view.name} BLOCKED[/] -- "
                 f"{_trunc(view.blocker_reason, 70)} "
                 f"[dim](needs: {_trunc(view.blocker_needs, 50)})[/]"
             )
+            self._touch(view)
         elif kind == "error":
             self._log(f"[red]error in {view.name}[/]: {_trunc(data.get('message', ''), 100)}")
 
     def _log(self, line: str) -> None:
         self.recent_events.append(line)
-        if len(self.recent_events) > 18:
-            self.recent_events = self.recent_events[-18:]
+        if len(self.recent_events) > 30:
+            self.recent_events = self.recent_events[-30:]
+
+    # ---- rendering ---------------------------------------------------------
+
+    def _agent_label(self, view: AgentView, now: float) -> Text:
+        style = STATUS_STYLE.get(view.status, "white")
+        label = Text()
+        if view.status == "working":
+            label.append(_spinner_char(now) + " ", style=style)
+        else:
+            label.append("● ", style=style)
+
+        # Spawn flash: pulse the name in bold cyan for a moment after spawn.
+        elapsed_since_spawn = now - view.spawn_time
+        if elapsed_since_spawn < SPAWN_FLASH_SECONDS:
+            # decay from bold bright cyan to normal
+            label.append(view.name, style="bold bright_cyan")
+            label.append(" [NEW]", style="bright_cyan dim")
+        else:
+            label.append(view.name, style="bold")
+
+        label.append(f"  {view.role_type}/", style="dim")
+        label.append(view.status, style=style)
+        return label
 
     def _build_tree(self) -> Tree:
-        title = Text("TaskGenie", style="bold cyan")
-        title.append("  task: ", style="dim")
+        now = time.time()
+        title = Text()
+        title.append("TaskGenie", style="bold cyan")
+        title.append("  ", style="dim")
         title.append(_trunc(self.task, 100), style="italic")
         tree = Tree(title)
         if self.root_id:
-            self._add_node(tree, self.root_id)
+            self._add_node(tree, self.root_id, now)
         return tree
 
-    def _add_node(self, parent_node: Tree, agent_id: str) -> None:
+    def _add_node(self, parent_node: Tree, agent_id: str, now: float) -> None:
         v = self.agents[agent_id]
+        node = parent_node.add(self._agent_label(v, now))
+        for cid in v.children_ids:
+            self._add_node(node, cid, now)
+
+    def _build_focus(self) -> Panel:
+        if not self.focus_id or self.focus_id not in self.agents:
+            return Panel(
+                Text("(no agent has acted yet)", style="dim italic"),
+                title="focus",
+                border_style="dim",
+            )
+        v = self.agents[self.focus_id]
         style = STATUS_STYLE.get(v.status, "white")
 
-        label = Text()
-        label.append("● ", style=style)
-        label.append(v.name, style="bold")
-        label.append(f"  [{v.role_type}/{v.status}]", style="dim")
+        header = Text()
+        header.append(v.name, style="bold")
+        header.append(f"  {v.role_type} / ", style="dim")
+        header.append(v.status, style=style)
 
-        sub = Text()
+        body_parts: list[Any] = [header, Text("")]
+
+        if v.task:
+            body_parts.append(Text("task:", style="dim"))
+            body_parts.append(Text(_trunc(v.task, 600), style="italic"))
+            body_parts.append(Text(""))
+
         if v.narration:
-            sub.append("\n  ", style="dim")
-            sub.append('“', style="italic dim")
-            sub.append(_trunc(v.narration, 220), style="italic")
-            sub.append('”', style="italic dim")
+            body_parts.append(Text("saying:", style="dim"))
+            body_parts.append(Text(v.narration, style="italic"))
+            body_parts.append(Text(""))
+
         if v.last_tool:
-            sub.append("\n  → ", style="dim")
-            sub.append(v.last_tool, style="cyan")
-            sub.append("(", style="dim")
-            sub.append(_short_args(v.last_tool_args), style="dim")
-            sub.append(")", style="dim")
-        if v.report and v.status == "done":
-            sub.append("\n  ⮑ ", style="green dim")
-            sub.append(_trunc(v.report, 220), style="green")
+            tool_line = Text()
+            tool_line.append("tool: ", style="dim")
+            tool_line.append(v.last_tool, style="cyan bold")
+            tool_line.append(f"({_short_args(v.last_tool_args)})", style="dim")
+            body_parts.append(tool_line)
+            body_parts.append(Text(""))
+
         if v.status == "blocked":
-            sub.append("\n  ! ", style="orange1 bold")
-            sub.append(_trunc(v.blocker_reason, 200), style="orange1")
-            if v.blocker_needs:
-                sub.append("\n  needs: ", style="orange1 dim")
-                sub.append(_trunc(v.blocker_needs, 200), style="orange1")
+            body_parts.append(Text("BLOCKER", style="bold orange1"))
+            body_parts.append(Text(f"reason: {v.blocker_reason}", style="orange1"))
+            body_parts.append(Text(f"needs:  {v.blocker_needs}", style="orange1"))
+            if v.partial_progress:
+                body_parts.append(Text(f"partial: {v.partial_progress}", style="orange1 dim"))
 
-        node = parent_node.add(label + sub)
-        for cid in v.children_ids:
-            self._add_node(node, cid)
+        if v.status == "done" and v.report:
+            body_parts.append(Text("report:", style="green dim"))
+            body_parts.append(Text(_trunc(v.report, 800), style="green"))
 
-    def _render(self) -> Group:
-        tree = self._build_tree()
-        log_text = Text("\n".join(self.recent_events) if self.recent_events else "(no events yet)")
-        log_panel = Panel(log_text, title="event log", border_style="dim")
-        return Group(tree, log_panel)
+        return Panel(
+            Group(*body_parts),
+            title=f"focus -- {v.name}",
+            border_style=style,
+        )
+
+    def _build_log(self) -> Panel:
+        if not self.recent_events:
+            body = Text("(waiting for events)", style="dim italic")
+        else:
+            body = Text("\n".join(self.recent_events[-12:]))
+        return Panel(body, title="event log", border_style="dim")
+
+    def _render(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="main", ratio=3),
+            Layout(name="log", size=14),
+        )
+        layout["main"].split_row(
+            Layout(name="tree", ratio=2),
+            Layout(name="focus", ratio=1),
+        )
+        layout["tree"].update(Panel(self._build_tree(), border_style="cyan"))
+        layout["focus"].update(self._build_focus())
+        layout["log"].update(self._build_log())
+        return layout
+
+    # ---- main loop ---------------------------------------------------------
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         q = BUS.subscribe()
         try:
-            with Live(self._render(), console=self.console, refresh_per_second=8, screen=False) as live:
+            with Live(
+                self._render(),
+                console=self.console,
+                refresh_per_second=12,
+                screen=False,
+                redirect_stdout=False,
+                redirect_stderr=False,
+            ) as live:
                 while True:
                     try:
-                        event = await asyncio.wait_for(q.get(), timeout=0.25)
+                        event = await asyncio.wait_for(q.get(), timeout=0.1)
                         self._handle_event(event)
                     except asyncio.TimeoutError:
                         pass
@@ -204,13 +316,3 @@ class TUI:
                         break
         finally:
             BUS.unsubscribe(q)
-
-
-def _short_args(args: dict[str, Any]) -> str:
-    parts = []
-    for k, v in args.items():
-        sv = str(v)
-        if len(sv) > 40:
-            sv = sv[:37] + "…"
-        parts.append(f"{k}={sv}")
-    return ", ".join(parts)
