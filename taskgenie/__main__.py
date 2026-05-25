@@ -11,6 +11,7 @@ from rich.rule import Rule
 
 from taskgenie.agent import Agent
 from taskgenie.config import CONFIG
+from taskgenie.mcp_client import MCPClient
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
 from taskgenie.tui import TUI
@@ -18,16 +19,22 @@ from taskgenie.tui import TUI
 ABANDON_TOKENS = {"", "quit", "exit", "abandon", "stop"}
 
 
-def _print_banner(console: Console) -> None:
+def _print_banner(console: Console, mcp: MCPClient) -> None:
+    lines = [
+        f"[bold]Endpoint:[/] {CONFIG.base_url}",
+        f"[bold]Model:[/] {CONFIG.model or '(auto-detect)'}",
+        f"[bold]Max depth:[/] {CONFIG.max_depth}",
+        f"[bold]Max turns/agent:[/] {CONFIG.max_turns_per_agent}",
+    ]
+    if mcp.registered_tools:
+        lines.append(f"[bold]MCP tools:[/] {', '.join(mcp.registered_tools)}")
+    else:
+        lines.append("[bold]MCP tools:[/] [dim]none (no servers connected)[/]")
+    if mcp.connect_errors:
+        for server, err in mcp.connect_errors.items():
+            lines.append(f"[bold red]MCP error[/] {server}: {err}")
     console.print(
-        Panel.fit(
-            f"[bold]Endpoint:[/] {CONFIG.base_url}\n"
-            f"[bold]Model:[/] {CONFIG.model or '(auto-detect)'}\n"
-            f"[bold]Max depth:[/] {CONFIG.max_depth}\n"
-            f"[bold]Max turns/agent:[/] {CONFIG.max_turns_per_agent}",
-            title="TaskGenie",
-            border_style="cyan",
-        )
+        Panel.fit("\n".join(lines), title="TaskGenie", border_style="cyan")
     )
 
 
@@ -72,7 +79,15 @@ async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
 
 async def _run(task: str) -> int:
     console = Console()
-    _print_banner(console)
+    mcp = await MCPClient.from_config(CONFIG.mcp_config_path)
+    try:
+        return await _run_with_mcp(task, console, mcp)
+    finally:
+        await mcp.close()
+
+
+async def _run_with_mcp(task: str, console: Console, mcp: MCPClient) -> int:
+    _print_banner(console, mcp)
 
     ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
     tui = TUI(task=task)
