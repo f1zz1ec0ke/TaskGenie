@@ -5,12 +5,20 @@ calling agent's scratch directory to scope file operations.
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
+
+# Env vars that always pass through to subprocesses. Everything else is stripped
+# so secrets (API keys, etc.) don't leak into untrusted-by-default exec_code.
+# Users can add more via TASKGENIE_EXEC_ENV_PASSTHROUGH=KEY1,KEY2.
+_DEFAULT_PASSTHROUGH = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "TEMP", "TMP"}
 
 _READ_FILE_SCHEMA = {
     "type": "function",
@@ -51,10 +59,12 @@ _EXEC_CODE_SCHEMA = {
     "function": {
         "name": "exec_code",
         "description": (
-            "Execute a short Python or shell snippet in a per-agent scratch sandbox with a "
-            "timeout. Returns stdout + stderr + exit code. Useful for quick computations, "
-            "file processing, or invoking installed CLIs. State does NOT persist between "
-            "calls; if you need to keep something, write it to a file."
+            "Execute a short Python or shell snippet with a timeout. Working directory is "
+            "your scratch dir; env is scrubbed (only PATH/HOME/LANG-style vars present). "
+            "Returns exit code + captured stdout + stderr. State does NOT persist between "
+            "calls — write to a file via write_file if you need to keep something. "
+            "This is timeout-and-cwd protection, NOT a security sandbox; the operator runs "
+            "TaskGenie on their own machine."
         ),
         "parameters": {
             "type": "object",
@@ -91,13 +101,76 @@ async def _write_file(agent: Any, args: dict[str, Any]) -> str:
     return f"wrote {len(args['content'])} chars to {args['path']}"
 
 
+def _scrubbed_env() -> dict[str, str]:
+    extras = os.environ.get("TASKGENIE_EXEC_ENV_PASSTHROUGH", "")
+    passthrough = _DEFAULT_PASSTHROUGH | {k.strip() for k in extras.split(",") if k.strip()}
+    return {k: v for k, v in os.environ.items() if k in passthrough}
+
+
+def _resolve_argv(language: str, code: str) -> list[str] | None:
+    if language == "python":
+        return [sys.executable, "-c", code]
+    if language == "shell":
+        shell = shutil.which("bash") or shutil.which("sh")
+        if shell:
+            return [shell, "-c", code]
+        if os.name == "nt":
+            return [os.environ.get("COMSPEC", "cmd.exe"), "/c", code]
+        return None
+    return None
+
+
 async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
-    # Real implementation lands in a later pass; v1 returns a stub so the wiring
-    # is testable and the model gets a clear signal that this is unavailable.
-    preview = args["code"][:200] + ("..." if len(args["code"]) > 200 else "")
+    language = args["language"]
+    code = args["code"]
+    argv = _resolve_argv(language, code)
+    if argv is None:
+        return f"[exec_code error] no interpreter found for language={language!r}"
+
+    cwd = agent.scratch_dir
+    Path(cwd).mkdir(parents=True, exist_ok=True)
+    env = _scrubbed_env()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        return f"[exec_code error] could not launch {argv[0]}: {e}"
+    except OSError as e:
+        return f"[exec_code error] {type(e).__name__}: {e}"
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=CONFIG.exec_timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        return (
+            f"[exec_code TIMEOUT after {CONFIG.exec_timeout_seconds}s] "
+            "process killed. Consider shorter / chunked work."
+        )
+
+    def _decode(b: bytes) -> str:
+        try:
+            return b.decode("utf-8", errors="replace")
+        except Exception:
+            return repr(b)
+
+    out = _decode(stdout)
+    err = _decode(stderr)
     return (
-        f"[exec_code STUB] Would run {args['language']}:\n{preview}\n"
-        "Real execution is not wired in v1 — call report_blocker if you need this."
+        f"exit_code={proc.returncode}\n"
+        f"--- stdout ---\n{out or '(empty)'}\n"
+        f"--- stderr ---\n{err or '(empty)'}"
     )
 
 
