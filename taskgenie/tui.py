@@ -188,19 +188,22 @@ class TUI:
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         q = BUS.subscribe()
-        with Live(self._render(), console=self.console, refresh_per_second=8, screen=False) as live:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=0.25)
-                    self._handle_event(event)
-                except asyncio.TimeoutError:
-                    pass
-                live.update(self._render())
-                if stop_when.done():
-                    while not q.empty():
-                        self._handle_event(q.get_nowait())
+        try:
+            with Live(self._render(), console=self.console, refresh_per_second=8, screen=False) as live:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(q.get(), timeout=0.25)
+                        self._handle_event(event)
+                    except asyncio.TimeoutError:
+                        pass
                     live.update(self._render())
-                    break
+                    if stop_when.done():
+                        while not q.empty():
+                            self._handle_event(q.get_nowait())
+                        live.update(self._render())
+                        break
+        finally:
+            BUS.unsubscribe(q)
 
 
 def _short_args(args: dict[str, Any]) -> str:

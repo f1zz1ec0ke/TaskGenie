@@ -337,6 +337,13 @@ class Agent:
             return {"error": child}
         if child.status == "fired":
             return {"error": f"{child.name} was fired and cannot be assigned tasks"}
+        if child.status == "working":
+            return {
+                "error": (
+                    f"{child.name} is already running another task. "
+                    "Call `await_results` on the existing task_handle before re-assigning."
+                )
+            }
 
         task_handle = f"task-{uuid.uuid4().hex[:6]}"
         coro_task = asyncio.create_task(child.run(task), name=task_handle)

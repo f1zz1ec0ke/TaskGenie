@@ -1,18 +1,31 @@
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
 
 from taskgenie.config import CONFIG
 
+_TRANSIENT = (APITimeoutError, APIConnectionError, InternalServerError, RateLimitError)
+
 
 class LMStudioClient:
-    """Thin async wrapper around LM Studio's OpenAI-compatible endpoint."""
+    """Async wrapper around an OpenAI-compatible endpoint with retry + a
+    concurrency semaphore so a manager fanning out N children can't hammer
+    the model server."""
 
     def __init__(self) -> None:
         self._client = AsyncOpenAI(base_url=CONFIG.base_url, api_key=CONFIG.api_key)
         self._model: str | None = CONFIG.model or None
+        self._sem = asyncio.Semaphore(CONFIG.max_concurrent_llm)
 
     async def model_name(self) -> str:
         if self._model:
@@ -37,7 +50,22 @@ class LMStudioClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        resp = await self._client.chat.completions.create(**kwargs)
+
+        last_exc: Exception | None = None
+        for attempt in range(4):  # initial + 3 retries
+            async with self._sem:
+                try:
+                    resp = await self._client.chat.completions.create(**kwargs)
+                    break
+                except _TRANSIENT as e:
+                    last_exc = e
+                    if attempt == 3:
+                        raise
+                    sleep = (2 ** attempt) + random.uniform(0, 0.5)
+                    await asyncio.sleep(sleep)
+        else:  # never executed (loop breaks on success or raises on last attempt)
+            raise last_exc  # type: ignore[misc]
+
         choice = resp.choices[0]
         msg = choice.message
         return {
