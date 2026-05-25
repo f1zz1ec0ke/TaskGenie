@@ -10,8 +10,8 @@ from taskgenie.events import BUS, Event
 from taskgenie.llm import LLM
 from taskgenie.prompts import manager_prompt, worker_prompt
 from taskgenie.result import RunResult
-from taskgenie.tools import MANAGEMENT_TOOLS, WORK_TOOLS
-from taskgenie.tools.work import exec_code, read_file, scratch_for, write_file
+from taskgenie.tools import REGISTRY
+from taskgenie.tools.work import scratch_for
 
 RoleType = Literal["ceo", "manager", "worker"]
 Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
@@ -59,8 +59,8 @@ class Agent:
     @property
     def tools(self) -> list[dict[str, Any]]:
         if self.role_type == "worker":
-            return WORK_TOOLS
-        return MANAGEMENT_TOOLS
+            return REGISTRY.work_tools()
+        return REGISTRY.management_tools()
 
     def _emit(self, kind: str, **data: Any) -> None:
         BUS.publish(Event(kind, self.id, self.name, data=data))  # type: ignore[arg-type]
@@ -192,12 +192,9 @@ class Agent:
             return self._tool_rehire(**args)
         if name == "fire":
             return self._tool_fire(**args)
-        if name == "read_file":
-            return read_file(self.scratch_dir, args["path"])
-        if name == "write_file":
-            return write_file(self.scratch_dir, args["path"], args["content"])
-        if name == "exec_code":
-            return exec_code(args["language"], args["code"])
+        dispatcher = REGISTRY.dispatcher(name)
+        if dispatcher is not None:
+            return await dispatcher(self, args)
         return f"[unknown_tool] {name}"
 
     def _tool_hire(self, name: str, role_type: str, role_prompt: str) -> dict[str, Any]:

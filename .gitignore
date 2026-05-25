@@ -9,4 +9,6 @@ __pycache__/
 dist/
 build/
 .scratch/
+.taskgenie/
+mcp.json
 *.log
