@@ -6,6 +6,7 @@ Run with: python -m tests.test_workspace
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -331,6 +332,109 @@ async def test_utf8_roundtrip(tmp_path: Path) -> None:
     print("[utf8_roundtrip] OK")
 
 
+async def test_overwrite_after_read_warns(tmp_path: Path) -> None:
+    """When an agent does read_workspace(path) then write_workspace(path,
+    mode='overwrite'), the dispatcher appends a lost-update warning to the
+    tool response so the model sees it before its next decision."""
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path))
+    CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects-warn")
+    Agent.REGISTRY.clear()
+    session = Session.create("warn task")
+    Agent.SCRATCH_ROOT = str(session.scratch_root)
+    Agent.WORKSPACE_ROOT = str(session.project_dir)
+
+    worker = Agent(name="W", role_type="worker", system_prompt="...")
+    write = REGISTRY.dispatcher("write_workspace")
+    assert write is not None
+
+    # Set up an existing file the worker will later read + overwrite.
+    (session.project_dir / "config.py").write_text("VERSION = 1\n", encoding="utf-8")
+
+    # Simulate the read_workspace call sitting in the worker's message history.
+    worker.messages.append(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "tc-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_workspace",
+                        "arguments": json.dumps({"path": "config.py"}),
+                    },
+                }
+            ],
+        }
+    )
+
+    # Overwrite after read -> warning in response
+    res = await write(
+        worker,
+        {
+            "path": "config.py",
+            "content": "VERSION = 2\n",
+            "mode": "overwrite",
+        },
+    )
+    assert "wrote (overwrote)" in res
+    assert "WARNING" in res
+    assert "edit_workspace" in res
+
+    # Overwrite WITHOUT a prior read of that exact path -> no warning
+    res = await write(
+        worker,
+        {
+            "path": "newfile.txt",
+            "content": "hello",
+            "mode": "overwrite",
+        },
+    )
+    assert "WARNING" not in res
+
+    print("[overwrite_after_read_warns] OK")
+
+
+def test_safe_jsonable() -> None:
+    """The artifact json writer must survive bundles that contain tuple
+    keys, datetimes, sets, and other JSON-hostile objects -- final.json
+    is a logging artifact, never worth crashing the run over."""
+    from taskgenie.artifacts import _safe_jsonable
+
+    # Plain JSON-friendly content survives unchanged
+    plain = {"a": [1, 2, "three"], "b": {"c": None, "d": True}}
+    assert _safe_jsonable(plain) == plain
+
+    # Tuple key (the bug from the real run) gets stringified
+    tricky = {("foo", "bar"): 5}
+    out = _safe_jsonable(tricky)
+    assert list(out.keys()) == ["('foo', 'bar')"]
+    assert out["('foo', 'bar')"] == 5
+
+    # Tuple values become lists; sets become lists too
+    out = _safe_jsonable({"t": (1, 2, 3), "s": {7, 8}})
+    assert out["t"] == [1, 2, 3]
+    assert sorted(out["s"]) == [7, 8]
+
+    # Nested counter-style dict with mixed key types
+    nested = {"agents": {"id-1": {("a", "b"): 3, "plain": 4}}}
+    out = _safe_jsonable(nested)
+    assert "('a', 'b')" in out["agents"]["id-1"]
+    assert out["agents"]["id-1"]["plain"] == 4
+
+    # Round-trip through json.dumps without exception
+    big = {
+        "stats": {"agents": {"x": {("tuple", "key"): 1, "normal": 2}}},
+        "list": [{"a": (1, 2)}],
+        "set": {1, 2, 3},
+        "raw": object(),  # exotic
+    }
+    s = json.dumps(_safe_jsonable(big), indent=2)
+    assert "tuple" in s and "normal" in s and "object" in s
+
+    print("[safe_jsonable] OK")
+
+
 async def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         await test_worker_writes_workspace(Path(d))
@@ -343,6 +447,9 @@ async def main() -> int:
         test_project_dir_layout(Path(d))
     with tempfile.TemporaryDirectory() as d:
         await test_utf8_roundtrip(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        await test_overwrite_after_read_warns(Path(d))
+    test_safe_jsonable()
     print("\nAll workspace tests passed.")
     return 0
 

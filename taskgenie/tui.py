@@ -333,20 +333,53 @@ class TUI:
 
         node = parent_node.add(label)
 
-        # Spotlight: show the one worker most likely to be "currently
-        # generating" right now under this manager. Pick the working worker
-        # with the most recent last_activity so the line points at whoever's
-        # mid-tool-call or mid-narration, not a stale entry.
+        # Pick the spotlight worker -- the working worker with the most
+        # recent activity, the one most likely to be "currently generating"
+        # under this manager. They get their full narration on the row; the
+        # others get a quieter representation but still appear in the tree.
+        spotlight_id: str | None = None
         if working_workers:
-            spotlight = max(working_workers, key=lambda w: w.last_activity)
-            activity = spotlight.narration or spotlight.last_tool or ""
-            sline = Text()
-            sline.append(_spinner_char(now) + " ", style="yellow")
-            sline.append(spotlight.name, style="bold")
-            if activity:
-                sline.append("  ")
-                sline.append(_trunc(activity, 60), style="italic dim")
-            node.add(sline)
+            spotlight_id = max(working_workers, key=lambda w: w.last_activity).id
+
+        # Show ALL workers as tree rows. Active first (with spotlight at the
+        # top of that group), then done. Cap to keep pathological fan-outs
+        # bounded -- but unlike the previous "spotlight-only" pass, every
+        # worker that fits is visible, including idle and done ones.
+        ordered_workers: list[AgentView] = []
+        if spotlight_id is not None:
+            ordered_workers.append(self.agents[spotlight_id])
+            ordered_workers.extend(w for w in active_workers if w.id != spotlight_id)
+        else:
+            ordered_workers.extend(active_workers)
+        ordered_workers.extend(done_workers)
+
+        worker_cap = 10
+        for w in ordered_workers[:worker_cap]:
+            wline = Text()
+            wstyle = STATUS_STYLE.get(w.status, "white")
+            if w.status == "working":
+                wline.append(_spinner_char(now) + " ", style=wstyle)
+            else:
+                wline.append("● ", style=wstyle)
+            wline.append(w.name, style="bold")
+            if w.id == spotlight_id:
+                activity = w.narration or w.last_tool or ""
+                if activity:
+                    wline.append("  ")
+                    wline.append(_trunc(activity, 60), style="italic dim")
+            elif w.status == "working" and w.last_tool:
+                wline.append(f"  {w.last_tool}", style="cyan dim")
+            else:
+                wline.append(f"  {w.status}", style=f"{wstyle} dim")
+            node.add(wline)
+        worker_overflow = len(ordered_workers) - worker_cap
+        if worker_overflow > 0:
+            node.add(
+                Text(
+                    f"…+{worker_overflow} more workers",
+                    style="dim italic",
+                )
+            )
 
         # Recurse into manager children. Cap to keep deep ragged trees
         # bounded, but in practice the cap rarely triggers because managers

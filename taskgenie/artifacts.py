@@ -71,6 +71,42 @@ def _wrap_html(title: str, body_html: str, meta: dict[str, str]) -> str:
     )
 
 
+def _safe_jsonable(obj: Any) -> Any:
+    """Recursively coerce obj into a JSON-serialisable form.
+
+    The strict `json` module rejects:
+      - dict keys that aren't str/int/float/bool/None (e.g. tuple)
+      - values like bytes, datetime, set, dataclass instances
+
+    Real runs have surfaced "keys must be str, ... not tuple" failures
+    when something deep in the stats/agent tree has a non-string key.
+    Rather than crash the whole final.json write and lose the bundle,
+    sanitise: stringify problematic keys, recurse through containers,
+    fall back to `repr()` for anything else exotic. The lossy
+    conversion is preferable to losing the artifact.
+    """
+    # Primitives JSON natively supports.
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, (str, int, float, bool)) or k is None:
+                safe_k = k
+            else:
+                # Tuple keys and similar -- repr is a deterministic stringification.
+                safe_k = repr(k)
+            out[safe_k] = _safe_jsonable(v)
+        return out
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_safe_jsonable(x) for x in obj]
+    # Last resort: stringify so json.dumps doesn't blow up.
+    try:
+        return str(obj)
+    except Exception:
+        return repr(obj)
+
+
 def _agent_tree(ceo: Agent) -> list[dict[str, Any]]:
     """Snapshot every agent: id, name, role, status, parent, follow_ups, report."""
     nodes: list[dict[str, Any]] = []
@@ -159,7 +195,8 @@ def write_final(
         "history": list(session.data.history),
     }
     json_path.write_text(
-        json.dumps(bundle, indent=2, default=str), encoding="utf-8"
+        json.dumps(_safe_jsonable(bundle), indent=2, default=str),
+        encoding="utf-8",
     )
 
     paths: dict[str, Path] = {"md": md_path, "html": html_path, "json": json_path}

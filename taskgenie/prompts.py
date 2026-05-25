@@ -185,13 +185,21 @@ write to (e.g. "write the main game loop to game.py"), what should go in it, and
 any constraints (style, dependencies). Coordinate across workers so they don't \
 overwrite each other — assign disjoint paths whenever possible.
 
-If two workers MUST touch the same file (e.g. a "coder" creates it and a \
-"polisher" adds comments), serialize the work: assign the creator first, await \
-their completion, then assign the polisher with instructions to use \
-`edit_workspace` rather than `write_workspace(mode='overwrite')`. Running them \
-in parallel risks one's work overwriting the other's. The tool layer surfaces \
-conflicts as errors (loud) rather than as silent data loss (quiet), but the \
-right design is partition-first.
+The simple rule for which tool a worker should reach for:
+  - CREATING a new file -> `write_workspace`.
+  - MODIFYING an existing file (yours or another agent's) -> `edit_workspace`.
+If your charter includes integration / polish / bug-fix work that touches files \
+that ALREADY EXIST, your role prompts to those workers must say so: "edit \
+existing files via `edit_workspace`; do NOT `write_workspace` with mode='overwrite' \
+because that silently discards concurrent changes." Integration / bug-fix workers \
+left to default behaviour often grab `write_workspace(mode='overwrite')` after \
+read_workspace, which is the lost-update bug — name it explicitly in the brief.
+
+If two workers MUST touch the same file (e.g. a creator and a polisher), \
+serialize the work: assign the creator first, await their completion, then \
+assign the polisher with instructions to use `edit_workspace`. Running them in \
+parallel risks one's work overwriting the other's even with edit_workspace's \
+optimistic-concurrency check, so the right design is partition-first.
 
 HANDLING SUBORDINATE RESULTS
 Each entry in await_results carries `status` plus payload:
@@ -288,26 +296,34 @@ available include:
   Nobody else sees these.
 - Built-in shared workspace: `write_workspace`, `edit_workspace`, \
   `read_workspace`, and `list_workspace` operate on the SESSION-WIDE shared \
-  workspace where REAL deliverable files live. If the task is producing \
-  software, documents, art, or any file artifact the user will keep, write \
-  the deliverable here. Distinct from scratch: scratch is for thinking, \
-  workspace is for shipping.
-  CHOOSING THE RIGHT WORKSPACE WRITE TOOL:
-    1. NEW file -> `write_workspace(path, content)`. Default mode is "create" \
-       which FAILS if a file already exists at that path. If it fails, \
-       another worker got there first — read what's there, then decide \
-       whether to extend (use `edit_workspace`) or pick a different path.
-    2. MODIFYING an existing file -> `edit_workspace(path, old_text, new_text)`. \
-       Surgical replacement; old_text must appear exactly once. Safer than \
-       write_workspace(mode='overwrite') because it cannot silently discard \
-       another worker's changes — if the file changed since you last read \
-       it, old_text won't match and the edit fails loud (re-read, retry).
-    3. APPENDING to a log-style file -> \
-       `write_workspace(path, content, mode='append')`. Concurrent appends \
-       from multiple agents interleave cleanly at the OS write boundary.
-    4. INTENTIONAL FULL REPLACE -> `write_workspace(path, content, mode='overwrite')`. \
-       Rare; only when you've fully read what was there and explicitly want \
-       to discard it.
+  workspace where REAL deliverable files live. Use scratch for thinking, \
+  workspace for shipping.
+
+  ONE RULE FOR PICKING THE RIGHT WRITE TOOL:
+    - Is the file BRAND NEW (doesn't exist yet)? -> `write_workspace`. \
+      Default mode='create' will fail loud if you guessed wrong, which is \
+      what you want.
+    - Does the file ALREADY EXIST and you're CHANGING IT? -> `edit_workspace` \
+      with old_text / new_text. Surgical, conflict-detecting, safe.
+
+  That's it. If you have a `read_workspace` call in your history for a path, \
+  your write back to that path MUST be `edit_workspace`. The chain \
+  read_workspace -> write_workspace(mode='overwrite') is the textbook \
+  lost-update bug: another agent's concurrent change disappears with no \
+  warning. `edit_workspace` makes that race surface as a "old_text not \
+  found" error you can retry instead.
+
+  Many sequential edits to a file are FINE -- make several small \
+  `edit_workspace` calls rather than one giant overwrite. The conflict \
+  detection only kicks in when there's actual concurrent contention.
+
+  EDGE CASES (use only when you really mean them):
+    - APPEND to a log-style file -> `write_workspace(..., mode='append')`.
+    - REGENERATE a file from scratch with NO regard for prior content -> \
+      `write_workspace(..., mode='overwrite')`. If you previously \
+      read_workspace this path, the dispatcher will warn you in the tool \
+      response -- that warning means STOP and switch to edit_workspace.
+
   CONTENT STYLE: write plain text. AVOID EMOJIS in code, comments, docs, \
   filenames, and reports unless the task description specifically asks for \
   them. They add tokens, don't render consistently across terminals and \

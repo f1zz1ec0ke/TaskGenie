@@ -6,6 +6,7 @@ calling agent's scratch directory to scope file operations.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -82,21 +83,25 @@ _WRITE_WORKSPACE_SCHEMA = {
     "function": {
         "name": "write_workspace",
         "description": (
-            "Write a file into the SHARED WORKSPACE -- the directory of REAL deliverables "
-            "the user will end up with (e.g. game.py, index.html, README.md, assets/...). "
-            "Workers use this when the task is producing software, documents, art, or any "
-            "file artifact. Creates parent directories as needed. Distinct from "
-            "`write_file` (your private scratch for intermediate work). Use scratch for "
-            "thinking, workspace for shipping. "
-            "\n\n"
+            "Write a BRAND-NEW file into the SHARED WORKSPACE -- the directory of REAL "
+            "deliverables the user will end up with (e.g. game.py, index.html, README.md, "
+            "assets/...). Workers use this when CREATING a new file artifact. Creates "
+            "parent directories as needed. Distinct from `write_file` (your private "
+            "scratch for intermediate work).\n\n"
+            "IF YOU ARE MODIFYING AN EXISTING FILE, USE `edit_workspace` INSTEAD, NOT "
+            "THIS TOOL. A read_workspace + write_workspace(mode='overwrite') sequence is "
+            "the textbook lost-update bug; another agent's changes silently disappear. "
+            "edit_workspace can't do that.\n\n"
             "MODES (chooses how to handle an existing file at the same path):\n"
-            "  - 'create' (default): FAILS if the file already exists. Use for new files. "
-            "Catches accidental clobbers loud rather than silent. If you got 'file exists', "
-            "you probably want `edit_workspace` instead -- not a brute overwrite.\n"
-            "  - 'overwrite': replaces existing content. Use ONLY when you genuinely "
-            "intend to discard whatever was there.\n"
+            "  - 'create' (DEFAULT, almost always the right choice): FAILS if the file "
+            "already exists. Catches accidental clobbers loud rather than silent. If you "
+            "got 'file exists', SWITCH TO `edit_workspace` -- do NOT retry with overwrite.\n"
+            "  - 'overwrite': replaces existing content WHOLESALE. Use ONLY when you are "
+            "regenerating a file from scratch with NO regard for prior content (e.g. you "
+            "did NOT call read_workspace on this path). If you read the file first, you "
+            "should be editing, not overwriting.\n"
             "  - 'append': appends to the existing file (creates if missing). Safe for "
-            "log-style additions."
+            "log-style additions where order matters and no rewriting is needed."
         ),
         "parameters": {
             "type": "object",
@@ -239,6 +244,27 @@ async def _read_workspace(agent: Any, args: dict[str, Any]) -> str:
     return p.read_text(encoding="utf-8")
 
 
+def _agent_read_workspace_paths(agent: Any) -> set[str]:
+    """Inspect this agent's tool-call history for paths they read from
+    workspace. Used to nudge them away from mode='overwrite' after a read,
+    which is the lost-update anti-pattern."""
+    paths: set[str] = set()
+    for msg in getattr(agent, "messages", []):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            fn = tc.get("function", {})
+            if fn.get("name") != "read_workspace":
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(args.get("path"), str):
+                paths.add(args["path"])
+    return paths
+
+
 async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
     base = _workspace_or_error(agent)
     if isinstance(base, str):
@@ -252,15 +278,31 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
         if p.exists():
             return (
                 f"ERROR: workspace/{args['path']} already exists. "
-                "Use `edit_workspace` to modify it, or pass mode='overwrite' if you "
-                "really intend to discard the current contents."
+                "Use `edit_workspace` to modify it surgically. If you genuinely "
+                "want to discard the current contents (rare), retry with "
+                "mode='overwrite'."
             )
         p.write_text(content, encoding="utf-8")
         return f"wrote (created) {len(content)} chars to workspace/{args['path']}"
 
     if mode == "overwrite":
+        # Lost-update detector: if this agent previously read this path,
+        # appending a warning to the tool response makes the model aware
+        # they're about to make the read+overwrite mistake. We still write
+        # (overwrite is a legitimate sometimes-tool), but the warning steers
+        # next-turn decisions toward edit_workspace.
+        previously_read = args["path"] in _agent_read_workspace_paths(agent)
         p.write_text(content, encoding="utf-8")
-        return f"wrote (overwrote) {len(content)} chars to workspace/{args['path']}"
+        msg = f"wrote (overwrote) {len(content)} chars to workspace/{args['path']}"
+        if previously_read:
+            msg += (
+                "\nWARNING: you previously read this file and then overwrote it. "
+                "If you intended to MODIFY it, you just may have lost another "
+                "agent's concurrent changes. Use `edit_workspace(old_text, "
+                "new_text)` for read-then-modify cycles -- it surfaces conflicts "
+                "as errors instead of as silent data loss."
+            )
+        return msg
 
     if mode == "append":
         # Open in append mode so concurrent appends from multiple agents
