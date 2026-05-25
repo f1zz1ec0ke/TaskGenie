@@ -19,10 +19,14 @@ from taskgenie.event_logger import read_events
 class AgentSummary:
     name: str
     role_type: str
-    turns: int = 0  # number of assistant messages = LLM calls
+    turns: int = 0  # number of assistant messages = narrate events
+    llm_calls: int = 0  # actual LLM round-trips this agent made
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     tool_calls: Counter[str] = field(default_factory=Counter)
     status: str = "?"
     blocker: dict[str, str] | None = None
+    follow_ups_raised: int = 0
 
 
 @dataclass
@@ -37,6 +41,11 @@ class RunStats:
     reviews_accepted: int
     reviews_rejected: int
     tool_call_total: int
+    llm_calls_total: int
+    prompt_tokens_total: int
+    completion_tokens_total: int
+    questions_asked: int  # CEO -> user mid-task questions
+    follow_ups_total: int
     duration_seconds: float | None
     started_at: str | None
     ended_at: str | None
@@ -63,6 +72,11 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
     blockers_total = blockers_escalated_to_user = 0
     reviews_accepted = reviews_rejected = 0
     tool_call_total = 0
+    llm_calls_total = 0
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
+    questions_asked = 0
+    follow_ups_total = 0
     first_ts: datetime | None = None
     last_ts: datetime | None = None
 
@@ -98,6 +112,22 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
             tool = data.get("tool", "?")
             agent.tool_calls[tool] += 1
             tool_call_total += 1
+        elif kind == "llm_call":
+            agent.llm_calls += 1
+            llm_calls_total += 1
+            pt = int(data.get("prompt_tokens", 0) or 0)
+            ct = int(data.get("completion_tokens", 0) or 0)
+            agent.prompt_tokens += pt
+            agent.completion_tokens += ct
+            prompt_tokens_total += pt
+            completion_tokens_total += ct
+        elif kind == "follow_up_suggested":
+            agent.follow_ups_raised += 1
+            follow_ups_total += 1
+        elif kind == "question":
+            # The CEO is the only role with ask_user, but counting per-agent
+            # falls out for free in case that ever changes.
+            questions_asked += 1
         elif kind == "hire":
             hires += 1
         elif kind == "fire":
@@ -137,10 +167,23 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
         reviews_accepted=reviews_accepted,
         reviews_rejected=reviews_rejected,
         tool_call_total=tool_call_total,
+        llm_calls_total=llm_calls_total,
+        prompt_tokens_total=prompt_tokens_total,
+        completion_tokens_total=completion_tokens_total,
+        questions_asked=questions_asked,
+        follow_ups_total=follow_ups_total,
         duration_seconds=duration,
         started_at=first_ts.isoformat(timespec="seconds") if first_ts else None,
         ended_at=last_ts.isoformat(timespec="seconds") if last_ts else None,
     )
+
+
+def _fmt_count(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
 
 
 def render_panel(stats: RunStats):
@@ -167,7 +210,21 @@ def render_panel(stats: RunStats):
         "Reviews",
         f"{stats.reviews_accepted} accepted, {stats.reviews_rejected} rejected",
     )
+    overview.add_row(
+        "User questions",
+        f"{stats.questions_asked} asked",
+    )
+    overview.add_row(
+        "Follow-ups raised",
+        f"{stats.follow_ups_total} total",
+    )
     overview.add_row("Tool calls", str(stats.tool_call_total))
+    overview.add_row(
+        "LLM calls",
+        f"{stats.llm_calls_total} calls — "
+        f"{_fmt_count(stats.prompt_tokens_total)} prompt / "
+        f"{_fmt_count(stats.completion_tokens_total)} completion tokens",
+    )
     if stats.duration_seconds is not None:
         overview.add_row("Wall time", f"{stats.duration_seconds:.1f}s")
 
@@ -176,6 +233,8 @@ def render_panel(stats: RunStats):
     per_agent.add_column("role")
     per_agent.add_column("status")
     per_agent.add_column("turns", justify="right")
+    per_agent.add_column("LLM", justify="right")
+    per_agent.add_column("tok ↑/↓", justify="right")
     per_agent.add_column("top tools", overflow="fold")
     per_agent.add_column("blocker", overflow="fold")
     status_style = {
@@ -199,6 +258,8 @@ def render_panel(stats: RunStats):
             agent.role_type,
             f"[{style}]{agent.status}[/]",
             str(agent.turns),
+            str(agent.llm_calls),
+            f"{_fmt_count(agent.prompt_tokens)}/{_fmt_count(agent.completion_tokens)}",
             top_tools,
             blocker_text or "—",
         )
