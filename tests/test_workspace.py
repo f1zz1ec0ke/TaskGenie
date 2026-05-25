@@ -6,6 +6,7 @@ Run with: python -m tests.test_workspace
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -15,13 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from taskgenie.agent import Agent
 from taskgenie.config import CONFIG
 from taskgenie.prompts import worker_prompt, manager_prompt
-from taskgenie.session import Session
+from taskgenie.session import Session, PROJECTS_ROOT_ENV
 from taskgenie.tools.registry import REGISTRY
 
 
 async def test_worker_writes_workspace(tmp_path: Path) -> None:
     object.__setattr__(CONFIG, "data_dir", str(tmp_path))
     CONFIG.sessions_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "projects")
     Agent.REGISTRY.clear()
 
     session = Session.create("workspace task")
@@ -95,10 +97,47 @@ async def test_workspace_tool_kinds() -> None:
     print("[workspace_tool_kinds] OK")
 
 
+def test_project_dir_layout(tmp_path: Path) -> None:
+    """Sessions land workspaces in ./TaskGenie/<project>/, not in the session dir."""
+    object.__setattr__(CONFIG, "data_dir", str(tmp_path / "data"))
+    os.environ[PROJECTS_ROOT_ENV] = str(tmp_path / "TaskGenie")
+    Agent.REGISTRY.clear()
+
+    # Default project name derived from the task slug
+    s1 = Session.create("Build a physics game")
+    assert s1.project_dir.parent == (tmp_path / "TaskGenie").resolve()
+    assert s1.project_dir.name == "build-a-physics-game"
+    assert s1.project_dir.exists()
+    # Session metadata lives separately, under data_dir
+    assert s1.root_dir.exists()
+    assert str(s1.root_dir) != str(s1.project_dir)
+
+    # Collision suffix when the dir already exists
+    s2 = Session.create("Build a physics game")
+    assert s2.project_dir.name == "build-a-physics-game-2"
+    assert s2.project_dir.exists()
+    assert s2.project_dir != s1.project_dir
+
+    # Explicit --project override
+    s3 = Session.create("Whatever the task is", project="MyGame")
+    assert s3.project_dir.name == "MyGame"
+
+    # project_dir survives reload (round-trip through state.json)
+    s1.save()
+    reloaded = Session.load(s1.session_id)
+    assert reloaded.project_dir == s1.project_dir
+    # And workspace_dir is now an alias for project_dir
+    assert reloaded.workspace_dir == reloaded.project_dir
+
+    print("[project_dir_layout] OK")
+
+
 async def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         await test_worker_writes_workspace(Path(d))
     await test_workspace_tool_kinds()
+    with tempfile.TemporaryDirectory() as d:
+        test_project_dir_layout(Path(d))
     print("\nAll workspace tests passed.")
     return 0
 

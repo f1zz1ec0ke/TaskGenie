@@ -3,6 +3,13 @@
 Conservative checkpointing: only saves at clean quiescent points (after the
 CEO's run loop returns). State is JSON for readability; the per-agent scratch
 directories live alongside.
+
+Two on-disk locations per session:
+  - `.taskgenie/sessions/<id>/`  — internal: state.json, events.jsonl, scratch
+  - `./TaskGenie/<project>/`     — USER-FACING: the workspace deliverables
+                                    (game.py, README.md, etc.) plus a copy of
+                                    the CEO's report. This is what the user
+                                    opens after the run.
 """
 from __future__ import annotations
 
@@ -21,6 +28,8 @@ from taskgenie.tools.registry import REGISTRY
 
 STATE_FILE = "state.json"
 EVENTS_FILE = "events.jsonl"
+PROJECTS_ROOT_ENV = "TASKGENIE_PROJECTS_DIR"
+DEFAULT_PROJECTS_ROOT = "TaskGenie"
 
 
 def make_session_id(task: str) -> str:
@@ -29,6 +38,30 @@ def make_session_id(task: str) -> str:
     slug = "-".join(words)[:40] or "session"
     suffix = secrets.token_hex(2)
     return f"{date}-{slug}-{suffix}"
+
+
+def _project_slug(task: str) -> str:
+    """A short, friendly directory name derived from the task."""
+    words = re.findall(r"\w+", task.lower())[:4]
+    slug = "-".join(words)[:30]
+    return slug or "project"
+
+
+def _projects_root() -> Path:
+    return Path(os.environ.get(PROJECTS_ROOT_ENV, DEFAULT_PROJECTS_ROOT)).resolve()
+
+
+def _unique_project_dir(name: str) -> Path:
+    """Pick a project dir under the projects root, suffixing on collision."""
+    root = _projects_root()
+    base = root / name
+    if not base.exists():
+        return base
+    for i in range(2, 1000):
+        candidate = root / f"{name}-{i}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Too many existing {name}* projects in {root}")
 
 
 @dataclass
@@ -47,6 +80,7 @@ class SessionData:
     last_saved_at: str
     status: str  # "running" | "blocked" | "done" | "abandoned" | "error"
     ceo_id: str | None
+    project_dir: str = ""  # absolute path to ./TaskGenie/<project>/
     agents: dict[str, dict[str, Any]] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
     tool_signature: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -82,17 +116,29 @@ class Session:
         return self.root_dir / "scratch"
 
     @property
-    def workspace_dir(self) -> Path:
-        """The shared, deliverable-style file directory for this session.
-        Workers write actual artifacts (code, docs, art) here so the CEO
-        can point the user at real files instead of inlining everything
-        into a markdown report."""
+    def project_dir(self) -> Path:
+        """The user-facing project directory under ./TaskGenie/<project>/.
+        Workers write deliverable artifacts here; the CEO's report is
+        copied alongside as README.md so the user can `cd` here and see
+        everything together."""
+        if self.data.project_dir:
+            return Path(self.data.project_dir)
+        # Backward-compat for sessions saved before project_dir existed:
+        # fall back to the old session/workspace/ location.
         return self.root_dir / "workspace"
 
+    # Alias retained so older callers (and tools that referenced
+    # session.workspace_dir) still resolve to the right path.
+    @property
+    def workspace_dir(self) -> Path:
+        return self.project_dir
+
     @classmethod
-    def create(cls, task: str) -> "Session":
+    def create(cls, task: str, project: str | None = None) -> "Session":
         session_id = make_session_id(task)
         now = _dt.datetime.now().isoformat(timespec="seconds")
+        slug = project or _project_slug(task)
+        project_path = _unique_project_dir(slug)
         data = SessionData(
             session_id=session_id,
             task=task,
@@ -100,12 +146,13 @@ class Session:
             last_saved_at=now,
             status="running",
             ceo_id=None,
+            project_dir=str(project_path),
         )
         data.add_history(HistoryEntry(kind="task", text=task))
         session = cls(data)
         session.root_dir.mkdir(parents=True, exist_ok=True)
         session.scratch_root.mkdir(parents=True, exist_ok=True)
-        session.workspace_dir.mkdir(parents=True, exist_ok=True)
+        project_path.mkdir(parents=True, exist_ok=True)
         return session
 
     @classmethod
