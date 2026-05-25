@@ -45,6 +45,7 @@ class Agent:
         self.task_targets: dict[str, str] = {}
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
+        self.follow_ups: list[dict[str, Any]] = []
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
         Agent.REGISTRY[self.id] = self
         BUS.publish(
@@ -76,6 +77,7 @@ class Agent:
             "scratch_dir": self.scratch_dir,
             "blocker_reason": self.blocker_reason,
             "blocker_needs": self.blocker_needs,
+            "follow_ups": self.follow_ups,
         }
 
     @classmethod
@@ -94,6 +96,7 @@ class Agent:
         agent.task_targets = {}
         agent.blocker_reason = d.get("blocker_reason", "")
         agent.blocker_needs = d.get("blocker_needs", "")
+        agent.follow_ups = d.get("follow_ups", [])
         agent.scratch_dir = d["scratch_dir"]
         cls.REGISTRY[agent.id] = agent
         return agent
@@ -223,7 +226,9 @@ class Agent:
                     report = args.get("report", content or "")
                     self._set_status("done", report=report)
                     self._emit("complete", report=report)
-                    return RunResult(kind="done", report=report)
+                    return RunResult(
+                        kind="done", report=report, follow_ups=list(self.follow_ups)
+                    )
 
                 if name == "report_blocker":
                     reason = args.get("reason", "")
@@ -243,7 +248,29 @@ class Agent:
                         reason=reason,
                         needs=needs,
                         partial_progress=partial,
+                        follow_ups=list(self.follow_ups),
                     )
+
+                if name == "suggest_follow_up":
+                    entry = {
+                        "what": args.get("what_is_needed", ""),
+                        "rationale": args.get("rationale", ""),
+                        "who": args.get("who_should_do_it", ""),
+                    }
+                    self.follow_ups.append(entry)
+                    self._emit("follow_up_suggested", **entry)
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": (
+                                f"Follow-up recorded: {entry['what']}. "
+                                "It will be passed to your parent when you complete. "
+                                "Keep working on your assigned task."
+                            ),
+                        }
+                    )
+                    continue
 
                 try:
                     result = await self._execute_tool(name, args)

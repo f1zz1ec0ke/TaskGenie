@@ -62,6 +62,7 @@ class AgentView:
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
         self.partial_progress: str = ""
+        self.follow_ups: list[dict[str, str]] = []
         self.children_ids: list[str] = []
         self.spawn_time: float = time.time()
         self.last_activity: float = time.time()
@@ -156,6 +157,19 @@ class TUI:
             view.status = "done"
             self._log(f"[green]{view.name} complete[/]")
             self._touch(view)
+        elif kind == "follow_up_suggested":
+            view.follow_ups.append(
+                {
+                    "what": data.get("what", ""),
+                    "rationale": data.get("rationale", ""),
+                    "who": data.get("who", ""),
+                }
+            )
+            self._log(
+                f"[magenta]{view.name} ↑ follow-up[/]: "
+                f"{_trunc(data.get('what', ''), 80)}"
+            )
+            self._touch(view)
         elif kind == "blocked":
             view.blocker_reason = data.get("reason", "")
             view.blocker_needs = data.get("needs", "")
@@ -196,6 +210,8 @@ class TUI:
 
         label.append(f"  {view.role_type}/", style="dim")
         label.append(view.status, style=style)
+        if view.follow_ups:
+            label.append(f"  +{len(view.follow_ups)}", style="magenta")
         return label
 
     def _build_tree(self) -> Tree:
@@ -260,6 +276,23 @@ class TUI:
         if v.status == "done" and v.report:
             body_parts.append(Text("report:", style="green dim"))
             body_parts.append(Text(_trunc(v.report, 800), style="green"))
+
+        if v.follow_ups:
+            body_parts.append(Text(""))
+            body_parts.append(
+                Text(f"follow-ups suggested ({len(v.follow_ups)}):", style="magenta dim")
+            )
+            for i, fu in enumerate(v.follow_ups[:5], 1):
+                line = Text()
+                line.append(f"  {i}. ", style="magenta dim")
+                line.append(_trunc(fu.get("what", ""), 90), style="magenta")
+                if fu.get("rationale"):
+                    line.append(f" -- {_trunc(fu['rationale'], 60)}", style="magenta dim")
+                body_parts.append(line)
+            if len(v.follow_ups) > 5:
+                body_parts.append(
+                    Text(f"  ... and {len(v.follow_ups) - 5} more", style="magenta dim")
+                )
 
         return Panel(
             Group(*body_parts),

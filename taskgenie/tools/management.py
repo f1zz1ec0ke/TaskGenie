@@ -201,6 +201,40 @@ _REPORT_BLOCKER_SCHEMA = {
     },
 }
 
+_SUGGEST_FOLLOW_UP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "suggest_follow_up",
+        "description": (
+            "Buffer a suggestion for additional work that should be done. Does NOT end your "
+            "run — you keep working after calling this. When you eventually `complete`, your "
+            "buffered suggestions ride along to your parent in the follow_ups field. The "
+            "parent decides whether to spawn a new sibling, expand their own scope, or relay "
+            "the suggestion further up the chain. Use this when you notice work that's "
+            "ADJACENT to your assigned task but out of your direct scope — genuine gaps, "
+            "not vague ideas."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "what_is_needed": {
+                    "type": "string",
+                    "description": "Specifically what additional work should be done.",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this matters — what gap or opportunity you noticed.",
+                },
+                "who_should_do_it": {
+                    "type": "string",
+                    "description": "Optional hint about who should pick this up (e.g. 'a sub-manager focused on X', 'a worker who can do Y').",
+                },
+            },
+            "required": ["what_is_needed", "rationale"],
+        },
+    },
+}
+
 
 def register_management_tools() -> None:
     for schema in [
@@ -214,6 +248,7 @@ def register_management_tools() -> None:
         REGISTRY.register(schema, kind="management", version="1.0")
     REGISTRY.register(_COMPLETE_SCHEMA, kind="both", version="1.0")
     REGISTRY.register(_REPORT_BLOCKER_SCHEMA, kind="both", version="1.0")
+    REGISTRY.register(_SUGGEST_FOLLOW_UP_SCHEMA, kind="both", version="1.0")
 
 
 register_management_tools()
