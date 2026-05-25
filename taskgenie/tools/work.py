@@ -101,8 +101,9 @@ async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
     )
 
 
-def scratch_for(agent_id: str) -> str:
-    path = os.path.join(str(CONFIG.scratch_dir), agent_id)
+def scratch_for(agent_id: str, root: str | None = None) -> str:
+    base = root or str(CONFIG.scratch_dir)
+    path = os.path.join(base, agent_id)
     os.makedirs(path, exist_ok=True)
     return path
 
