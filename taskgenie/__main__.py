@@ -13,6 +13,7 @@ from rich.table import Table
 
 from taskgenie.agent import Agent
 from taskgenie.config import CONFIG
+from taskgenie.event_logger import JSONLEventLogger
 from taskgenie.mcp_client import MCPClient
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
@@ -187,20 +188,26 @@ async def _drive_session(
 async def _run_new(task: str) -> int:
     console = Console()
     mcp = await MCPClient.from_config(CONFIG.mcp_config_path)
+    logger: JSONLEventLogger | None = None
     try:
         session = Session.create(task)
         Agent.SCRATCH_ROOT = str(session.scratch_root)
+        logger = JSONLEventLogger(session.events_path)
+        logger.start()
         _print_banner(console, session, mcp)
         ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
         tui = TUI(task=task)
         return await _drive_session(console, session, mcp, ceo, tui, task)
     finally:
+        if logger is not None:
+            await logger.stop()
         await mcp.close()
 
 
 async def _run_resume(session_id: str | None) -> int:
     console = Console()
     mcp = await MCPClient.from_config(CONFIG.mcp_config_path)
+    logger: JSONLEventLogger | None = None
     try:
         if session_id:
             session = Session.load(session_id)
@@ -214,6 +221,8 @@ async def _run_resume(session_id: str | None) -> int:
             )
 
         Agent.SCRATCH_ROOT = str(session.scratch_root)
+        logger = JSONLEventLogger(session.events_path)
+        logger.start()
         Agent.bulk_load(session.data.agents)
         if session.data.ceo_id is None or session.data.ceo_id not in Agent.REGISTRY:
             console.print("[red]Session has no CEO recorded — cannot resume.[/]")
@@ -255,6 +264,8 @@ async def _run_resume(session_id: str | None) -> int:
         tui = TUI(task=session.data.task)
         return await _drive_session(console, session, mcp, ceo, tui, message)
     finally:
+        if logger is not None:
+            await logger.stop()
         await mcp.close()
 
 
