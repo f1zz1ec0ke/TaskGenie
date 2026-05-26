@@ -309,6 +309,15 @@ available include:
 - Built-in scratch: `read_file` and `write_file` for the per-agent scratch \
   directory — your private workspace for intermediate notes and drafts. \
   Nobody else sees these.
+
+  CONTEXT MANAGEMENT: when a previous tool produced a lot of output (a big \
+  file read, a long exec_code stdout, etc.), it may have been replaced in \
+  your message history with a one-line pointer like `[tool output dumped: \
+  47KB from 'exec_code'; full content saved to scratch file \
+  'tool-t14-exec_code-call_xyz.log'. Call read_file(path='tool-...') to \
+  retrieve it.]` The original output is on disk in your scratch. Call \
+  `read_file` with the named filename ONLY if you need to consult the \
+  full text again — otherwise the summary in the pointer is enough.
 - Built-in shared workspace: `write_workspace`, `edit_workspace`, \
   `read_workspace`, and `list_workspace` operate on the SESSION-WIDE shared \
   workspace where REAL deliverable files live. Use scratch for thinking, \

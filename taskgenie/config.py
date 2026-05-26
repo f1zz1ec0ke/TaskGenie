@@ -35,6 +35,13 @@ class Config:
     max_concurrent_llm: int = _env_int("TASKGENIE_MAX_CONCURRENT_LLM", 4)
     exec_timeout_seconds: int = _env_int("TASKGENIE_EXEC_TIMEOUT", 30)
     mcp_call_timeout_seconds: int = _env_int("TASKGENIE_MCP_CALL_TIMEOUT", 60)
+    # Context-window management knobs (see taskgenie/context.py + archivist.py).
+    # Default ctx_window matches Claude 3.5+ / many local models; smaller
+    # models should override via TASKGENIE_CTX_WINDOW.
+    ctx_window_tokens: int = _env_int("TASKGENIE_CTX_WINDOW", 128000)
+    compact_at_pct: float = _env_float("TASKGENIE_COMPACT_AT_PCT", 0.8)
+    compact_keep_recent: int = _env_int("TASKGENIE_COMPACT_KEEP_RECENT", 6)
+    dump_tool_output_above_bytes: int = _env_int("TASKGENIE_DUMP_OVER_BYTES", 16384)
     data_dir: str = _env("TASKGENIE_DATA_DIR", ".taskgenie")
     mcp_config_path: str = _env("TASKGENIE_MCP_CONFIG", "./mcp.json")
 
