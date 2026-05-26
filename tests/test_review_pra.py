@@ -77,7 +77,7 @@ class _CompleteOnTurnZero:
     async def model_name(self) -> str:
         return "scripted"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         return {
             "content": "Done.",
             "tool_calls": [_tc("call_complete_1", "complete", report="hello")],
@@ -88,7 +88,7 @@ class _BlockerOnTurnZero:
     async def model_name(self) -> str:
         return "scripted"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         return {
             "content": "stuck",
             "tool_calls": [
@@ -106,7 +106,7 @@ class _AskUserOnTurnZero:
     async def model_name(self) -> str:
         return "scripted"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         return {
             "content": "need input",
             "tool_calls": [
@@ -123,7 +123,7 @@ class _CompleteAfterSiblingTool:
     async def model_name(self) -> str:
         return "scripted"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         return {
             "content": "both at once",
             "tool_calls": [
@@ -140,11 +140,17 @@ class _CompleteAfterSiblingTool:
 
 
 def _new_ceo() -> Agent:
+    """Build a fresh CEO. Uses mkdtemp (not TemporaryDirectory as a context
+    manager) because the scratch dir must outlive this call -- the
+    original `with TemporaryDirectory() as d: ... return Agent(...)`
+    pattern deleted the tempdir before the test could use it, so every
+    CEO created here was silently writing under a path that wouldn't be
+    cleaned up by the context manager."""
     Agent.REGISTRY.clear()
-    with tempfile.TemporaryDirectory() as d:
-        Agent.SCRATCH_ROOT = d
-        Agent.WORKSPACE_ROOT = d
-        return Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
+    d = tempfile.mkdtemp(prefix="tg-test-pra-")
+    Agent.SCRATCH_ROOT = d
+    Agent.WORKSPACE_ROOT = d
+    return Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
 
 
 async def test_complete_seals_its_own_tool_call() -> None:

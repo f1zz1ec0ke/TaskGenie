@@ -231,20 +231,46 @@ class Session:
             "ceo": REGISTRY.signature("ceo"),
         }
         self.root_dir.mkdir(parents=True, exist_ok=True)
-        # Atomic write.
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=self.root_dir,
-            prefix=".state-",
-            suffix=".json.tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            json.dump(asdict(self.data), tmp, indent=2)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = tmp.name
-        os.replace(tmp_path, self.state_path)
+        # Atomic write. `default=str` mirrors event_logger/artifacts and
+        # keeps an accidentally-leaked non-JSON-native value (a Path, a
+        # set, a stray datetime) from raising mid-write and orphaning the
+        # temp file. The try/finally below cleans up any temp that didn't
+        # make it through `os.replace`.
+        tmp_path: str | None = None
+        consumed = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=self.root_dir,
+                prefix=".state-",
+                suffix=".json.tmp",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                json.dump(asdict(self.data), tmp, indent=2, default=str)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp_path = tmp.name
+            os.replace(tmp_path, self.state_path)
+            consumed = True
+            # fsync the directory on POSIX so the rename itself is
+            # durable across power loss. Windows doesn't expose this;
+            # skip there.
+            if os.name != "nt":
+                try:
+                    dir_fd = os.open(self.root_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+        finally:
+            if tmp_path and not consumed:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def snapshot_agents(self, agents: dict[str, dict[str, Any]]) -> None:
         self.data.agents = agents

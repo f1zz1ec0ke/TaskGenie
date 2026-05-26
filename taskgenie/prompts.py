@@ -342,11 +342,16 @@ available include:
   detection only kicks in when there's actual concurrent contention.
 
   EDGE CASES (use only when you really mean them):
-    - APPEND to a log-style file -> `write_workspace(..., mode='append')`.
+    - APPEND to a log-style file -> `write_workspace(..., mode='append')`. \
+      Atomic only for payloads <= 4KB; for larger appends two concurrent \
+      writers can interleave at chunk boundaries.
     - REGENERATE a file from scratch with NO regard for prior content -> \
-      `write_workspace(..., mode='overwrite')`. If you previously \
-      read_workspace this path, the dispatcher will warn you in the tool \
-      response -- that warning means STOP and switch to edit_workspace.
+      `write_workspace(..., mode='overwrite')`. The dispatcher tracks which \
+      paths you previously read_workspace'd: mode='create' on such a path \
+      hard-fails with "file exists" (telling you to switch to edit_workspace), \
+      and mode='overwrite' still succeeds but the response carries a WARNING \
+      about lost-update. Either way, read-then-modify means use \
+      `edit_workspace`.
 
   CONTENT STYLE: write plain text. AVOID EMOJIS in code, comments, docs, \
   filenames, and reports unless the task description specifically asks for \
@@ -354,9 +359,21 @@ available include:
   editors, and look unprofessional in source artifacts. Use real words. \
   Files and their contents support full Unicode (accents, math symbols, \
   CJK, etc.) — that's fine and expected; emoji are the discouraged subset.
-- Built-in exec: `exec_code` for short Python or shell snippets in a sandbox \
-  (may be stubbed — check the description; if it says STUB, treat any real \
-  exec need as a blocker). Working directory is your scratch.
+- Built-in exec: two tools, picked by where you want to run.
+    * `exec_code` runs in your SCRATCH directory. Use for intermediate \
+      computation, validating a regex, scratch-only file transforms — \
+      nothing that produces a shared artifact.
+    * `exec_workspace` runs in the SHARED WORKSPACE. Use to TEST or \
+      INVOKE a deliverable file your team wrote via `write_workspace` \
+      — e.g. `python game.py` to verify it launches, `pytest`, \
+      `node server.js`, etc. Relative paths in your snippet resolve \
+      against the workspace root, so portable commands just work.
+  Mirrors the read/write split (`read_file`/`read_workspace`, \
+  `write_file`/`write_workspace`): same private-vs-shared decision. \
+  Env vars `$TASKGENIE_WORKSPACE` and `$TASKGENIE_SCRATCH` are exposed \
+  in both, so a snippet that needs to bounce between them (e.g. read \
+  config from workspace, write log to scratch) can. State does NOT \
+  persist between exec calls — use scratch files for intermediates.
 - MCP-provided: whatever tools the operator has configured (commonly web search and \
   URL fetch, but anything they wired up). Check your tool list for exact names like \
   `brave_web_search`, `fetch`, etc.

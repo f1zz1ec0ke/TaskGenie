@@ -49,7 +49,7 @@ class _RaisingLLM:
     async def model_name(self) -> str:
         return "raises"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         raise ConnectionError("boom: cannot reach LLM")
 
 
@@ -67,7 +67,7 @@ class _LoopingNoOpLLM:
     async def model_name(self) -> str:
         return "loop"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         self._n += 1
         return {
             "content": "still going",
@@ -93,7 +93,7 @@ class _MalformedToolArgsLLM:
     async def model_name(self) -> str:
         return "bad-json"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         turn = self._turn
         self._turn += 1
         if turn == 0:
@@ -111,11 +111,14 @@ class _MalformedToolArgsLLM:
 
 
 def _new_ceo() -> Agent:
+    """See test_review_pra._new_ceo for why we use mkdtemp instead of a
+    TemporaryDirectory context manager (the old version deleted the
+    scratch dir before the test ran)."""
     Agent.REGISTRY.clear()
-    with tempfile.TemporaryDirectory() as d:
-        Agent.SCRATCH_ROOT = d
-        Agent.WORKSPACE_ROOT = d
-        return Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
+    d = tempfile.mkdtemp(prefix="tg-test-prb-")
+    Agent.SCRATCH_ROOT = d
+    Agent.WORKSPACE_ROOT = d
+    return Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
 
 
 # ---------------------------------------------------------------------------

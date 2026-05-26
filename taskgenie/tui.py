@@ -201,7 +201,12 @@ class _ColumnOverflowTree:
         # Tell Panel we'll happily use the full inner width. Without this,
         # measure would fall through to Tree.__rich_measure__ which can
         # report a very wide preferred width and make Panel mis-size.
-        return Measurement(self.MIN_COL_WIDTH, options.max_width)
+        # Clamp min to max so very narrow terminals (max_width < MIN_COL_WIDTH)
+        # don't produce an invalid min>max Measurement.
+        return Measurement(
+            min(self.MIN_COL_WIDTH, options.max_width),
+            options.max_width,
+        )
 
 
 def _fmt_count(n: int) -> str:
@@ -334,9 +339,13 @@ class TUI:
             self._touch(view)
         elif kind == "narrate":
             text = data.get("text", "")
+            # Empty narrations would still reset last_activity and defeat
+            # the "thinking N s" indicator. Skip entirely so a silent
+            # working agent still looks alive in the focus panel.
+            if not text:
+                return
             view.narration = text
-            if text:
-                view.push_activity("narrate", text)
+            view.push_activity("narrate", text)
             self._touch(view)
         elif kind == "tool_call":
             tool = data.get("tool", "")
@@ -344,7 +353,19 @@ class TUI:
             view.last_tool = tool
             view.last_tool_args = args
             self.tool_calls_total += 1
-            view.push_activity("tool", tool, tool_args=dict(args))
+            # Truncate string values in tool_args at push time. The
+            # display path uses _short_args (40-char cap) anyway, so the
+            # full bytes were dead weight -- and with up to 200 entries
+            # per agent, an active worker doing many large
+            # write_workspace calls held megabytes of redundant content
+            # per AgentView.
+            trimmed_args = {
+                k: (v[:200] + "…(truncated)")
+                if isinstance(v, str) and len(v) > 200
+                else v
+                for k, v in args.items()
+            }
+            view.push_activity("tool", tool, tool_args=trimmed_args)
             self._log(
                 f"[cyan]{_md_escape(view.name)}[/] -> "
                 f"{_md_escape(tool)}({_md_escape(_short_args(args))})"
@@ -452,6 +473,46 @@ class TUI:
                 f"[red]error in {_md_escape(view.name)}[/]: "
                 f"{_md_escape(_trunc(data.get('message', ''), 100))}"
             )
+        elif kind == "compaction_start":
+            before = data.get("before_messages", 0)
+            before_tok = data.get("before_tokens", 0)
+            view.push_activity(
+                "compaction",
+                f"archivist: compacting {before} messages "
+                f"({_fmt_count(before_tok)} tokens)",
+            )
+            self._log(
+                f"[blue]{_md_escape(view.name)}[/] archivist compacting "
+                f"{before} messages"
+            )
+        elif kind == "compaction_end":
+            dur_s = float(data.get("duration_ms", 0) or 0) / 1000.0
+            if data.get("success"):
+                before = data.get("before_messages", 0)
+                after = data.get("after_messages", 0)
+                before_tok = data.get("before_tokens", 0)
+                after_tok = data.get("after_tokens", 0)
+                view.push_activity(
+                    "compaction",
+                    f"archivist: compacted {before}→{after} messages "
+                    f"({_fmt_count(before_tok)}→{_fmt_count(after_tok)} tokens, "
+                    f"{dur_s:.1f}s)",
+                )
+                self._log(
+                    f"[green]{_md_escape(view.name)}[/] archivist compacted "
+                    f"{before}→{after} messages"
+                )
+            else:
+                err = data.get("error", "no-op")
+                view.push_activity(
+                    "compaction",
+                    f"archivist: compaction failed ({dur_s:.1f}s): "
+                    f"{_trunc(str(err), 100)}",
+                )
+                self._log(
+                    f"[red]{_md_escape(view.name)} archivist compaction failed[/]: "
+                    f"{_md_escape(_trunc(str(err), 80))}"
+                )
 
     def _log(self, line: str) -> None:
         self.recent_events.append(line)
@@ -697,6 +758,7 @@ class TUI:
             "blocked": ("orange1", "blocked"),
             "question": ("cyan", "ask"),
             "error": ("red", "error"),
+            "compaction": ("blue", "ctx"),
         }
         style, label = prefix_style.get(kind, ("white", kind or "·"))
         line.append(f"{label:>7} ", style=f"{style} dim")
@@ -900,7 +962,14 @@ class TUI:
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         self._snapshot_initial_agents()
         q = BUS.subscribe()
-        use_screen = bool(getattr(self.console, "is_terminal", False))
+        # use_screen activates the alternate screen buffer (\x1b[?1049h).
+        # Console was constructed with force_terminal=True so its
+        # is_terminal always returns True -- check the REAL stdout to
+        # avoid scribbling escape codes into piped/captured output (CI
+        # logs, tests, redirections).
+        use_screen = sys.stdout.isatty() and bool(
+            getattr(self.console, "is_terminal", False)
+        )
         self._setup_input()
         try:
             with Live(

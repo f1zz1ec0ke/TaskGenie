@@ -10,8 +10,30 @@ import asyncio
 import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from taskgenie.events import BUS, Event
+
+# Cap any individual string field in an event's `data` payload to keep the
+# log line size bounded. Large tool outputs are already dump-routed to
+# scratch by `dump_large_tool_result`, but `tool_call.args` (the original
+# arguments) and very long narrations would otherwise blow the file size
+# up to MBs per session, especially now that max_turns_per_agent defaults
+# to 1000.
+_MAX_EVENT_FIELD_BYTES = 16 * 1024
+
+
+def _truncate_for_log(data: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        if isinstance(v, str) and len(v) > _MAX_EVENT_FIELD_BYTES:
+            out[k] = (
+                v[:_MAX_EVENT_FIELD_BYTES]
+                + f"…[truncated for log; original {len(v)} bytes]"
+            )
+        else:
+            out[k] = v
+    return out
 
 
 class JSONLEventLogger:
@@ -29,14 +51,20 @@ class JSONLEventLogger:
         self._task = asyncio.create_task(self._run(), name="event-logger")
 
     async def drain(self, timeout: float = 1.0) -> None:
-        """Wait for any queued events to be flushed to disk."""
+        """Wait for any queued events to be flushed to disk.
+
+        Uses `Queue.join()` (paired with `task_done()` in the writer) so we
+        actually block until every published-but-not-yet-flushed event has
+        been processed. The old poll-loop on `queue.empty()` was racy:
+        the writer could be mid-`f.write`/`f.flush` when we sampled empty
+        and decided we were done.
+        """
         if self._queue is None:
             return
-        deadline = asyncio.get_event_loop().time() + timeout
-        while not self._queue.empty():
-            if asyncio.get_event_loop().time() > deadline:
-                break
-            await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
     async def stop(self) -> None:
         if self._task is None:
@@ -60,21 +88,37 @@ class JSONLEventLogger:
                     event = await asyncio.wait_for(self._queue.get(), timeout=0.25)
                 except asyncio.TimeoutError:
                     continue
-                f.write(json.dumps(asdict(event), default=str) + "\n")
-                f.flush()
+                try:
+                    row = asdict(event)
+                    if isinstance(row.get("data"), dict):
+                        row["data"] = _truncate_for_log(row["data"])
+                    f.write(json.dumps(row, default=str) + "\n")
+                    f.flush()
+                finally:
+                    # Always mark done so `drain()` via Queue.join() can
+                    # progress even if serialisation raised. Otherwise a
+                    # single un-serialisable event would deadlock drain
+                    # for the rest of the session.
+                    self._queue.task_done()
 
 
 def read_events(path: Path) -> list[dict]:
-    """Read every event from a session log. Tolerates partial last lines."""
+    """Read every event from a session log. Tolerates partial last lines.
+
+    Streams line-by-line rather than slurping the whole file into memory
+    so a long-running session (potentially hundreds of MBs of events.jsonl
+    when `max_turns_per_agent=1000`) doesn't OOM stats.compute.
+    """
     if not path.exists():
         return []
     out: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return out

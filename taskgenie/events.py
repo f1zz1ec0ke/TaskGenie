@@ -18,6 +18,12 @@ EventKind = Literal[
     "complete",
     "error",
     "state",
+    "llm_call",
+    "blocked",
+    "question",
+    "follow_up_suggested",
+    "compaction_start",
+    "compaction_end",
 ]
 
 

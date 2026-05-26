@@ -26,7 +26,7 @@ def _env_float(key: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class Config:
-    base_url: str = _env("TASKGENIE_BASE_URL", "http://100.84.115.121:1234/v1")
+    base_url: str = _env("TASKGENIE_BASE_URL", "http://localhost:1234/v1")
     api_key: str = _env("TASKGENIE_API_KEY", "lm-studio")
     model: str = _env("TASKGENIE_MODEL", "")
     temperature: float = _env_float("TASKGENIE_TEMPERATURE", 0.1)

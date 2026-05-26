@@ -205,14 +205,16 @@ async def test_edit_workspace_cleans_up_temp_on_rename_failure(
         workspace_dir = str(workspace)
         messages: list = []
 
-    # Patch Path.replace to raise. This is the failure mode the cleanup
-    # is meant to handle.
-    original_replace = Path.replace
+    # Patch os.replace to raise. The new _edit_workspace uses tempfile
+    # + os.replace (was Path.replace before; mkstemp gave us O_NOFOLLOW
+    # for free), so we intercept at the actual call site.
+    original_replace = work_module.os.replace
 
-    def boom(self, target):  # noqa: ARG001
+    def boom(src, dst):  # noqa: ARG001
         raise OSError(18, "cross-device link not permitted")
 
-    with patch.object(Path, "replace", boom):
+    work_module.os.replace = boom
+    try:
         try:
             await work_module._edit_workspace(
                 _Agent(),
@@ -220,9 +222,8 @@ async def test_edit_workspace_cleans_up_temp_on_rename_failure(
             )
         except OSError:
             pass  # expected -- we re-raise after cleanup
-
-    # Restore for safety (patch.object already does this on exit).
-    assert Path.replace is original_replace
+    finally:
+        work_module.os.replace = original_replace
 
     # The crucial assertion: no stale .tg-edit-tmp left behind.
     stale = list(workspace.glob("*.tg-edit-tmp"))

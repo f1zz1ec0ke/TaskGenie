@@ -41,7 +41,16 @@ class LMStudioClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        bypass_semaphore: bool = False,
     ) -> dict[str, Any]:
+        """Send a chat-completion request with retry-on-transient errors.
+
+        `bypass_semaphore=True` lets system calls (the Archivist) skip the
+        concurrency cap that exists to throttle agent fan-out. Without
+        this, two workers compacting at once would consume the entire
+        `max_concurrent_llm` budget and starve any real agent calls.
+        """
         model = await self.model_name()
         kwargs: dict[str, Any] = {
             "model": model,
@@ -55,16 +64,19 @@ class LMStudioClient:
         last_exc: Exception | None = None
         start = time.monotonic()
         for attempt in range(4):  # initial + 3 retries
-            async with self._sem:
-                try:
+            try:
+                if bypass_semaphore:
                     resp = await self._client.chat.completions.create(**kwargs)
-                    break
-                except _TRANSIENT as e:
-                    last_exc = e
-                    if attempt == 3:
-                        raise
-                    sleep = (2 ** attempt) + random.uniform(0, 0.5)
-                    await asyncio.sleep(sleep)
+                else:
+                    async with self._sem:
+                        resp = await self._client.chat.completions.create(**kwargs)
+                break
+            except _TRANSIENT as e:
+                last_exc = e
+                if attempt == 3:
+                    raise
+                sleep = (2 ** attempt) + random.uniform(0, 0.5)
+                await asyncio.sleep(sleep)
         else:  # never executed (loop breaks on success or raises on last attempt)
             raise last_exc  # type: ignore[misc]
 

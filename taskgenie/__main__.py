@@ -144,10 +144,19 @@ async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
     ceo_task = asyncio.create_task(ceo.run(message), name="ceo")
     tui_task = asyncio.create_task(tui.run(stop_when=ceo_task), name="tui")
     try:
-        result = await ceo_task
+        return await ceo_task
     finally:
-        await tui_task
-    return result
+        # If anything raised (CancelledError on Ctrl+C, an unrelated TUI
+        # exception, the CEO bubbling something up) we still need both
+        # tasks fully unwound -- otherwise asyncio prints "Task was
+        # destroyed but it is pending!" at shutdown and the TUI may leave
+        # the terminal in cbreak mode. gather() with return_exceptions
+        # so the cleanup never masks the original exception.
+        if not ceo_task.done():
+            ceo_task.cancel()
+        if not tui_task.done():
+            tui_task.cancel()
+        await asyncio.gather(ceo_task, tui_task, return_exceptions=True)
 
 
 FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset"}
@@ -334,7 +343,11 @@ async def _drive_session(
     while True:
         try:
             result = await _run_session(ceo, tui, message)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Python 3.11+ asyncio.Runner converts SIGINT to a
+            # CancelledError on the running task; catching KeyboardInterrupt
+            # alone would miss it and the in-flight snapshot promise would
+            # silently break. Snapshot and exit 130 either way.
             console.print("[yellow]interrupted[/]")
             _snapshot(session, ceo)
             return 130
@@ -553,11 +566,27 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
         if tool_diff:
             console.print(Panel(tool_diff, title="Tool changes", border_style="cyan"))
 
-        # Was this session paused on a question / blocker, or completed
-        # (and we're resuming to give a follow-up)?
+        # Find the most-recent terminal/resolution entry. Pauses BEFORE
+        # that one are historical (already answered / unblocked /
+        # completed), not what we're paused on right now. Without this
+        # qualification, resuming a session that went
+        # question→answer→done would find the long-resolved question and
+        # re-ask it -- the CEO would end up with back-to-back answer
+        # messages for the same question.
+        resolved_idx = -1
+        for _i, _h in enumerate(session.data.history):
+            if _h["kind"] in (
+                "answer",
+                "unblock",
+                "done",
+                "followup",
+                "abandoned",
+                "error",
+            ):
+                resolved_idx = _i
         last_pause = next(
             (
-                h for h in reversed(session.data.history)
+                h for h in reversed(session.data.history[resolved_idx + 1 :])
                 if h["kind"] in ("blocker", "question")
             ),
             None,
@@ -578,6 +607,7 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                 console.print("[yellow]Resume cancelled.[/]")
                 return 0
             session.mark_answer(user_answer)
+            _snapshot(session, ceo)
             message = _build_answer_message(user_answer)
         elif session.data.status == "done":
             # Session previously completed -- resume into a follow-up turn
@@ -596,6 +626,7 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                 console.print("[dim]Nothing changed.[/]")
                 return 0
             session.mark_followup(followup)
+            _snapshot(session, ceo)
             message = _build_followup_message(followup)
         else:
             if last_pause and last_pause["kind"] == "blocker":
@@ -614,6 +645,7 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                 console.print("[yellow]Resume cancelled.[/]")
                 return 0
             session.mark_unblock(user_response)
+            _snapshot(session, ceo)
             message = _build_unblock_message(user_response, tool_diff)
 
         tui = TUI(task=session.data.task)

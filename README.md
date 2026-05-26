@@ -186,15 +186,20 @@ Set `TASKGENIE_PROJECTS_DIR` to change the `./TaskGenie/` root.
 
 | var | default | meaning |
 |---|---|---|
-| `TASKGENIE_BASE_URL` | `http://100.84.115.121:1234/v1` | OpenAI-compatible endpoint |
+| `TASKGENIE_BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint |
 | `TASKGENIE_API_KEY`  | `lm-studio` | Sent as bearer; LM Studio ignores it |
 | `TASKGENIE_MODEL`    | (auto-detect) | If empty, picks the first model the endpoint reports |
-| `TASKGENIE_TEMPERATURE` | `0.4` | LLM sampling temperature |
-| `TASKGENIE_MAX_DEPTH` | `4` | Maximum hierarchy depth (CEO is depth 0) |
-| `TASKGENIE_MAX_TURNS` | `25` | Maximum LLM turns per agent |
-| `TASKGENIE_MAX_CONCURRENT_LLM` | `4` | Concurrent in-flight LLM calls cap |
-| `TASKGENIE_EXEC_TIMEOUT` | `30` | `exec_code` wall-clock timeout (seconds) |
+| `TASKGENIE_TEMPERATURE` | `0.1` | LLM sampling temperature |
+| `TASKGENIE_MAX_DEPTH` | `8` | Maximum hierarchy depth (CEO is depth 0) |
+| `TASKGENIE_MAX_TURNS` | `1000` | Maximum LLM turns per agent |
+| `TASKGENIE_MAX_CONCURRENT_LLM` | `2` | Concurrent in-flight LLM calls cap (Archivist calls bypass) |
+| `TASKGENIE_EXEC_TIMEOUT` | `60` | `exec_code` wall-clock timeout (seconds) |
 | `TASKGENIE_EXEC_ENV_PASSTHROUGH` | (none) | Extra env vars to expose to `exec_code` |
+| `TASKGENIE_MCP_CALL_TIMEOUT` | `60` | Per-call timeout for MCP tool dispatches |
+| `TASKGENIE_CTX_WINDOW` | `128000` | Model context-window budget (tokens) the Archivist plans against |
+| `TASKGENIE_COMPACT_AT_PCT` | `0.6` | Fraction of `CTX_WINDOW` that triggers a pre-call compaction |
+| `TASKGENIE_COMPACT_KEEP_RECENT` | `3` | Most-recent messages preserved verbatim through a compaction |
+| `TASKGENIE_DUMP_OVER_BYTES` | `16384` | Tool replies larger than this are written to scratch; the in-memory message becomes a one-line pointer |
 | `TASKGENIE_DATA_DIR` | `.taskgenie` | Sessions, scratch, and event logs root |
 | `TASKGENIE_PROJECTS_DIR` | `TaskGenie` | Project (deliverables) directory root |
 | `TASKGENIE_MCP_CONFIG` | `./mcp.json` | Path to MCP server config |
@@ -258,10 +263,12 @@ taskgenie/
   prompts.py        # CEO / manager / worker role-prompt templates
   config.py         # .env-driven config
   session.py        # save / load / list / tool-diff persistence
-  event_logger.py   # background JSONL writer for events
+  event_logger.py   # background JSONL writer for events (bounded line size)
   stats.py          # deterministic run-summary computation + panel
   mcp_client.py     # spawn MCP server subprocesses; register tools
   artifacts.py      # final.{md,html,json} + project README writer
+  context.py        # token counting + large-tool-result dumping to scratch
+  archivist.py      # LLM-driven message-history compaction (no bus events)
   tui.py            # Rich live UI: two screens (focus+tree / event log) + header
   result.py         # RunResult kinds: done/blocked/question/exhausted/error
   tools/
@@ -271,11 +278,18 @@ taskgenie/
   __main__.py       # CLI (new / --resume / --list / --output / --project)
 
 tests/
-  test_loop.py          # happy path + full escalation chain
-  test_persistence.py   # save/load/resume + tool-diff
-  test_follow_ups.py    # bottom-up follow_up propagation
-  test_interactivity.py # ask_user round-trip + artifact extension inference
-  test_workspace.py     # workspace tools, modes, edits, UTF-8, JSON safety
+  test_loop.py            # happy path + full escalation chain
+  test_persistence.py     # save/load/resume + tool-diff
+  test_follow_ups.py      # bottom-up follow_up propagation
+  test_followup_loop.py   # CEO follow-up turns after `complete`
+  test_interactivity.py   # ask_user round-trip + artifact extension inference
+  test_workspace.py       # workspace tools, modes, edits, UTF-8, JSON safety
+  test_tui.py             # activity log, key handling, off-tty no-op
+  test_review_pra.py      # tool-call sealing, symlink rejection, markup escape
+  test_review_prb.py      # session load defensive, ceo-bucket diff, exhaustion, JSON args
+  test_review_prc.py      # MCP timeout, proc-tree kill, MCP close logging, edit cleanup
+  test_review_prd.py      # token counting, dump_large_tool_result, archivist, retry
+  test_review_rt2.py      # round-two: pipeline guard, ctx-error matcher, exec_code workspace, etc.
 ```
 
 ## Status

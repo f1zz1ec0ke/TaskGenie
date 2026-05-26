@@ -6,7 +6,7 @@ final report.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -92,10 +92,19 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
                 last_ts = ts
 
         if kind == "spawn" and aid:
-            agents[aid] = AgentSummary(
-                name=ev.get("agent_name") or aid,
-                role_type=data.get("role_type", "?"),
-            )
+            # Resume re-publishes a `spawn` event for every rehydrated agent
+            # so live subscribers (the TUI) can rebuild their views. Stats,
+            # however, is computed by REPLAY of the persistent JSONL log,
+            # which now includes both the original and the replayed spawn.
+            # Reinitialising AgentSummary on the replay would wipe every
+            # counter accumulated before the resume; aggregate totals
+            # (incremented elsewhere) wouldn't reset, leaving the panel
+            # internally inconsistent. Keep the FIRST spawn only.
+            if aid not in agents:
+                agents[aid] = AgentSummary(
+                    name=ev.get("agent_name") or aid,
+                    role_type=data.get("role_type", "?"),
+                )
             continue
 
         agent = agents.get(aid)

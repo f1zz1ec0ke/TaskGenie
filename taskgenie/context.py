@@ -22,6 +22,7 @@ window by default) so the slack absorbs heuristic error.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,12 @@ def dump_large_tool_result(
     Path(scratch_dir).mkdir(parents=True, exist_ok=True)
     safe_call = _SAFE_NAME_RE.sub("", call_id)[:24] or "x"
     safe_tool = _SAFE_NAME_RE.sub("", tool_name)[:24] or "tool"
-    filename = f"tool-t{turn_idx}-{safe_tool}-{safe_call}.log"
+    # Append a short hash of the full call_id so two tool_calls in the
+    # same turn whose ids differ only beyond char 24 (or after non-alnum
+    # sanitisation) don't collide on the same filename and overwrite each
+    # other's dump.
+    call_hash = hashlib.sha1(call_id.encode("utf-8")).hexdigest()[:8]
+    filename = f"tool-t{turn_idx}-{safe_tool}-{safe_call}-{call_hash}.log"
     target = Path(scratch_dir) / filename
     target.write_text(result_str, encoding="utf-8")
     bytes_kb = max(1, len(result_str) // 1024)
