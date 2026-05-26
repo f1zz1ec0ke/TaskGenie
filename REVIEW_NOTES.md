@@ -1,191 +1,416 @@
 # Project review — punch list
 
-Working notes from the top-to-bottom review on main. Not user-facing
+Working notes from the top-to-bottom reviews on main. Not user-facing
 docs — this is the to-do/done file.
 
 **Status (post round-one):** PRs A, B, C, D all merged into main.
 Plus PR #16 (user-authored) tuned CONFIG knobs: `temperature=0.1`,
 `max_depth=8`, `max_turns_per_agent=1000`, `max_concurrent_llm=2`,
-`exec_timeout_seconds=60`, `compact_at_pct=0.6`,
-`compact_keep_recent=3`. Tuned for deep, long-running tasks with
-more aggressive compaction.
+`exec_timeout_seconds=60`, `compact_at_pct=0.6`, `compact_keep_recent=3`.
 
-**Next pass (round two):** another top-to-bottom review against the
-new main. Same five-agent parallel-review pattern as before
-(orchestrator, tool surface, persistence, presentation, tests+docs).
-**This pass MUST include code from PRs B/C/D since I wrote it; fresh
-eyes are overdue.** Use the previous review's findings as a
-calibration baseline — what we missed, what we over-stated.
+**Round two (ALL FIXED in this PR — branch `claude/review-round-two`):**
+fresh-eyes review of the round-one code (B/C/D modules). Six parallel
+reviewers (orchestrator, tool surface, persistence, presentation,
+tests+docs, prompts+tool-descriptions). All findings R1-R35 below
+addressed; new round-two regression tests at `tests/test_review_rt2.py`.
 
----
-
-## PR D — Context-window management (MERGED #15 + #16)
-
-Branch: `claude/review-pr-d-context`
-Status: merged
-
-Rescoped during planning: the original "CEO history compaction" framing
-was wrong (CEO sees only subordinate FINAL reports via to_tool_payload,
-not their full histories). The real risk is workers with huge
-tool-result tail (read_workspace + exec_code outputs). Final scope:
-
-### D1. Inline tool-output dumping (MERGED)
-### D2. Archivist (MERGED) — a "background agent" emitting bus events
-### D3. Pre-call compaction (MERGED)
-### D4. Reactive recovery on context-length error (MERGED)
+Bonus: during the work, the `exec_workspace` design question came up
+(separate tool vs `workdir` arg vs env var only). Decision: separate
+tool, mirroring the existing `read_file`/`read_workspace` and
+`write_file`/`write_workspace` splits. Highest discoverability;
+matches the agents' mental model of "scratch vs workspace". Env vars
+`$TASKGENIE_WORKSPACE` / `$TASKGENIE_SCRATCH` stay as escape hatches
+for the rare both-dirs snippet.
 
 ---
 
-## PR A — Critical bugs (MERGED #12)
+## Round-two findings — FIXED in this PR
 
-Branch: `claude/review-pr-a-critical`
-Status: merged
+### CRITICAL
 
-### A1. Dangling tool_call_ids after early return (CRITICAL, verified)
-- **Where:** `taskgenie/agent.py:228-288`
-- **What:** The for-loop appends the assistant turn (with all `tool_calls`) to `self.messages` at line 204, then iterates. The branches for `complete`, `report_blocker`, `ask_user` `return` early without appending a `{"role":"tool", "tool_call_id":…}` reply for that call (or any trailing calls in the same batch). Next time those messages are sent to the API — which now happens every follow-up turn — the API will 400 because the conversation has a dangling `tool_call_id`.
-- **Fix:** add a helper that seals all unanswered tool_call_ids before each early return.
-- **Test:** ScriptedLLM returns complete; assert `ceo.messages[-1]` is a `tool` role matching the complete's `tool_call_id`. Same for blocker, ask_user.
+#### R1. Symlink TOCTOU in `_safe_path` → arbitrary file overwrite
+- **Where:** `taskgenie/tools/work.py:207-216` (`_safe_path`), used by
+  `_write_file`, `_write_workspace`, `_edit_workspace`.
+- **What:** `.resolve()` runs at validation, the actual `write_text()`
+  happens later. In between, a symlink planted at the target path
+  redirects the write anywhere. Tool-surface reviewer reproduced this
+  end-to-end — overwrote `/etc/passwd` from a scratch base dir via the
+  `write_workspace(mode='create')` happy path. PR A2 fixed string-prefix
+  containment; this is a separate vector.
+- **Fix:** open files with `os.open(..., O_WRONLY | O_CREAT | O_EXCL |
+  O_NOFOLLOW)` for create, `O_WRONLY | O_TRUNC | O_NOFOLLOW` for
+  overwrite, and `O_RDONLY | O_NOFOLLOW` for reads. For
+  `edit_workspace`'s rename, use the same flags on the temp + `os.replace`.
+- **Test:** plant a symlink → `/tmp/sentinel` at the target path before
+  the write call; assert ValueError/OSError and `/tmp/sentinel`
+  unchanged. Run against `_write_file`, `_write_workspace(mode='create')`,
+  `_write_workspace(mode='overwrite')`, `_edit_workspace`.
 
-### A2. Path traversal via `startswith` in `_safe_path` (HIGH, verified)
-- **Where:** `taskgenie/tools/work.py:206-212`
-- **What:** `str(target).startswith(str(base))` accepts sibling directories that share a name prefix. With `base = /tmp/scratch`, target = `/tmp/scratch-evil/foo` passes the check.
-- **Fix:** `target.relative_to(base)` in `try/except ValueError`, raise on ValueError.
-- **Test:** call `_safe_path("/tmp/scratch", "../scratch-evil/foo")` and assert `ValueError`.
+#### R2. Dangling `tool_call_ids` if anything post-`_execute_tool` raises
+- **Where:** `taskgenie/agent.py:411-443` (tool pipeline).
+- **What:** The `try` only wraps `_execute_tool`. After it returns,
+  `json.dumps(result)`, `dump_large_tool_result` (mkdir, write_text),
+  `self.messages.append`, and `self._emit` all run unguarded. Any
+  failure (disk full, encoding fault, non-JSON-serialisable result, BUS
+  subscriber raising) propagates out of `run()` with the assistant turn
+  containing all `tool_calls` already appended at line 301 — same
+  dangling-id 400 class as PR A1, shifted one layer down. No `RunResult`
+  is returned either; parent sees `_tool_await_results`'s blanket
+  `except Exception`, agent status never updates.
+- **Fix:** wrap from `result_str = ...` through the final `_emit` in a
+  try/except; on failure, append a `[tool_pipeline_error]` reply for
+  this `tool_call_id`, then seal any remaining ids in the batch before
+  marking the agent `error`.
+- **Test:** monkeypatch `dump_large_tool_result` to raise; assert
+  `agent.messages` has a tool reply for every assistant tool_call_id and
+  `result.kind == "error"`.
 
-### A3. Rich markup injection in event log (HIGH, verified)
-- **Where:** `taskgenie/tui.py:839` — `Text.from_markup("\n".join(self.recent_events))`
-- **What:** Agent-supplied strings (names, tool args, narrations, blocker reasons, feedback, questions) get interpolated raw into f-string log lines, then re-parsed as Rich markup at render time. An LLM emitting `[red]boom[/]` or `[link=file://...]` gets re-interpreted on screen 2. Local-only, but garbled output + potential terminal-escape weirdness.
-- **Fix:** escape agent-supplied fields with `rich.markup.escape()` at the f-string call sites in `_handle_event` before they enter `_log()`. Keep our own markup tags intact.
-- **Test:** call `_log()` indirectly via `_handle_event` with an agent name containing `[red]X[/]`, render the log panel, assert the rendered string contains the literal `[red]X[/]` (not stripped/styled).
+#### R3. Resume of `done` session re-asks a stale, already-answered question
+- **Where:** `taskgenie/__main__.py:558-581`.
+- **What:** `last_pause = next(reversed(history) where kind in {question, blocker})`
+  doesn't consider whether that pause was already resolved. Flow:
+  question → answer → … → done → quit → `--resume`. The check finds the
+  long-resolved question (still in history because `mark_answer` only
+  appends), branch 1 fires before the `status=="done"` branch on line
+  582, user is asked again, CEO ends up with back-to-back answer
+  messages. This is exactly the bug the missing B7 test would have
+  caught.
+- **Fix:** find the index of the most recent `answer`/`unblock`/`done`/
+  `followup` first; `last_pause` only considers entries after that.
+- **Test:** save a session: question → answer → done. Resume with a
+  scripted stdin; assert `_read_followup_input` (not
+  `_read_answer_input`) was called.
+
+### HIGH
+
+#### R4. `exec_code` can't reach the workspace (user-flagged)
+- **Where:** `taskgenie/tools/work.py:188-204` (schema), `:432` (cwd),
+  `taskgenie/prompts.py:357-359` (worker prompt).
+- **What:** Both the prompts and tool-surface reviewers flagged this
+  independently. Worker writes `game.py` to workspace, then can't run
+  it. `cwd` is hardcoded to scratch and `agent.workspace_dir` is never
+  exposed in any tool description, schema, or prompt. Workers
+  reasonably try `python game.py` and silently fail with "No such
+  file"; they waste turns rewriting the file thinking it's broken.
+- **Decision:** env-var `TASKGENIE_WORKSPACE` injected into `_scrubbed_env`
+  plus schema/prompt update. Smaller surface change than adding a
+  `workdir` arg, no new schema field, agents just `cd
+  "$TASKGENIE_WORKSPACE"` or use it absolute.
+- **Fix:** add `env["TASKGENIE_WORKSPACE"] = str(agent.workspace_dir)` in
+  `_exec_code`. Update schema description to document it. Update worker
+  prompt at prompts.py:357-359 to mention the env var.
+- **Test:** create a workspace file via `_write_workspace`, then
+  `_exec_code(language="shell", code='ls "$TASKGENIE_WORKSPACE"')`,
+  assert the file appears in stdout.
+
+#### R5. Archivist slice boundary can orphan a `tool` reply
+- **Where:** `taskgenie/archivist.py:101-104,197`.
+- **What:** `messages[-keep_recent:]` may land on a `{role:"tool"}`
+  whose matching `{role:"assistant", tool_calls:[...]}` falls in the
+  summarised middle. Next LLM call 400s because the surviving `tool`
+  message points at a `tool_call_id` that no longer exists. With the
+  default `keep_recent=3` and the typical assistant→tool alternation,
+  the slice often lands mid-pair.
+- **Fix:** snap the slice forward to the nearest preceding non-`tool`
+  message (assistant or user) so the recent band never starts with a
+  `tool`.
+- **Test:** synthetic 12-message alternating assistant(tool_calls)/tool
+  history; compact with keep_recent=3; assert every surviving `tool`
+  message's `tool_call_id` exists in some surviving assistant turn.
+
+#### R6. Archivist shares `max_concurrent_llm` semaphore with real agents
+- **Where:** `taskgenie/llm.py:29,58` + `taskgenie/archivist.py:136`.
+- **What:** At `max_concurrent_llm=1` this is a hard deadlock; at the
+  current `=2` it's starvation: when two workers compact simultaneously
+  they consume the entire LLM budget, blocking everything else.
+- **Fix:** give the archivist its own semaphore (separate budget) OR
+  bypass the shared one entirely (archivist is a system task, not a
+  user-visible agent).
+- **Decision:** bypass — archivist calls don't compete with agents for
+  rate-limit purposes since they're triggered by agents themselves.
+  Simpler than adding another knob.
+- **Test:** with `max_concurrent_llm=1`, kick a compaction concurrently
+  with an agent LLM call; assert neither blocks indefinitely.
+
+#### R7. Archivist `parent_id=None` + `depth=99` spawn corrupts hierarchy
+- **Where:** `taskgenie/archivist.py:108-119` + `taskgenie/tui.py:312-317`.
+- **What:** Archivist publishes `spawn` events on the same bus the TUI
+  uses to build the hierarchy. `parent_id=None` makes the TUI overwrite
+  `root_id` with the Archivist's id (line 317). Also: stats.compute
+  resets per-agent metrics on every spawn it sees — archivist spawns
+  pollute the stats panel.
+- **Fix:** introduce a distinct event kind (`compaction_start` /
+  `compaction_end`) instead of reusing `spawn`/`state`/`complete`. TUI
+  surfaces it as a one-line activity log entry on the target agent, not
+  as a tree node. Stats ignores it.
+- **Test:** archivist runs; assert no new entry in
+  `Agent.REGISTRY`, no change to TUI `root_id`, and the target agent's
+  activity_log has an entry for the compaction.
+
+#### R8. Archivist compaction wipes the lost-update warning's evidence
+- **Where:** `taskgenie/tools/work.py:251-269` (warning scan) +
+  `taskgenie/archivist.py:compact_messages` interaction.
+- **What:** The round-one PR-A-era lost-update warning at
+  `_write_workspace:298` looks for prior `read_workspace` tool_calls in
+  `agent.messages`. When the Archivist compacts older messages into a
+  single `[archived summary]`, those tool_calls disappear — so an agent
+  that reads a file, then compacts, then overwrites it gets no warning.
+  Silent regression of a round-one steering fix exactly in the
+  long-running sessions PR-D was built for.
+- **Fix:** thread a persistent `agent.read_workspace_paths: set[str]`,
+  populated in `_read_workspace`, queried by `_write_workspace`.
+  Survives compaction.
+- **Test:** mock `agent.messages` to contain only `[system, archived,
+  user]`; preload `agent.read_workspace_paths`; call `_write_workspace`
+  with overwrite; assert warning still fires.
+
+#### R9. `_maybe_compact` re-runs every turn near threshold
+- **Where:** `taskgenie/agent.py:201-230`.
+- **What:** If a compact succeeds but the new history is still over
+  threshold (large recent tool results don't get summarised), every
+  subsequent turn pays an extra LLM round-trip. Compounding cost.
+- **Fix:** track `self._last_compact_msg_count`; skip if the message
+  count has grown by fewer than N (say 4) since the last compact. OR
+  refuse to compact if previous compact returned `len(new) > len(old) *
+  0.9`. Pick the message-count guard — simpler.
+- **Test:** stub `compact_messages` to return input unchanged; run 5
+  turns over threshold; assert `compact_messages` invoked at most once.
+
+#### R10. `_is_context_length_error` matches too aggressively
+- **Where:** `taskgenie/agent.py:22-37`.
+- **What:** Substring `"context length"`/`"context_length"` matches
+  innocuous strings like `"context length check passed"` or
+  `"warn: context length cache hit 0%"`.
+- **Fix:** tighten to anchored patterns (`r"(maximum )?context (window|length).*?(exceeded|too long|exceeded the)"`)
+  or test for OpenAI's `context_length_exceeded` code first.
+- **Test:** feed innocuous strings with "context" word; assert False.
+
+#### R11. `_tool_fire` doesn't go through `_set_status` — no `state` event
+- **Where:** `taskgenie/agent.py:617-626`.
+- **What:** Line 621 assigns `child.status = "fired"` directly.
+  Subscribers never see the transition; TUI tree shows the agent in its
+  previous status until the next event lands.
+- **Fix:** `child._set_status("fired", reason=reason)` instead of
+  direct assignment.
+- **Test:** subscribe to BUS, fire a child, assert a `state` event with
+  `status="fired"` and matching agent_id.
+
+#### R12. KeyboardInterrupt snapshot is dead code on Python ≥3.11
+- **Where:** `taskgenie/__main__.py:337-340`.
+- **What:** `asyncio.run()` in 3.11+ converts SIGINT to `CancelledError`
+  on the running task. The `except KeyboardInterrupt` in
+  `_drive_session` never fires; users lose in-flight state on Ctrl+C
+  contrary to the "[yellow]interrupted[/] state saved" promise.
+- **Fix:** catch `(KeyboardInterrupt, asyncio.CancelledError)`,
+  snapshot, then re-raise (`raise`).
+- **Test:** schedule `loop.call_later(0.1, lambda: signal.raise_signal(SIGINT))`;
+  assert state.json exists and contains the post-snapshot data.
+
+#### R13. `_run_session` finally leaves dangling `ceo_task` on TUI exception
+- **Where:** `taskgenie/__main__.py:143-150`.
+- **What:** If `tui_task` raises (rare but possible on flaky tty), the
+  `ceo_task` is left pending. Generates "Task was destroyed but it is
+  pending" at shutdown.
+- **Fix:** in `finally`, cancel `ceo_task` if not done, gather both
+  with `return_exceptions=True`.
+- **Test:** make `tui_task` raise; assert no pending tasks after
+  `_run_session` returns.
+
+#### R14. `append` mode atomicity claim is wrong for >4KB writes
+- **Where:** `taskgenie/tools/work.py:311-317` + comment.
+- **What:** The comment claims appends "interleave cleanly at the OS
+  write boundary." True only for POSIX `O_APPEND` ≤ `PIPE_BUF` (4096).
+  Buffered text-mode `f.write(content)` doesn't translate to one
+  `write()` syscall.
+- **Fix:** open with `os.open(p, O_WRONLY | O_APPEND | O_CREAT |
+  O_NOFOLLOW)` (also fixes symlink TOCTOU for append); single
+  `os.write(fd, content.encode())`. For len > PIPE_BUF, drop the
+  atomicity claim from the docstring and document the limit.
+- **Test:** two concurrent appends of distinct payloads ≤4KB; assert
+  the file contains both payloads as contiguous runs (no interleaving).
+
+#### R15. Stats per-agent metrics reset on resume; totals don't
+- **Where:** `taskgenie/stats.py:94-99`.
+- **What:** `bulk_load` re-publishes a `spawn` event for every
+  rehydrated agent. `stats.compute` does `agents[aid] = AgentSummary(...)`
+  on each spawn — wiping the pre-resume counts. Aggregated totals are
+  increment-only and don't reset, so the panel is internally
+  inconsistent post-resume.
+- **Fix:** in `compute`, skip the spawn handler when `aid in agents`
+  (keep first spawn, ignore replays).
+- **Test:** synthetic event log with `spawn → llm_call → spawn` for
+  same agent_id; assert agent llm_calls count is preserved.
+
+#### R16. `events.jsonl` is unbounded
+- **Where:** `taskgenie/event_logger.py`.
+- **What:** No rotation, no max size. `read_events` slurps the whole
+  file. With `max_turns_per_agent=1000` and depth-8 hierarchies this is
+  100s of MB plausible.
+- **Fix:** stream-read in `read_events` (line-by-line). Truncate
+  individual event `data` payloads server-side before write if larger
+  than N KB. Skip full file rotation for now — premature optimisation.
+- **Test:** write a 50MB synthetic log; assert `read_events` peak
+  memory stays bounded (just check it returns without OOM in a small
+  RSS check, or pass a fake huge generator).
+
+### MEDIUM
+
+#### R17. README + `.env.example` stale on config defaults
+- **Where:** `README.md:187-201`, `.env.example`.
+- **What:** Stale on 5 user-tuned defaults (temperature, max_depth,
+  max_turns, max_concurrent_llm, exec_timeout). Missing all 5 PR-D
+  knobs (mcp_call_timeout, ctx_window, compact_at_pct,
+  compact_keep_recent, dump_over_bytes). BASE_URL still the Tailscale
+  100.x IP. Layout section missing context.py / archivist.py. Test
+  list missing test_followup_loop, test_tui, all four test_review_pr*.
+- **Fix:** regenerate the env table; update layout + test lists; flip
+  base_url to `http://localhost:1234/v1` in both README, `.env.example`,
+  AND `config.py`.
+
+#### R18. `Session.save` leaks tempfile on serialization error
+- **Where:** `taskgenie/session.py:235-247`.
+- **What:** `json.dump(asdict(self.data), tmp, indent=2)` without
+  `default=str`. If anything ever leaks a non-JSON-native value,
+  serialization raises mid-write, leaving `.state-XXXX.json.tmp` in
+  root_dir.
+- **Fix:** wrap in `try` with `Path(tmp_path).unlink(missing_ok=True)`
+  on failure. Add `default=str` for symmetry with the other JSON
+  writers (event_logger, artifacts).
+- **Test:** monkeypatch json.dump to raise; assert no `.tg-*tmp*` left
+  in the root dir.
+
+#### R19. Atomic write doesn't fsync directory
+- **Where:** `taskgenie/session.py:247`.
+- **Fix:** after `os.replace`, fsync the directory on POSIX
+  (`os.open(self.root_dir, O_RDONLY)` → `os.fsync` → close). Skip on
+  Windows.
+
+#### R20. `asyncio.get_event_loop()` deprecated
+- **Where:** `taskgenie/event_logger.py:35,37`.
+- **What:** DeprecationWarning on 3.12, raises on 3.14+. Project
+  requires ≥3.11.
+- **Fix:** `asyncio.get_running_loop()`.
+
+#### R21. `drain()` is racy in event_logger
+- **Where:** `taskgenie/event_logger.py:31-39`.
+- **Fix:** simplest patch: have the writer task set an
+  `asyncio.Event` after every flush; `drain` waits on
+  `queue.empty() AND last_flush.is_set()` with a small loop.
+- **Test:** publish, drain, read events; assert all published events
+  visible.
+
+#### R22. TUI activity_log retains un-truncated tool_args
+- **Where:** `taskgenie/tui.py:347`.
+- **What:** `tool_args=dict(args)` is a shallow copy of the FULL dict.
+  Up to 200 entries per agent. A worker doing many large
+  `write_workspace` calls holds MBs of redundant content per AgentView.
+- **Fix:** in `push_activity`, truncate any string value in `tool_args`
+  to ~200 chars (preserve the keys, just clip values). The display
+  uses `_short_args` anyway.
+
+#### R23. `_handle_event` empty narrate resets thinking timer
+- **Where:** `taskgenie/tui.py:335-340`.
+- **Fix:** early-return when `text == ""` before `_touch`.
+
+#### R24. `_ColumnOverflowTree.__rich_measure__` returns invalid bounds at very narrow widths
+- **Where:** `taskgenie/tui.py:204`.
+- **Fix:** `return Measurement(min(MIN_COL_WIDTH, options.max_width), options.max_width)`.
+
+#### R25. TUI forces alternate-screen even when piped
+- **Where:** `taskgenie/tui.py:903`.
+- **Fix:** `use_screen = sys.stdout.isatty() and self.console.is_terminal`.
+
+#### R26. Worker prompt misleads about read-then-write warning
+- **Where:** `taskgenie/prompts.py:347-349`.
+- **What:** Prompt says dispatcher always warns on read-then-write, but
+  actually `mode='create'` (default) hard-fails with "file exists"
+  while only `mode='overwrite'` triggers the warning.
+- **Fix:** rewrite the line to describe both branches accurately.
+
+#### R27. `_run_resume` doesn't snapshot user response
+- **Where:** `taskgenie/__main__.py:580, 598, 616`.
+- **What:** After `mark_answer`/`mark_followup`/`mark_unblock`, no
+  snapshot. If the next `_run_session` crashes, on-disk state never
+  records the user's input, causing duplicate prompts on re-resume.
+- **Fix:** call `_snapshot(session, ceo)` after each `mark_*` in
+  `_run_resume`.
+
+### LOW
+
+#### R28. `ask_user` schema has dead "managers/workers can't see this" text
+- **Where:** `taskgenie/tools/management.py:204-239`.
+- **Fix:** trim the description tail; only CEOs see the schema.
+
+#### R29. `_seal_tool_batch` trailing-call test path never exercised
+- **Where:** `tests/test_review_pra.py:189` —
+  `test_complete_seals_trailing_tool_calls_in_same_turn` puts complete
+  LAST in the batch, so the trailing-call branch is never run.
+- **Fix:** add a case where `complete` is FIRST with a real
+  tool_call after it; assert the trailing call's reply is
+  `[skipped: agent returned after complete...]`.
+
+#### R30. Leaky test fixtures
+- **Where:** `test_review_pra.py:142-147`, `test_review_prb.py:113-118`,
+  `test_review_prb.py:128/172/206/228`.
+- **What:** `with tempfile.TemporaryDirectory() as d: ... return CEO`
+  — tempdir destroyed before the test runs. CONFIG.data_dir mutations
+  without try/finally restore.
+- **Fix:** use `tmp_path` pytest fixture; wrap CONFIG mutations.
+
+#### R31. `test_loop.py` fixture text claims `exec_code is stubbed in v1`
+- **Where:** `tests/test_loop.py:316`.
+- **Fix:** delete/update the comment.
+
+#### R32. `dump_large_tool_result` filename collision risk on long call_ids
+- **Where:** `taskgenie/context.py:95-97`.
+- **Fix:** include a short hash of the full call_id in the filename.
+
+#### R33. `_safe_path` NUL-byte validation
+- **Where:** `taskgenie/tools/work.py:207-216`.
+- **Fix:** reject `\x00` in the relative path upfront with a clean
+  ValueError.
+
+#### R34. EventKind Literal incomplete
+- **Where:** `taskgenie/events.py:8-21`.
+- **Fix:** add `"blocked"`, `"question"`, `"follow_up_suggested"`,
+  `"llm_call"`, `"tool_result"` (already emitted by agent.py).
+
+#### R35. TwoTurnLLM test assertion is a tautology
+- **Where:** `tests/test_followup_loop.py:123`.
+- **Fix:** `len(mock.complete_reports) >= 0` is always true. Drop or
+  populate.
 
 ---
 
-## PR B — Resume hardening + test gaps (MERGED #13)
+## Round-one history (collapsed)
 
-Branch: `claude/review-pr-b-resume`
-Status: merged
+### PR A — Critical bugs (MERGED #12)
+A1 dangling tool_call_ids on early return; A2 path traversal via
+`startswith` in `_safe_path`; A3 Rich markup injection in event log.
 
-### B1. Session.load has no error handling (HIGH, verified)
-- **Where:** `taskgenie/session.py:159-165`
-- **What:** Reads `state.json` and unpacks via `SessionData(**raw)`. Torn writes, hand-edited files, or extra fields from a newer version all raise on load with no friendly message.
-- **Fix:** filter `raw` to known dataclass fields, wrap construction in try/except, log + raise a friendly error.
-- **Test:** save a session, append a junk key to state.json, attempt resume, assert helpful error or graceful skip.
+### PR B — Resume hardening + tests (MERGED #13)
+B1 `Session.load` defensive; B2 ceo-bucket in tool-signature diff; B3-B7
+test gaps.
 
-### B2. `diff_tools_against` ignores CEO-only tools (HIGH, agent-reported, verify before fixing)
-- **Where:** `taskgenie/session.py:269-304` + `taskgenie/tools/management.py`
-- **What:** `ask_user` is registered with `kind="ceo"` and never makes it into the persisted `management`/`work` signatures. Schema changes to ceo-only tools won't be flagged on resume.
-- **Verify:** read management.py to confirm `ask_user` registration kind.
-- **Fix:** persist a third `"ceo"` bucket and diff it.
-- **Test:** change ask_user schema between save and resume, assert the diff surfaces it.
+### PR C — Resource safety (MERGED #14)
+C1 MCP `call_tool` timeout; C2 `exec_code` subprocess group kill; C3 MCP
+close logs cleanly; C4 `edit_workspace` temp cleanup; C5 (deferred,
+bus queues unbounded — touched again in R16).
 
-### B3. Missing test: LLM transport failure → error RunResult
-- **Where:** `taskgenie/agent.py:188-192`
-- **Test sketch:** ScriptedLLM whose `chat` raises on turn 1; assert `result.kind == "error"` and that `__main__` writes stats + rc=1.
-
-### B4. Missing test: turn-limit exhaustion
-- **Where:** `taskgenie/agent.py:323-327`
-- **Test sketch:** ScriptedLLM that always returns a no-op narration with no tool_calls; monkeypatch `CONFIG.max_turns_per_agent=3`; assert `kind="exhausted"`.
-
-### B5. Missing test: `max_depth` cap on hire
-- **Where:** `taskgenie/agent.py:367-373`
-- **Test sketch:** chain agents to `max_depth - 1`, hire one more, expect an error response, assert no new agent in REGISTRY.
-
-### B6. Missing test: malformed JSON in tool args
-- **Where:** `taskgenie/agent.py:230-238`
-- **Test sketch:** ScriptedLLM returns a tool_call with `arguments="not json"`; assert agent continues and appends `[tool_args_error]` to messages.
-
-### B7. Missing test: resume of a `done` session uses the follow-up flow
-- **Where:** `taskgenie/__main__.py:578-595` (approx)
-- **Test sketch:** save a session in `done` state, resume, assert the follow-up prompt was used (not blocker prompt).
-
----
-
-## PR C — Resource safety (MERGED #14)
-
-Branch: `claude/review-pr-c-resources`
-Status: merged
-
-### C1. MCP `call_tool` has no timeout (MEDIUM, agent-reported)
-- **Where:** `taskgenie/mcp_client.py:117-119`
-- **Fix:** wrap `session.call_tool` in `asyncio.wait_for(..., CONFIG.mcp_call_timeout_seconds)`. Add config knob with sane default (30s).
-- **Test:** monkeypatch a mock MCP session whose `call_tool` hangs; assert timeout returns an error string.
-
-### C2. `exec_code` doesn't kill subprocess group (MEDIUM, agent-reported)
-- **Where:** `taskgenie/tools/work.py:413-426`
-- **Fix:** `start_new_session=True` on `create_subprocess_exec`, then `os.killpg(proc.pid, SIGKILL)` on timeout.
-- **Test:** code that backgrounds `sleep 9999 &`, time-out, then assert no leftover sleep process (best-effort).
-
-### C3. MCP `close()` swallows all exceptions silently (LOW-MEDIUM, agent-reported)
-- **Where:** `taskgenie/mcp_client.py:140-144`
-- **Fix:** log the exception (`logging.warning` or print to stderr) and keep best-effort behavior.
-
-### C4. `edit_workspace` temp file leak on partial failure (LOW, agent-reported)
-- **Where:** `taskgenie/tools/work.py:347-349`
-- **Fix:** `try/finally` removing the `.tg-edit-tmp` if it still exists.
-
-### C5. Bus queues are unbounded (LOW, agent-reported, defer)
-- **Where:** `taskgenie/events.py:48-50`
-- **Defer:** only bites if a subscriber forgets `unsubscribe`. Current code is careful with `finally`. Bounded queue + drop-oldest is the right answer but no rush.
-
----
-
-## PR D — Context-window management (IN FLIGHT)
-
-Branch: `claude/review-pr-d-context`
-Status: opened for review
-
-Rescoped during planning: the original "CEO history compaction" framing
-was wrong (CEO sees only subordinate FINAL reports via to_tool_payload,
-not their full histories). The real risk is workers with huge
-tool-result tail (read_workspace + exec_code outputs). New scope:
-
-### D1. Inline tool-output dumping
-- `taskgenie/context.py:dump_large_tool_result()` — tool replies over
-  `CONFIG.dump_tool_output_above_bytes` (default 4KB) get written to
-  the agent's scratch dir; the in-memory message becomes a one-line
-  pointer telling the agent to `read_file` if they need the full text.
-  Generic for all tools including MCP.
-
-### D2. Archivist agent
-- `taskgenie/archivist.py:compact_messages()` — when invoked, runs an
-  LLM call (NOT a full Agent — direct LLM with bus events for TUI
-  visibility) that compresses the middle band of an agent's messages
-  into one `[archived summary]` user message. Preserves: system
-  prompt, original task, last N turns. Falls back to original on LLM
-  failure.
-
-### D3. Pre-call compaction
-- `Agent._maybe_compact()` invoked before every `LLM.chat`. If
-  `count_tokens(self.messages) > CONFIG.ctx_window_tokens * CONFIG.compact_at_pct`,
-  the Archivist runs and the result is swapped in.
-
-### D4. Reactive recovery
-- If `LLM.chat` raises a context-length error, `_is_context_length_error`
-  pattern-matches the message and forces a compact + one retry.
-
----
-
-## Other findings (verify + queue)
-
-- **README default `TASKGENIE_BASE_URL`** is a Tailscale 100.x address. Likely your machine, not a useful default. Update README + `config.py` to `http://localhost:1234/v1`.
-- **README test list** at README.md ~line 273 missing `test_followup_loop.py` + `test_tui.py`.
-- **test_loop.py fixture text** at line ~316 claims `exec_code is stubbed in v1` — contradicts the README's "Real exec_code" claim. Fixture only, update for accuracy.
-- **Layout misbehavior at small terminal sizes** (tui.py) — body collapses to 1 row. Low priority; add a "terminal too small" fallback panel below some min size.
+### PR D — Context-window management (MERGED #15)
+D1 inline tool-output dumping (16KB threshold); D2 Archivist; D3 pre-call
+compaction; D4 reactive recovery on context-length errors.
 
 ---
 
 ## Bright spots — preserve
 
 - `_safe_jsonable` in `artifacts.py:74-107` — recursive sanitizer with `repr()` fallback.
-- `save()` in `session.py:200-220` — fsync + same-dir tempfile + `os.replace`. Textbook atomic write.
-- `_ColumnOverflowTree` in `tui.py:127-203` — measure-first via uncapped `render_lines`, then cell-aware column packing.
+- `_seal_tool_batch` (agent.py:451) — correct sealing across all early-return paths from PR A.
+- `_ColumnOverflowTree` in `tui.py:127-203` — measure-first, cell-aware column packing.
 - `RunResult.to_tool_payload` in `result.py` — decouples internal state from parent-visible JSON.
-- `test_workspace.py::test_overwrite_after_read_warns` — meaningful test for a subtle lost-update steering bug.
-- `test_workspace.py::test_utf8_roundtrip` — covers a real cross-platform bug class (cp1252 fallback) with CJK, arrows, math, emoji round-trip.
-
----
-
-## Done / merged
-
-(none yet — PR A in flight)
+- Worker prompt's "honesty" section (`prompts.py:273-303`) — concrete failure modes.
+- Manager prompt's "be honest with your parent" block (`prompts.py:240-259`).
+- `edit_workspace` schema (`work.py:130-167`) — failure modes enumerated with recovery actions.
+- `_snapshot_initial_agents` two-pass logic + explanatory comment (`tui.py:253-296`).
+- `test_workspace.py::test_utf8_roundtrip` — covers cp1252 fallback with CJK/arrows/math/emoji.

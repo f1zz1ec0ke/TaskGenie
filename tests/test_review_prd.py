@@ -177,7 +177,7 @@ class _SummaryLLM:
     async def model_name(self) -> str:
         return "summary-mock"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         self.last_input = messages
         return {"content": self.summary, "tool_calls": [], "usage": {}}
 
@@ -186,7 +186,7 @@ class _FailingLLM:
     async def model_name(self) -> str:
         return "fail-mock"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         raise RuntimeError("simulated LLM failure")
 
 
@@ -288,7 +288,7 @@ class _BigToolThenCompleteLLM:
     async def model_name(self) -> str:
         return "big-tool"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         self._n += 1
         if self._n == 1:
             return {
@@ -356,7 +356,7 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
             async def model_name(self):
                 return "mock"
 
-            async def chat(self, messages, tools=None):
+            async def chat(self, messages, tools=None, **_kwargs):
                 self._n += 1
                 if self._n == 1:
                     return {
@@ -411,7 +411,7 @@ class _CountingLLM:
     async def model_name(self):
         return "counting"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         self.message_counts.append(len(messages))
         self._n += 1
         # If we're acting as both the agent's LLM and the Archivist's
@@ -497,7 +497,7 @@ async def test_context_error_triggers_compact_and_retry(tmp_path: Path) -> None:
         async def model_name(self):
             return "ctx-err"
 
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **_kwargs):
             self._n += 1
             # The Archivist's LLM call has system="You are an Archivist..."
             first_sys = (messages[0].get("content") or "")[:30] if messages else ""

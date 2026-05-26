@@ -1,34 +1,33 @@
 """Archivist: compact an agent's message history when it's about to blow
 the context window.
 
-Design choice: NOT a full Agent. Calls LLM directly with a focused
-summarization prompt. Emits spawn / state / complete events on the bus
-so the TUI surfaces compaction visibly even though there's no Agent
-object in the REGISTRY.
+Design choice: NOT a full Agent and NOT a bus event source. Pure async
+function that takes a message list and returns a compacted one. The
+calling Agent is responsible for emitting `compaction_start` /
+`compaction_end` events around the call so the TUI can show the
+compaction on the TARGET agent's activity log (rather than as a spurious
+depth-99 tree node).
 
-The "background agent" framing the user asked for is honoured at the
-event-bus level (you'll see "Archivist[WorkerName]" appear in the
-hierarchy / activity log when it fires) while keeping the implementation
-a single async function with deterministic behaviour:
+Lifecycle:
 
   1. Preserve verbatim: system prompt, original user task, the last
-     `keep_recent` messages.
+     `keep_recent` messages (snapped FORWARD to avoid starting the
+     recent band with a `tool` message whose matching assistant turn
+     would land in the about-to-be-summarised middle).
   2. Hand the middle band to the LLM and ask for a dense paragraph
      summary.
   3. Splice the summary in between the original task and the recent
      band as a single `[archived summary]` user message.
 
 If the LLM call fails or returns nothing useful, we return the original
-messages unchanged. The caller is responsible for not retrying forever
-(see `Agent._maybe_compact`'s `_compacted_at` tracking).
+messages unchanged. Caller is responsible for not retrying forever
+(see `Agent._maybe_compact`'s `_compaction_floor` tracking).
 """
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from taskgenie.config import CONFIG
-from taskgenie.events import BUS, Event
 from taskgenie.llm import LLM
 
 ARCHIVIST_SYSTEM_PROMPT = (
@@ -50,6 +49,25 @@ ARCHIVIST_SYSTEM_PROMPT = (
 )
 
 
+def _safe_recent_keep(messages: list[dict[str, Any]], keep_recent: int) -> int:
+    """Snap `keep_recent` forward so messages[-keep_recent:] never STARTS
+    with a `tool` message.
+
+    Why: a `tool` reply only makes sense after the `assistant` turn whose
+    `tool_calls` declared the matching `tool_call_id`. If the recent band
+    begins with `tool` and the matching `assistant` is in the middle band
+    (about to be summarised away), the next API call 400s on a dangling
+    tool_call_id. Sliding forward (= keeping MORE messages) pulls the
+    matching assistant into the recent band.
+    """
+    n = len(messages)
+    if keep_recent <= 0 or keep_recent >= n:
+        return keep_recent
+    while keep_recent < n and messages[n - keep_recent].get("role") == "tool":
+        keep_recent += 1
+    return keep_recent
+
+
 def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
     """Render the middle band into a readable transcript for the Archivist."""
     lines: list[str] = []
@@ -57,7 +75,10 @@ def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
         role = msg.get("role", "?")
         content = msg.get("content", "") or ""
         if isinstance(content, list):
-            content = " ".join(str(p.get("text", p)) for p in content)
+            content = " ".join(
+                str(p.get("text", p)) if isinstance(p, dict) else str(p)
+                for p in content
+            )
         # Cap each individual message excerpt so an outsized tool result
         # can't dominate the summary input. The original full text is
         # already on disk via dump_large_tool_result by the time we get
@@ -81,11 +102,15 @@ async def compact_messages(
     """Return a compacted copy of `messages`. On failure, returns the
     input unchanged so the caller can decide what to do.
 
-    Visible side-effect: emits spawn/state/complete events on BUS so the
-    TUI can surface that a compaction happened.
+    NOTE: this function does NOT publish bus events. The caller (Agent)
+    is responsible for emitting `compaction_start` / `compaction_end`
+    around the await so the TUI can route the activity to the right
+    target agent's display.
     """
     if keep_recent is None:
         keep_recent = CONFIG.compact_keep_recent
+    # Snap keep_recent forward if the slice would dangle a tool_call_id.
+    keep_recent = _safe_recent_keep(messages, keep_recent)
     if len(messages) <= keep_recent + 2:
         return messages  # nothing meaningful to compact
 
@@ -103,36 +128,12 @@ async def compact_messages(
     if len(middle) < 2:
         return messages  # not enough fat to be worth a round-trip
 
-    archivist_id = f"Archivist-{secrets.token_hex(3)}"
-    archivist_name = f"Archivist[{target_name}]"
-    BUS.publish(
-        Event(
-            "spawn",
-            archivist_id,
-            archivist_name,
-            data={
-                "role_type": "worker",
-                "depth": 99,
-                "parent_id": None,
-            },
-        )
-    )
-    BUS.publish(
-        Event(
-            "state",
-            archivist_id,
-            archivist_name,
-            data={
-                "status": "working",
-                "task": (
-                    f"Compact {len(middle)} middle messages for {target_name} "
-                    f"(keeping system + task + last {keep_recent} turns)"
-                ),
-            },
-        )
-    )
-
     try:
+        # bypass_semaphore: archivist calls are triggered BY agents that
+        # are already holding (or about to acquire) the LLM concurrency
+        # semaphore. Sharing the budget would let two concurrent compacts
+        # exhaust max_concurrent_llm and starve the real agents that
+        # spawned them. Archivist is a system task, not a user-facing one.
         response = await LLM.chat(
             messages=[
                 {"role": "system", "content": ARCHIVIST_SYSTEM_PROMPT},
@@ -141,51 +142,22 @@ async def compact_messages(
                     "content": (
                         f"Compress this conversation history (messages "
                         f"{first_real_idx + 1}-{len(messages) - keep_recent - 1} "
-                        f"of {len(messages)}). Reply with one dense paragraph."
+                        f"of {len(messages)} for agent {target_name!r}). "
+                        f"Reply with one dense paragraph."
                         f"\n\n--- TRANSCRIPT ---\n"
                         + _format_messages_for_summary(middle)
                     ),
                 },
             ],
             tools=None,
+            bypass_semaphore=True,
         )
-    except Exception as e:
-        BUS.publish(
-            Event(
-                "error",
-                archivist_id,
-                archivist_name,
-                data={"message": f"compaction LLM call failed: {e}"},
-            )
-        )
-        BUS.publish(
-            Event(
-                "state",
-                archivist_id,
-                archivist_name,
-                data={"status": "error"},
-            )
-        )
+    except Exception:
+        # No bus emit here; caller's compaction_end event records the failure.
         return messages
 
     summary = (response.get("content") or "").strip()
     if not summary:
-        BUS.publish(
-            Event(
-                "error",
-                archivist_id,
-                archivist_name,
-                data={"message": "compaction LLM returned empty content"},
-            )
-        )
-        BUS.publish(
-            Event(
-                "state",
-                archivist_id,
-                archivist_name,
-                data={"status": "error"},
-            )
-        )
         return messages
 
     summary_msg = {
@@ -194,27 +166,4 @@ async def compact_messages(
             f"[archived summary of {len(middle)} earlier messages]: {summary}"
         ),
     }
-    compacted = [system_msg, original_task, summary_msg, *recent]
-
-    BUS.publish(
-        Event(
-            "complete",
-            archivist_id,
-            archivist_name,
-            data={
-                "report": (
-                    f"compacted {len(messages)} -> {len(compacted)} messages "
-                    f"({len(middle)} middle messages summarised)"
-                ),
-            },
-        )
-    )
-    BUS.publish(
-        Event(
-            "state",
-            archivist_id,
-            archivist_name,
-            data={"status": "done"},
-        )
-    )
-    return compacted
+    return [system_msg, original_task, summary_msg, *recent]

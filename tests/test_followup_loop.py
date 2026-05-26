@@ -119,9 +119,9 @@ async def test_followup_round_trip(tmp_path: Path) -> None:
         cli_module._read_followup_input = real  # type: ignore[assignment]
 
     assert rc == 0
-    # CEO produced two complete reports (one initial + one follow-up)
-    assert len(mock.complete_reports) >= 0  # we don't track them on LLM, but...
     # Session history should record both done events and the followup
+    # (the LLM mock doesn't append to its own complete_reports list,
+    # so the canonical record is the persisted history -- check that).
     kinds = [h["kind"] for h in session.data.history]
     assert kinds.count("done") >= 2
     assert "followup" in kinds

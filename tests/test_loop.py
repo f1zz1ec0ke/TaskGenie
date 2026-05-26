@@ -63,7 +63,7 @@ class ScriptedLLM:
     async def model_name(self) -> str:
         return "scripted-mock"
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **_kwargs):
         who = _agent_name_from_sysprompt(messages[0]["content"])
         turn = self._turn.get(who, 0)
         self._turn[who] = turn + 1
@@ -313,9 +313,9 @@ class EscalationLLM(ScriptedLLM):
                 tc(
                     "w-1",
                     "report_blocker",
-                    reason="exec_code is stubbed in v1 and returns a placeholder; I cannot actually compute anything.",
-                    needs="A working sandboxed Python execution tool.",
-                    partial_progress="Identified the analysis approach (mean, median, p95) but could not execute.",
+                    reason="this scripted scenario forbids using exec_code so I cannot actually compute anything.",
+                    needs="permission to run the computation.",
+                    partial_progress="Identified the analysis approach (mean, median, p95) but did not execute.",
                 )
             ],
         }

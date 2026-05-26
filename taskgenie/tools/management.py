@@ -22,7 +22,7 @@ _HIRE_SCHEMA = {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "A descriptive name for the subordinate (PascalCase, e.g. 'CodingAgentResearcher').",
+                    "description": "A descriptive name for the subordinate (PascalCase, e.g. 'PricingResearcher').",
                 },
                 "role_type": {
                     "type": "string",
@@ -213,8 +213,8 @@ _ASK_USER_SCHEMA = {
             "two reasonable interpretations. Do NOT use for trivial decisions you can "
             "make yourself, or for things the user already specified in their original "
             "request. Cheaper to ask once now than rebuild 300 steps of work later. "
-            "Only the CEO should use this — managers and workers escalate via "
-            "`report_blocker` if they need user input."
+            "Subordinates can't see this tool; if they need user input they "
+            "`report_blocker` and you decide whether to convert that into an `ask_user`."
         ),
         "parameters": {
             "type": "object",

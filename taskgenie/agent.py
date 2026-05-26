@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 import uuid
 from typing import Any, Literal
 
@@ -19,12 +21,19 @@ RoleType = Literal["ceo", "manager", "worker"]
 Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
 
 
-_CTX_LIMIT_MARKERS = (
-    "context_length",
-    "maximum context length",
-    "context length",
-    "too many tokens",
-    "context window",
+# Match real provider error wordings tightly; substring matches on
+# "context length" or "context window" were too broad and fired on noise
+# strings like "context length cache hit 0%".
+_CTX_LIMIT_RE = re.compile(
+    r"(?:"
+    r"context[_ ]length[_ ]exceeded"
+    r"|maximum (?:context|input) (?:length|window)"
+    r"|context (?:window|length)[^.]{0,40}(?:exceed|too (?:long|large|many))"
+    r"|exceeds? (?:the )?(?:maximum |max )?(?:context|input)"
+    r"|too many (?:input |prompt )?tokens"
+    r"|(?:input|prompt) is too long"
+    r")",
+    re.IGNORECASE,
 )
 
 
@@ -33,8 +42,15 @@ def _is_context_length_error(exc: Exception) -> bool:
     OpenAI-compatible or Anthropic provider. Errs on the side of saying
     no -- a false negative just falls through to normal error reporting;
     a false positive triggers an unnecessary compact+retry."""
-    msg = str(exc).lower()
-    return any(marker in msg for marker in _CTX_LIMIT_MARKERS)
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and code == "context_length_exceeded":
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", {})
+        if isinstance(err, dict) and err.get("code") == "context_length_exceeded":
+            return True
+    return bool(_CTX_LIMIT_RE.search(str(exc)))
 
 
 class Agent:
@@ -70,6 +86,15 @@ class Agent:
         self.blocker_reason: str = ""
         self.blocker_needs: str = ""
         self.follow_ups: list[dict[str, Any]] = []
+        # Paths this agent has called read_workspace on. Persistent across
+        # turns so the lost-update warning in _write_workspace still fires
+        # after the Archivist has compacted the original tool_call away.
+        self.read_workspace_paths: set[str] = set()
+        # Message-count high-water mark from the last (successful or
+        # no-op) compaction attempt. _maybe_compact uses it to avoid
+        # re-triggering every turn when one compact didn't bring the
+        # history below threshold.
+        self._compaction_floor: int = 0
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
         self.workspace_dir = Agent.WORKSPACE_ROOT
         Agent.REGISTRY[self.id] = self
@@ -103,6 +128,7 @@ class Agent:
             "blocker_reason": self.blocker_reason,
             "blocker_needs": self.blocker_needs,
             "follow_ups": self.follow_ups,
+            "read_workspace_paths": sorted(self.read_workspace_paths),
         }
 
     @classmethod
@@ -122,6 +148,8 @@ class Agent:
         agent.blocker_reason = d.get("blocker_reason", "")
         agent.blocker_needs = d.get("blocker_needs", "")
         agent.follow_ups = d.get("follow_ups", [])
+        agent.read_workspace_paths = set(d.get("read_workspace_paths", []) or [])
+        agent._compaction_floor = 0
         agent.scratch_dir = d["scratch_dir"]
         agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
@@ -206,26 +234,70 @@ class Agent:
         recovery after a context-length error from the API).
 
         Returns True if compaction actually shrank the history.
+
+        Emits `compaction_start` / `compaction_end` events on BUS so the
+        TUI can surface compaction activity on THIS agent's row rather
+        than as a depth-99 ghost tree node (the archivist function itself
+        no longer publishes anything to the bus).
         """
-        if not force and not should_compact(
-            self.messages,
-            CONFIG.ctx_window_tokens,
-            CONFIG.compact_at_pct,
-        ):
-            return False
+        if not force:
+            if not should_compact(
+                self.messages,
+                CONFIG.ctx_window_tokens,
+                CONFIG.compact_at_pct,
+            ):
+                return False
+            # Repeat-compaction guard: if we compacted recently and only a
+            # couple of new messages have been added since, skip. Stops a
+            # feedback loop where the first compact couldn't bring the
+            # history below threshold (large tool results stay verbatim)
+            # and every subsequent turn runs another archivist LLM call.
+            if len(self.messages) - self._compaction_floor < 4:
+                return False
         before = len(self.messages)
         before_tokens = count_tokens(self.messages)
-        new_messages = await compact_messages(self.name, self.messages)
+        self._emit(
+            "compaction_start",
+            before_messages=before,
+            before_tokens=before_tokens,
+            keep_recent=CONFIG.compact_keep_recent,
+        )
+        start = time.monotonic()
+        try:
+            new_messages = await compact_messages(self.name, self.messages)
+        except Exception as e:
+            duration_ms = (time.monotonic() - start) * 1000
+            self._emit(
+                "compaction_end",
+                success=False,
+                error=str(e),
+                duration_ms=duration_ms,
+            )
+            return False
+        duration_ms = (time.monotonic() - start) * 1000
         if len(new_messages) >= before:
-            return False  # Archivist couldn't help (e.g. LLM failed)
+            # Archivist couldn't help (LLM failure, no-op summary).
+            # Advance the floor anyway so we don't keep retrying every turn.
+            self._compaction_floor = len(self.messages)
+            self._emit(
+                "compaction_end",
+                success=False,
+                before_messages=before,
+                after_messages=len(new_messages),
+                duration_ms=duration_ms,
+            )
+            return False
         self.messages = new_messages
+        self._compaction_floor = len(self.messages)
         after_tokens = count_tokens(self.messages)
         self._emit(
-            "narrate",
-            text=(
-                f"[context] compacted history: {before} -> {len(new_messages)} "
-                f"messages ({before_tokens} -> {after_tokens} tokens)"
-            ),
+            "compaction_end",
+            success=True,
+            before_messages=before,
+            after_messages=len(new_messages),
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            duration_ms=duration_ms,
         )
         return True
 
@@ -408,39 +480,88 @@ class Agent:
                     )
                     continue
 
+                # Wrap the whole tool-execute + post-process pipeline in
+                # one try. If ANYTHING here raises (dispatcher, json.dumps
+                # on a weird return, dump_large_tool_result hitting disk
+                # full, _emit failing on a BUS subscriber) we still emit
+                # a `tool` reply for this tool_call_id and seal any
+                # trailing tool_calls in the batch -- otherwise the next
+                # API call 400s with a dangling tool_call_id (same class
+                # as the bug PR A1 fixed, shifted one layer down).
                 try:
-                    result = await self._execute_tool(name, args)
-                except Exception as e:
-                    result = f"[tool_error] {type(e).__name__}: {e}"
-                    self._emit("error", message=str(result))
+                    try:
+                        result = await self._execute_tool(name, args)
+                    except Exception as e:
+                        result = f"[tool_error] {type(e).__name__}: {e}"
+                        self._emit("error", message=str(result))
 
-                result_str = result if isinstance(result, str) else json.dumps(result)
-                # If the result is bigger than the dump threshold, persist
-                # it to scratch and replace the in-memory message with a
-                # pointer. Stops a single fat read_workspace/exec_code
-                # output from dominating the context window. The full
-                # text remains retrievable via read_file.
-                stored_content, dumped_path = dump_large_tool_result(
-                    result_str,
-                    self.scratch_dir,
-                    _turn,
-                    tc["id"],
-                    name,
-                    CONFIG.dump_tool_output_above_bytes,
-                )
-                self.messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": stored_content}
-                )
-                if dumped_path:
-                    self._emit(
-                        "tool_result",
-                        tool=name,
-                        result=stored_content,
-                        dumped_path=dumped_path,
-                        original_bytes=len(result_str),
+                    result_str = (
+                        result if isinstance(result, str) else json.dumps(result)
                     )
-                else:
-                    self._emit("tool_result", tool=name, result=result_str)
+                    # If the result is bigger than the dump threshold,
+                    # persist it to scratch and replace the in-memory
+                    # message with a pointer. Stops a single fat
+                    # read_workspace/exec_code output from dominating the
+                    # context window. The full text remains retrievable
+                    # via read_file.
+                    stored_content, dumped_path = dump_large_tool_result(
+                        result_str,
+                        self.scratch_dir,
+                        _turn,
+                        tc["id"],
+                        name,
+                        CONFIG.dump_tool_output_above_bytes,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": stored_content,
+                        }
+                    )
+                    if dumped_path:
+                        self._emit(
+                            "tool_result",
+                            tool=name,
+                            result=stored_content,
+                            dumped_path=dumped_path,
+                            original_bytes=len(result_str),
+                        )
+                    else:
+                        self._emit("tool_result", tool=name, result=result_str)
+                except Exception as e:
+                    err = f"[tool_pipeline_error] {type(e).__name__}: {e}"
+                    last = self.messages[-1] if self.messages else {}
+                    already_appended = (
+                        last.get("role") == "tool"
+                        and last.get("tool_call_id") == tc["id"]
+                    )
+                    if not already_appended:
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": err,
+                            }
+                        )
+                    for j in range(i + 1, len(tool_calls)):
+                        skip_tc = tool_calls[j]
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": skip_tc["id"],
+                                "content": (
+                                    f"[skipped: agent halted on pipeline "
+                                    f"error in `{name}`]"
+                                ),
+                            }
+                        )
+                    self._emit("error", message=err)
+                    self._set_status("error", error=err)
+                    return RunResult(
+                        kind="error",
+                        error=f"{self.name} tool pipeline failure: {e}",
+                    )
 
         self._set_status("exhausted")
         return RunResult(
@@ -618,7 +739,11 @@ class Agent:
         child = self._lookup_child(agent_id)
         if isinstance(child, str):
             return f"[error] {child}"
-        child.status = "fired"
+        # Use _set_status (not direct assignment) so subscribers see the
+        # transition event -- the TUI tree relies on `state` events to
+        # re-colour the node; without the event it appeared stuck in the
+        # previous status until the next emit on that agent.
+        child._set_status("fired", reason=reason)
         for handle, t in list(self.task_assignments.items()):
             if self.task_targets.get(handle) == child.id and not t.done():
                 t.cancel()
