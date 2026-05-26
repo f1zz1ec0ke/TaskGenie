@@ -5,7 +5,9 @@ import json
 import uuid
 from typing import Any, Literal
 
+from taskgenie.archivist import compact_messages
 from taskgenie.config import CONFIG
+from taskgenie.context import count_tokens, dump_large_tool_result, should_compact
 from taskgenie.events import BUS, Event
 from taskgenie.llm import LLM
 from taskgenie.prompts import manager_prompt, worker_prompt
@@ -15,6 +17,24 @@ from taskgenie.tools.work import scratch_for
 
 RoleType = Literal["ceo", "manager", "worker"]
 Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
+
+
+_CTX_LIMIT_MARKERS = (
+    "context_length",
+    "maximum context length",
+    "context length",
+    "too many tokens",
+    "context window",
+)
+
+
+def _is_context_length_error(exc: Exception) -> bool:
+    """True if `exc` looks like a context-window-exceeded error from any
+    OpenAI-compatible or Anthropic provider. Errs on the side of saying
+    no -- a false negative just falls through to normal error reporting;
+    a false positive triggers an unnecessary compact+retry."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CTX_LIMIT_MARKERS)
 
 
 class Agent:
@@ -178,18 +198,95 @@ class Agent:
         self.status = status
         self._emit("state", status=status, **extra)
 
+    async def _maybe_compact(self, force: bool = False) -> bool:
+        """If the message history is approaching the context window,
+        hand it to the Archivist and swap in the compacted version.
+
+        `force=True` runs compaction unconditionally (used for reactive
+        recovery after a context-length error from the API).
+
+        Returns True if compaction actually shrank the history.
+        """
+        if not force and not should_compact(
+            self.messages,
+            CONFIG.ctx_window_tokens,
+            CONFIG.compact_at_pct,
+        ):
+            return False
+        before = len(self.messages)
+        before_tokens = count_tokens(self.messages)
+        new_messages = await compact_messages(self.name, self.messages)
+        if len(new_messages) >= before:
+            return False  # Archivist couldn't help (e.g. LLM failed)
+        self.messages = new_messages
+        after_tokens = count_tokens(self.messages)
+        self._emit(
+            "narrate",
+            text=(
+                f"[context] compacted history: {before} -> {len(new_messages)} "
+                f"messages ({before_tokens} -> {after_tokens} tokens)"
+            ),
+        )
+        return True
+
     async def run(self, task: str) -> RunResult:
         self.messages.append({"role": "user", "content": task})
         self._set_status("working", task=task)
 
         empty_turn_count = 0
         for _turn in range(CONFIG.max_turns_per_agent):
+            # Pre-call compaction: if we're approaching the context
+            # window, summarise older messages via the Archivist BEFORE
+            # the API call, so we don't blow the limit and so we burn
+            # fewer prompt tokens on this turn.
+            await self._maybe_compact()
+
             try:
                 response = await LLM.chat(self.messages, tools=self.tools)
             except Exception as e:
-                self._set_status("error", error=str(e))
-                self._emit("error", message=f"LLM call failed: {e}")
-                return RunResult(kind="error", error=f"{self.name} LLM failure: {e}")
+                # Reactive recovery: if the API said we exceeded the
+                # context window, force a compaction and retry ONCE. The
+                # heuristic in count_tokens occasionally under-counts a
+                # heavy tool_result so this path catches the long tail.
+                if _is_context_length_error(e):
+                    self._emit(
+                        "error",
+                        message=(
+                            f"context window exceeded; compacting and retrying: {e}"
+                        ),
+                    )
+                    compacted = await self._maybe_compact(force=True)
+                    if compacted:
+                        try:
+                            response = await LLM.chat(self.messages, tools=self.tools)
+                        except Exception as e2:
+                            self._set_status("error", error=str(e2))
+                            self._emit(
+                                "error",
+                                message=f"LLM call failed after compaction: {e2}",
+                            )
+                            return RunResult(
+                                kind="error",
+                                error=f"{self.name} LLM failure: {e2}",
+                            )
+                    else:
+                        self._set_status("error", error=str(e))
+                        self._emit(
+                            "error",
+                            message=(
+                                f"LLM call failed (compaction couldn't help): {e}"
+                            ),
+                        )
+                        return RunResult(
+                            kind="error",
+                            error=f"{self.name} LLM failure: {e}",
+                        )
+                else:
+                    self._set_status("error", error=str(e))
+                    self._emit("error", message=f"LLM call failed: {e}")
+                    return RunResult(
+                        kind="error", error=f"{self.name} LLM failure: {e}"
+                    )
 
             usage = response.get("usage") or {}
             self._emit(
@@ -318,10 +415,32 @@ class Agent:
                     self._emit("error", message=str(result))
 
                 result_str = result if isinstance(result, str) else json.dumps(result)
-                self.messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
+                # If the result is bigger than the dump threshold, persist
+                # it to scratch and replace the in-memory message with a
+                # pointer. Stops a single fat read_workspace/exec_code
+                # output from dominating the context window. The full
+                # text remains retrievable via read_file.
+                stored_content, dumped_path = dump_large_tool_result(
+                    result_str,
+                    self.scratch_dir,
+                    _turn,
+                    tc["id"],
+                    name,
+                    CONFIG.dump_tool_output_above_bytes,
                 )
-                self._emit("tool_result", tool=name, result=result_str)
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": tc["id"], "content": stored_content}
+                )
+                if dumped_path:
+                    self._emit(
+                        "tool_result",
+                        tool=name,
+                        result=stored_content,
+                        dumped_path=dumped_path,
+                        original_bytes=len(result_str),
+                    )
+                else:
+                    self._emit("tool_result", tool=name, result=result_str)
 
         self._set_status("exhausted")
         return RunResult(

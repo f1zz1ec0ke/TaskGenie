@@ -70,10 +70,10 @@ Status: merged
 
 ---
 
-## PR C — Resource safety (IN FLIGHT)
+## PR C — Resource safety (MERGED #14)
 
 Branch: `claude/review-pr-c-resources`
-Status: opened for review
+Status: merged
 
 ### C1. MCP `call_tool` has no timeout (MEDIUM, agent-reported)
 - **Where:** `taskgenie/mcp_client.py:117-119`
@@ -99,19 +99,39 @@ Status: opened for review
 
 ---
 
-## PR D — Memory compaction (design needed, plan agent first)
+## PR D — Context-window management (IN FLIGHT)
 
-Branch (planned): `claude/review-pr-d-compact`
+Branch: `claude/review-pr-d-context`
+Status: opened for review
 
-### D1. CEO message history grows unbounded across follow-up turns
-- **Where:** `taskgenie/__main__.py` follow-up loop + `taskgenie/agent.py:46,182`
-- **Design questions to settle before coding:**
-  - Compact at turn boundary or after N tokens?
-  - Summarize via LLM call, or rule-based truncation of tool_results?
-  - Preserve: system prompt, original task, final reports, follow-up user messages.
-  - Drop or summarize: old tool_calls + tool_results (especially long workspace reads).
-  - Knob exposure: `CONFIG.compact_after_tokens`, `CONFIG.preserve_last_n_turns`?
-- **Plan agent prompt:** brief on the codebase, ask for a step-by-step plan with files touched + the trade-off between LLM-summarization (better quality, $) vs rule-based (cheap, lossy).
+Rescoped during planning: the original "CEO history compaction" framing
+was wrong (CEO sees only subordinate FINAL reports via to_tool_payload,
+not their full histories). The real risk is workers with huge
+tool-result tail (read_workspace + exec_code outputs). New scope:
+
+### D1. Inline tool-output dumping
+- `taskgenie/context.py:dump_large_tool_result()` — tool replies over
+  `CONFIG.dump_tool_output_above_bytes` (default 4KB) get written to
+  the agent's scratch dir; the in-memory message becomes a one-line
+  pointer telling the agent to `read_file` if they need the full text.
+  Generic for all tools including MCP.
+
+### D2. Archivist agent
+- `taskgenie/archivist.py:compact_messages()` — when invoked, runs an
+  LLM call (NOT a full Agent — direct LLM with bus events for TUI
+  visibility) that compresses the middle band of an agent's messages
+  into one `[archived summary]` user message. Preserves: system
+  prompt, original task, last N turns. Falls back to original on LLM
+  failure.
+
+### D3. Pre-call compaction
+- `Agent._maybe_compact()` invoked before every `LLM.chat`. If
+  `count_tokens(self.messages) > CONFIG.ctx_window_tokens * CONFIG.compact_at_pct`,
+  the Archivist runs and the result is swapped in.
+
+### D4. Reactive recovery
+- If `LLM.chat` raises a context-length error, `_is_context_length_error`
+  pattern-matches the message and forces a compact + one retry.
 
 ---
 
