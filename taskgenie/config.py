@@ -34,6 +34,7 @@ class Config:
     max_turns_per_agent: int = _env_int("TASKGENIE_MAX_TURNS", 25)
     max_concurrent_llm: int = _env_int("TASKGENIE_MAX_CONCURRENT_LLM", 4)
     exec_timeout_seconds: int = _env_int("TASKGENIE_EXEC_TIMEOUT", 30)
+    mcp_call_timeout_seconds: int = _env_int("TASKGENIE_MCP_CALL_TIMEOUT", 60)
     data_dir: str = _env("TASKGENIE_DATA_DIR", ".taskgenie")
     mcp_config_path: str = _env("TASKGENIE_MCP_CONFIG", "./mcp.json")
 
