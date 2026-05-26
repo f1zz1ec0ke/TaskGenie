@@ -41,7 +41,7 @@ class Config:
     ctx_window_tokens: int = _env_int("TASKGENIE_CTX_WINDOW", 128000)
     compact_at_pct: float = _env_float("TASKGENIE_COMPACT_AT_PCT", 0.8)
     compact_keep_recent: int = _env_int("TASKGENIE_COMPACT_KEEP_RECENT", 6)
-    dump_tool_output_above_bytes: int = _env_int("TASKGENIE_DUMP_OVER_BYTES", 4096)
+    dump_tool_output_above_bytes: int = _env_int("TASKGENIE_DUMP_OVER_BYTES", 16384)
     data_dir: str = _env("TASKGENIE_DATA_DIR", ".taskgenie")
     mcp_config_path: str = _env("TASKGENIE_MCP_CONFIG", "./mcp.json")
 

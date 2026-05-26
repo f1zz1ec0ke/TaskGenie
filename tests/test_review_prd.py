@@ -345,6 +345,10 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
     REGISTRY.register(
         big_schema, kind="work", version="1.0", dispatcher=dispatcher
     )
+    # Drive the threshold from below the 8KB fake output so this test
+    # stays independent of CONFIG.dump_tool_output_above_bytes's default.
+    original_dump_threshold = CONFIG.dump_tool_output_above_bytes
+    object.__setattr__(CONFIG, "dump_tool_output_above_bytes", 4096)
     try:
         class _LLM:
             _n = 0
@@ -389,6 +393,9 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
         assert scratch_files[0].read_text(encoding="utf-8") == "Z" * 8192
     finally:
         REGISTRY.unregister("_fake_huge_tool")
+        object.__setattr__(
+            CONFIG, "dump_tool_output_above_bytes", original_dump_threshold
+        )
     print("[large_tool_result_dumped_to_scratch] OK")
 
 
