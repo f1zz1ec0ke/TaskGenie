@@ -5,9 +5,10 @@ Updated as PRs land. Not user-facing docs — this is the to-do file.
 
 ---
 
-## PR A — Critical bugs (IN FLIGHT)
+## PR A — Critical bugs (MERGED #12)
 
 Branch: `claude/review-pr-a-critical`
+Status: merged
 
 ### A1. Dangling tool_call_ids after early return (CRITICAL, verified)
 - **Where:** `taskgenie/agent.py:228-288`
@@ -29,9 +30,10 @@ Branch: `claude/review-pr-a-critical`
 
 ---
 
-## PR B — Resume hardening + test gaps (queued)
+## PR B — Resume hardening + test gaps (MERGED #13)
 
-Branch (planned): `claude/review-pr-b-resume`
+Branch: `claude/review-pr-b-resume`
+Status: merged
 
 ### B1. Session.load has no error handling (HIGH, verified)
 - **Where:** `taskgenie/session.py:159-165`
@@ -68,9 +70,10 @@ Branch (planned): `claude/review-pr-b-resume`
 
 ---
 
-## PR C — Resource safety (queued)
+## PR C — Resource safety (IN FLIGHT)
 
-Branch (planned): `claude/review-pr-c-resources`
+Branch: `claude/review-pr-c-resources`
+Status: opened for review
 
 ### C1. MCP `call_tool` has no timeout (MEDIUM, agent-reported)
 - **Where:** `taskgenie/mcp_client.py:117-119`

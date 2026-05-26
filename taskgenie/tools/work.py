@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -346,10 +347,20 @@ async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
         )
     updated = current.replace(old, new, 1)
     # Atomic-ish replace: write to a sibling temp then rename. Avoids leaving a
-    # half-written file if the process dies mid-write.
+    # half-written file if the process dies mid-write. If the rename fails
+    # (e.g. cross-device, permission), clean up the temp ourselves so the
+    # workspace doesn't accumulate stale .tg-edit-tmp files.
     tmp = p.with_suffix(p.suffix + ".tg-edit-tmp")
-    tmp.write_text(updated, encoding="utf-8")
-    tmp.replace(p)
+    try:
+        tmp.write_text(updated, encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
     return (
         f"edited workspace/{args['path']} "
         f"({len(old)} chars -> {len(new)} chars)"
@@ -376,6 +387,28 @@ def _scrubbed_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in passthrough}
 
 
+def _kill_proc_tree(proc: asyncio.subprocess.Process, on_posix: bool) -> None:
+    """Kill a subprocess and any children it spawned.
+
+    On POSIX (after start_new_session=True) the subprocess is the leader
+    of its own process group; killpg targets the whole group. On Windows
+    or if killpg fails for any reason, fall back to killing the parent
+    directly -- best-effort.
+    """
+    if on_posix:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            # Group already gone, or we never managed to put the child in
+            # its own group; fall through to the direct kill below.
+            pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _resolve_argv(language: str, code: str) -> list[str] | None:
     if language == "python":
         return [sys.executable, "-c", code]
@@ -400,6 +433,12 @@ async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
     Path(cwd).mkdir(parents=True, exist_ok=True)
     env = _scrubbed_env()
 
+    # start_new_session puts the child in its own process group on POSIX so
+    # we can kill the whole group on timeout. Without this, a snippet like
+    # `bash -c "sleep 9999 &"` would leave the inner sleep orphaned even
+    # after we kill the shell. Windows doesn't support it (or process groups
+    # in the same way) -- fall back to plain proc.kill() there.
+    on_posix = os.name != "nt"
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -407,6 +446,7 @@ async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=on_posix,
         )
     except FileNotFoundError as e:
         return f"[exec_code error] could not launch {argv[0]}: {e}"
@@ -418,10 +458,7 @@ async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
             proc.communicate(), timeout=CONFIG.exec_timeout_seconds
         )
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        _kill_proc_tree(proc, on_posix)
         await proc.wait()
         return (
             f"[exec_code TIMEOUT after {CONFIG.exec_timeout_seconds}s] "

@@ -6,7 +6,9 @@ shuts every subprocess down.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
 
 
@@ -114,7 +117,16 @@ class MCPClient:
         if session is None:
             return f"[MCP_ERROR] no session for server {server_name}"
         try:
-            result = await session.call_tool(name=original_name, arguments=args)
+            result = await asyncio.wait_for(
+                session.call_tool(name=original_name, arguments=args),
+                timeout=CONFIG.mcp_call_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            # A hung MCP server would otherwise block this worker forever.
+            return (
+                f"[MCP_ERROR] {server_name}.{original_name} timed out "
+                f"after {CONFIG.mcp_call_timeout_seconds}s"
+            )
         except Exception as e:
             return f"[MCP_ERROR] {server_name}.{original_name}: {type(e).__name__}: {e}"
         parts: list[str] = []
@@ -139,6 +151,13 @@ class MCPClient:
         self._sessions.clear()
         try:
             await self._stack.aclose()
-        except Exception:
-            # Best-effort shutdown — child processes may already be dying.
-            pass
+        except Exception as e:
+            # Best-effort shutdown -- child processes may already be dying.
+            # But log so a genuinely hung shutdown is visible. Stderr instead
+            # of the Rich console so it doesn't get swallowed by an alt-screen
+            # TUI that's already torn down.
+            print(
+                f"[mcp_client] cleanup error in close(): "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
