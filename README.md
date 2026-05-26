@@ -63,12 +63,16 @@ LLM/token counters, and a chronological event stream.
   tool, fix a bug, edit a prompt), then `taskgenie --resume <id>` —
   the full agent tree is rehydrated, the CEO is told which tools have
   changed, and work continues. `taskgenie --list` shows all sessions.
-- **Live TUI.** 2×2 grid with a header strip: live counters
+- **Live TUI.** Two-screen layout with a persistent header strip
   (agent counts by status, LLM calls, tokens up/down, tool calls,
-  elapsed) + focus pane (deep details of the most-recent agent) +
-  hierarchy (every manager, every worker, with the spotlight worker's
-  narration highlighted) + active panel (every working agent's current
-  action) + scrolling event log.
+  elapsed). **Screen 1** splits the focus pane (the most-recent agent's
+  full per-turn activity log — narrations, tool calls, hires,
+  reviews — accumulating as it works, plus a "thinking Ns…" liveness
+  timer when the LLM is mid-call) and the hierarchy (every manager,
+  every worker, with the spotlight worker's narration highlighted).
+  **Screen 2** gives the scrolling event log the whole canvas.
+  Press `Tab` to swap screens, or `1` / `2` to pin one. Keybindings
+  fall back to no-ops when stdout isn't a terminal.
 - **MCP client built in.** Drop a standard `mcp.json` (Claude Desktop /
   Cursor / LM Studio format) at the project root and TaskGenie spawns
   each server as a subprocess and surfaces its tools to workers
@@ -258,7 +262,7 @@ taskgenie/
   stats.py          # deterministic run-summary computation + panel
   mcp_client.py     # spawn MCP server subprocesses; register tools
   artifacts.py      # final.{md,html,json} + project README writer
-  tui.py            # Rich 2x2 live UI (header, focus, hierarchy, active, log)
+  tui.py            # Rich live UI: two screens (focus+tree / event log) + header
   result.py         # RunResult kinds: done/blocked/question/exhausted/error
   tools/
     registry.py     # central tool registration + dispatch
