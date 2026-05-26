@@ -245,6 +245,19 @@ class Session:
         self.data.status = "done"
         self.data.add_history(HistoryEntry(kind="done", text=report))
 
+    def mark_followup(self, user_text: str) -> None:
+        """A user follow-up after the CEO already completed once. Session
+        moves back to 'running' so resume picks up correctly."""
+        self.data.status = "running"
+        self.data.add_history(HistoryEntry(kind="followup", text=user_text))
+
+    def mark_reset(self, fired_count: int) -> None:
+        """The user issued /reset; the team was disbanded but the
+        workspace and CEO persist. Recorded for forensic history."""
+        self.data.add_history(
+            HistoryEntry(kind="reset", payload={"fired_count": fired_count})
+        )
+
     def mark_abandoned(self) -> None:
         self.data.status = "abandoned"
         self.data.add_history(HistoryEntry(kind="abandoned"))
