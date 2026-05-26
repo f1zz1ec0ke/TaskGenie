@@ -50,15 +50,26 @@ def _build_scenario() -> TUI:
     tui._handle_event(Event("hire", "ceo", "CEO", data={"child_name": "PPUMgr", "role_type": "manager"}))
     tui._handle_event(Event("tool_call", "ceo", "CEO", data={"tool": "hire_manager", "args": {"name": "CartMgr"}}))
     tui._handle_event(Event("hire", "ceo", "CEO", data={"child_name": "CartMgr", "role_type": "manager"}))
+    tui._handle_event(Event("tool_call", "ceo", "CEO", data={"tool": "hire_manager", "args": {"name": "AudioMgr"}}))
+    tui._handle_event(Event("hire", "ceo", "CEO", data={"child_name": "AudioMgr", "role_type": "manager"}))
+    tui._handle_event(Event("tool_call", "ceo", "CEO", data={"tool": "hire_manager", "args": {"name": "InputMgr"}}))
+    tui._handle_event(Event("hire", "ceo", "CEO", data={"child_name": "InputMgr", "role_type": "manager"}))
 
     _spawn(tui, "cpu_mgr", "CPUMgr", "manager", 1, "ceo")
     _spawn(tui, "ppu_mgr", "PPUMgr", "manager", 1, "ceo")
     _spawn(tui, "cart_mgr", "CartMgr", "manager", 1, "ceo")
+    _spawn(tui, "audio_mgr", "AudioMgr", "manager", 1, "ceo")
+    _spawn(tui, "input_mgr", "InputMgr", "manager", 1, "ceo")
 
-    # CPU department: 1 working, 1 blocked, 1 done.
+    # CPU department: large team to force tree overflow into a 2nd column.
     _spawn(tui, "cpu_w1", "OpcodeDecoder", "worker", 2, "cpu_mgr")
     _spawn(tui, "cpu_w2", "InterruptCtrl", "worker", 2, "cpu_mgr")
     _spawn(tui, "cpu_w3", "RegisterFile", "worker", 2, "cpu_mgr")
+    _spawn(tui, "cpu_w4", "ALU", "worker", 2, "cpu_mgr")
+    _spawn(tui, "cpu_w5", "MemoryBus", "worker", 2, "cpu_mgr")
+    _spawn(tui, "cpu_w6", "CycleTimer", "worker", 2, "cpu_mgr")
+    _spawn(tui, "cpu_w7", "InstructionTests", "worker", 2, "cpu_mgr")
+    _spawn(tui, "cpu_w8", "DebugTracer", "worker", 2, "cpu_mgr")
     tui._handle_event(Event("state", "cpu_mgr", "CPUMgr", data={"status": "working", "task": "Implement the SM83 CPU core: registers, fetch-decode-execute, interrupts, timing."}))
     tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "OpcodeDecoder", "task": "Implement all 0x00-0xFF opcodes plus the 0xCB prefix table."}))
     tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "InterruptCtrl", "task": "Implement VBLANK/LCD/Timer/Serial/Joypad interrupt vectors and IME flag."}))
@@ -91,15 +102,39 @@ def _build_scenario() -> TUI:
     tui._handle_event(Event("tool_call", "cpu_w1", "OpcodeDecoder", data={"tool": "edit_workspace", "args": {"path": "cpu/decoder.py", "mode": "append"}}))
     tui._handle_event(Event("narrate", "cpu_w1", "OpcodeDecoder", data={"text": "Now the 0xCB prefix table: BIT/RES/SET/RL/RR/SLA/SRA/SWAP/SRL across all 8 targets. Generating via a small DSL."}))
 
-    # PPU department: manager working, one worker working.
+    # Mark several CPU workers active / done / blocked to make the column
+    # feel like a real run.
+    tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "ALU", "task": "Implement add/sub/and/or/xor/cp with half-carry and zero-flag updates."}))
+    tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "MemoryBus", "task": "8/16-bit reads + writes against the bus map, mirroring rules included."}))
+    tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "CycleTimer", "task": "Per-opcode T-cycle accounting and M-cycle stepping."}))
+    tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "InstructionTests", "task": "Generate the Blargg-style instr_timing fixture."}))
+    tui._handle_event(Event("assign", "cpu_mgr", "CPUMgr", data={"agent_name": "DebugTracer", "task": "Cycle-by-cycle trace dump for diff against reference traces."}))
+    tui._handle_event(Event("state", "cpu_w4", "ALU", data={"status": "working"}))
+    tui._handle_event(Event("tool_call", "cpu_w4", "ALU", data={"tool": "write_workspace", "args": {"path": "cpu/alu.py"}}))
+    tui._handle_event(Event("state", "cpu_w5", "MemoryBus", data={"status": "working"}))
+    tui._handle_event(Event("state", "cpu_w6", "CycleTimer", data={"status": "working"}))
+    tui._handle_event(Event("complete", "cpu_w7", "InstructionTests", data={"report": "instr_timing.gb-derived fixtures generated."}))
+    tui._handle_event(Event("state", "cpu_w8", "DebugTracer", data={"status": "idle"}))
+
+    # PPU department: manager working, several workers, varied states.
     _spawn(tui, "ppu_w1", "Renderer", "worker", 2, "ppu_mgr")
     _spawn(tui, "ppu_w2", "Tiles", "worker", 2, "ppu_mgr")
+    _spawn(tui, "ppu_w3", "Sprites", "worker", 2, "ppu_mgr")
+    _spawn(tui, "ppu_w4", "ScanlineFetcher", "worker", 2, "ppu_mgr")
+    _spawn(tui, "ppu_w5", "PaletteDecoder", "worker", 2, "ppu_mgr")
     tui._handle_event(Event("state", "ppu_mgr", "PPUMgr", data={"status": "working", "task": "Implement the PPU: tile fetching, sprite layer, scanline timing, VBLANK."}))
     tui._handle_event(Event("assign", "ppu_mgr", "PPUMgr", data={"agent_name": "Renderer", "task": "Implement scanline-accurate rendering pipeline with mode 0/1/2/3 timing."}))
     tui._handle_event(Event("assign", "ppu_mgr", "PPUMgr", data={"agent_name": "Tiles", "task": "Tile data decode from VRAM 0x8000-0x97FF, background map 0x9800-0x9FFF."}))
+    tui._handle_event(Event("assign", "ppu_mgr", "PPUMgr", data={"agent_name": "Sprites", "task": "OAM scan, 10-sprite-per-line limit, X-priority sort."}))
+    tui._handle_event(Event("assign", "ppu_mgr", "PPUMgr", data={"agent_name": "ScanlineFetcher", "task": "Background + window fetcher state machine."}))
+    tui._handle_event(Event("assign", "ppu_mgr", "PPUMgr", data={"agent_name": "PaletteDecoder", "task": "BGP/OBP0/OBP1 register handling for the DMG 4-shade palette."}))
     tui._handle_event(Event("state", "ppu_w1", "Renderer", data={"status": "working"}))
     tui._handle_event(Event("tool_call", "ppu_w1", "Renderer", data={"tool": "write_workspace", "args": {"path": "ppu/renderer.py"}}))
     tui._handle_event(Event("state", "ppu_w2", "Tiles", data={"status": "working"}))
+    tui._handle_event(Event("state", "ppu_w3", "Sprites", data={"status": "working"}))
+    tui._handle_event(Event("state", "ppu_w4", "ScanlineFetcher", data={"status": "blocked"}))
+    tui._handle_event(Event("blocked", "ppu_w4", "ScanlineFetcher", data={"reason": "VRAM layout disagrees with Pan Docs by 4 bytes", "needs": "clarification on tile addressing mode", "partial_progress": "fetcher state machine drafted"}))
+    tui._handle_event(Event("complete", "ppu_w5", "PaletteDecoder", data={"report": "BGP/OBP0/OBP1 working, palette swaps mid-frame."}))
 
     # Cart department: done.
     _spawn(tui, "cart_w1", "MBC1", "worker", 2, "cart_mgr")
@@ -109,6 +144,30 @@ def _build_scenario() -> TUI:
     tui._handle_event(Event("tool_call", "cart_w1", "MBC1", data={"tool": "write_workspace", "args": {"path": "cart/mbc1.py"}}))
     tui._handle_event(Event("complete", "cart_w1", "MBC1", data={"report": "MBC1 cart loader done; passes tetris.gb and dr_mario.gb header checks."}))
     tui._handle_event(Event("review", "cart_mgr", "CartMgr", data={"accepted": True, "feedback": "Solid. Header masks correct, banking model matches Pan Docs."}))
+
+    # Audio department: square channels, wave, noise, mixer.
+    _spawn(tui, "audio_w1", "Square1", "worker", 2, "audio_mgr")
+    _spawn(tui, "audio_w2", "Square2", "worker", 2, "audio_mgr")
+    _spawn(tui, "audio_w3", "WaveChannel", "worker", 2, "audio_mgr")
+    _spawn(tui, "audio_w4", "NoiseChannel", "worker", 2, "audio_mgr")
+    _spawn(tui, "audio_w5", "AudioMixer", "worker", 2, "audio_mgr")
+    _spawn(tui, "audio_w6", "FrameSequencer", "worker", 2, "audio_mgr")
+    tui._handle_event(Event("state", "audio_mgr", "AudioMgr", data={"status": "working", "task": "APU: four channels + mixer + frame sequencer at 512Hz."}))
+    tui._handle_event(Event("state", "audio_w1", "Square1", data={"status": "working"}))
+    tui._handle_event(Event("state", "audio_w2", "Square2", data={"status": "working"}))
+    tui._handle_event(Event("state", "audio_w3", "WaveChannel", data={"status": "idle"}))
+    tui._handle_event(Event("state", "audio_w4", "NoiseChannel", data={"status": "idle"}))
+    tui._handle_event(Event("state", "audio_w5", "AudioMixer", data={"status": "idle"}))
+    tui._handle_event(Event("state", "audio_w6", "FrameSequencer", data={"status": "working"}))
+
+    # Input department: joypad + serial stub.
+    _spawn(tui, "input_w1", "JoypadMatrix", "worker", 2, "input_mgr")
+    _spawn(tui, "input_w2", "SerialStub", "worker", 2, "input_mgr")
+    _spawn(tui, "input_w3", "KeyMap", "worker", 2, "input_mgr")
+    tui._handle_event(Event("state", "input_mgr", "InputMgr", data={"status": "working", "task": "Joypad register + serial link cable stub."}))
+    tui._handle_event(Event("state", "input_w1", "JoypadMatrix", data={"status": "working"}))
+    tui._handle_event(Event("state", "input_w2", "SerialStub", data={"status": "idle"}))
+    tui._handle_event(Event("complete", "input_w3", "KeyMap", data={"report": "SDL2 keymap done."}))
 
     # Some LLM bookkeeping so the header strip looks alive.
     for _ in range(47):
@@ -129,7 +188,10 @@ def _build_scenario() -> TUI:
 
 def _render_screen(tui: TUI, screen: int, out_path: Path, title: str) -> None:
     tui._screen = screen
-    console = Console(record=True, width=180, height=46, force_terminal=True, color_system="truecolor")
+    # Height pulled down to a realistic laptop-terminal size so the
+    # bigger scenario actually overflows the hierarchy panel and the
+    # column-flow is visible in the preview.
+    console = Console(record=True, width=180, height=34, force_terminal=True, color_system="truecolor")
     console.print(tui._render())
     out_path.parent.mkdir(parents=True, exist_ok=True)
     console.save_svg(str(out_path), title=title)

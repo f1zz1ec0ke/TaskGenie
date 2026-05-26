@@ -5,10 +5,14 @@ import sys
 import time
 from typing import Any
 
-from rich.console import Console, Group
+from rich.cells import cell_len, set_cell_size
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.layout import Layout
 from rich.live import Live
+from rich.measure import Measurement
 from rich.panel import Panel
+from rich.segment import Segment
+from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
@@ -90,6 +94,113 @@ class AgentView:
         self.activity_log.append(entry)
         if len(self.activity_log) > ACTIVITY_LOG_CAP:
             self.activity_log = self.activity_log[-ACTIVITY_LOG_CAP:]
+
+
+def _truncate_segments(seg_list: list[Segment], max_width: int) -> list[Segment]:
+    """Cut a list of Segments down to `max_width` display columns.
+
+    Uses Rich's cell_len so fullwidth/CJK characters are counted as 2.
+    The final segment may be partially sliced; styles are preserved.
+    """
+    out: list[Segment] = []
+    width = 0
+    for seg in seg_list:
+        if width >= max_width:
+            break
+        text = seg.text
+        if text == "\n" or not text:
+            continue
+        seg_w = cell_len(text)
+        if seg_w == 0:
+            continue
+        if width + seg_w <= max_width:
+            out.append(seg)
+            width += seg_w
+        else:
+            remaining = max_width - width
+            out.append(Segment(set_cell_size(text, remaining), seg.style))
+            width = max_width
+            break
+    return out
+
+
+class _ColumnOverflowTree:
+    """Tree wrapper that flows into more columns when it would overflow.
+
+    The tree renders as one logical thing — when the rendered height
+    exceeds the panel's assigned height, the overflow lines wrap into a
+    second column to the right, and a third if needed, etc. Same
+    indentation prefixes carry across the column break, so column 2's
+    first line might be `│   ├── ● Foo` referencing parents that live in
+    column 1 — the same visual you'd see scrolling through a deep tree.
+
+    When the tree fits, we yield it directly so single-column rendering
+    is identical to the pre-overflow behaviour.
+    """
+
+    MIN_COL_WIDTH = 38  # Below this, even short worker labels look bad.
+
+    def __init__(self, tree: Tree) -> None:
+        self._tree = tree
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        avail_h = options.height
+        avail_w = options.max_width
+        if avail_h is None or avail_h <= 0 or avail_w <= 0:
+            yield self._tree
+            return
+
+        # Render once at a wide width AND uncapped height so we measure
+        # the tree's full extent. render_lines() crops to options.height
+        # otherwise, which would hide the very overflow we want to detect.
+        wide_opts = options.update(
+            width=max(avail_w, 200), height=None
+        )
+        wide_lines = console.render_lines(self._tree, wide_opts, pad=False)
+        # Drop trailing blank lines Rich sometimes adds.
+        while wide_lines and not any(s.text.strip() for s in wide_lines[-1]):
+            wide_lines.pop()
+
+        if len(wide_lines) <= avail_h:
+            yield self._tree
+            return
+
+        cols_needed = (len(wide_lines) + avail_h - 1) // avail_h
+        max_cols = max(1, avail_w // self.MIN_COL_WIDTH)
+        cols = min(cols_needed, max_cols)
+        if cols <= 1:
+            yield self._tree  # Even one column won't fit — let it crop.
+            return
+
+        col_w = avail_w // cols
+        trunc_lines = [_truncate_segments(line, col_w) for line in wide_lines]
+
+        grid = Table.grid(padding=0)
+        cells: list[Text] = []
+        for i in range(cols):
+            chunk = trunc_lines[i * avail_h : (i + 1) * avail_h]
+            if not chunk:
+                break
+            grid.add_column(width=col_w, overflow="crop", no_wrap=True)
+            cell_text = Text(overflow="crop", no_wrap=True)
+            for line_idx, seg_list in enumerate(chunk):
+                if line_idx > 0:
+                    cell_text.append("\n")
+                for seg in seg_list:
+                    cell_text.append(seg.text, style=seg.style or "")
+            cells.append(cell_text)
+        grid.add_row(*cells)
+        yield grid
+
+    def __rich_measure__(
+        self, console: Console, options: ConsoleOptions
+    ) -> Measurement:
+        # Tell Panel we'll happily use the full inner width. Without this,
+        # measure would fall through to Tree.__rich_measure__ which can
+        # report a very wide preferred width and make Panel mis-size.
+        return Measurement(self.MIN_COL_WIDTH, options.max_width)
 
 
 def _fmt_count(n: int) -> str:
@@ -763,7 +874,11 @@ class TUI:
             )
             layout["body"]["focus"].update(self._build_focus())
             layout["body"]["tree"].update(
-                Panel(self._build_tree(), border_style="cyan", title="hierarchy")
+                Panel(
+                    _ColumnOverflowTree(self._build_tree()),
+                    border_style="cyan",
+                    title="hierarchy",
+                )
             )
         return layout
 

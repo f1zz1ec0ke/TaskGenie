@@ -17,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rich.console import Console
 
+from rich.table import Table
+from rich.tree import Tree
+
 from taskgenie.events import Event
 from taskgenie.tui import (
     SCREEN_LOG,
@@ -24,6 +27,7 @@ from taskgenie.tui import (
     THINKING_THRESHOLD_SECONDS,
     AgentView,
     TUI,
+    _ColumnOverflowTree,
 )
 
 
@@ -188,6 +192,72 @@ def test_screens_render_distinct_content() -> None:
     print("[screens_render_distinct_content] OK")
 
 
+def test_overflow_tree_passes_through_when_fits() -> None:
+    """Short trees should render exactly the same as before — the wrapper
+    is a no-op when the tree fits in the assigned height."""
+    tree = Tree("Root")
+    for i in range(3):
+        tree.add(f"line {i}")
+    overflow = _ColumnOverflowTree(tree)
+
+    console = Console(width=120, height=30, force_terminal=True)
+    opts = console.options.update(width=80, height=20)
+    result = list(overflow.__rich_console__(console, opts))
+    # Exactly one yielded renderable, and it's the original tree object —
+    # no extra column-flow machinery in the single-column case.
+    assert len(result) == 1
+    assert result[0] is tree
+    print("[overflow_tree_passes_through_when_fits] OK")
+
+
+def test_overflow_tree_spills_into_columns() -> None:
+    """Tall trees overflow into Table.grid columns — the rendered output
+    must be a Table (not the bare tree) and must fit the assigned height."""
+    tree = Tree("Root")
+    for i in range(60):  # way more than the 10-row budget
+        tree.add(f"line {i}")
+    overflow = _ColumnOverflowTree(tree)
+
+    console = Console(width=200, height=12, force_terminal=True)
+    opts = console.options.update(width=150, height=10)
+    result = list(overflow.__rich_console__(console, opts))
+    assert len(result) == 1
+    assert isinstance(result[0], Table), (
+        f"expected Table.grid for overflow path, got {type(result[0])}"
+    )
+
+    # Render the table and verify entries from BOTH ends of the source
+    # tree are visible — proving the tree actually wrapped into columns
+    # rather than just truncating.
+    buf = Console(width=150, height=10, force_terminal=False)
+    with buf.capture() as captured:
+        buf.print(result[0])
+    out = captured.get()
+    assert "line 0" in out, f"first entry missing from columned tree:\n{out}"
+    # Something further down the tree should also be present in a later
+    # column (we have 60 lines into ~10 rows of height across multiple cols).
+    assert "line 20" in out or "line 30" in out, (
+        f"deeper entries missing — overflow didn't spill into columns:\n{out}"
+    )
+    print("[overflow_tree_spills_into_columns] OK")
+
+
+def test_overflow_tree_no_height_yields_tree() -> None:
+    """If options.height is None/zero (initial measure pass), the wrapper
+    must not crash and should fall back to the bare tree."""
+    tree = Tree("Root")
+    for i in range(50):
+        tree.add(f"line {i}")
+    overflow = _ColumnOverflowTree(tree)
+
+    console = Console(width=100, force_terminal=True)
+    opts = console.options.update(width=80, height=None)
+    result = list(overflow.__rich_console__(console, opts))
+    assert len(result) == 1
+    assert result[0] is tree
+    print("[overflow_tree_no_height_yields_tree] OK")
+
+
 def test_setup_input_noop_off_tty() -> None:
     """Tests are not a tty; _setup_input must be a safe no-op so we don't
     accidentally clobber the test runner's terminal state."""
@@ -211,6 +281,9 @@ def main() -> int:
     test_thinking_indicator_absent_when_recent()
     test_keys_toggle_screen()
     test_screens_render_distinct_content()
+    test_overflow_tree_passes_through_when_fits()
+    test_overflow_tree_spills_into_columns()
+    test_overflow_tree_no_height_yields_tree()
     test_setup_input_noop_off_tty()
     print("\nAll TUI tests passed.")
     return 0
