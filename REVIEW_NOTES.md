@@ -1,7 +1,38 @@
 # Project review — punch list
 
-Working notes from the top-to-bottom review on main @ 65d29b2.
-Updated as PRs land. Not user-facing docs — this is the to-do file.
+Working notes from the top-to-bottom review on main. Not user-facing
+docs — this is the to-do/done file.
+
+**Status (post round-one):** PRs A, B, C, D all merged into main.
+Plus PR #16 (user-authored) tuned CONFIG knobs: `temperature=0.1`,
+`max_depth=8`, `max_turns_per_agent=1000`, `max_concurrent_llm=2`,
+`exec_timeout_seconds=60`, `compact_at_pct=0.6`,
+`compact_keep_recent=3`. Tuned for deep, long-running tasks with
+more aggressive compaction.
+
+**Next pass (round two):** another top-to-bottom review against the
+new main. Same five-agent parallel-review pattern as before
+(orchestrator, tool surface, persistence, presentation, tests+docs).
+**This pass MUST include code from PRs B/C/D since I wrote it; fresh
+eyes are overdue.** Use the previous review's findings as a
+calibration baseline — what we missed, what we over-stated.
+
+---
+
+## PR D — Context-window management (MERGED #15 + #16)
+
+Branch: `claude/review-pr-d-context`
+Status: merged
+
+Rescoped during planning: the original "CEO history compaction" framing
+was wrong (CEO sees only subordinate FINAL reports via to_tool_payload,
+not their full histories). The real risk is workers with huge
+tool-result tail (read_workspace + exec_code outputs). Final scope:
+
+### D1. Inline tool-output dumping (MERGED)
+### D2. Archivist (MERGED) — a "background agent" emitting bus events
+### D3. Pre-call compaction (MERGED)
+### D4. Reactive recovery on context-length error (MERGED)
 
 ---
 
