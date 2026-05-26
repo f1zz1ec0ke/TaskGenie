@@ -19,7 +19,7 @@ import os
 import re
 import secrets
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -160,9 +160,32 @@ class Session:
         path = CONFIG.sessions_dir / session_id / STATE_FILE
         if not path.exists():
             raise FileNotFoundError(f"no session: {session_id}")
-        raw = json.loads(path.read_text())
-        data = SessionData(**raw)
-        return cls(data)
+        try:
+            raw = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Session {session_id} has a corrupt state.json: {e}"
+            ) from e
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"Session {session_id} state.json is not a JSON object"
+            )
+        # Filter to fields the dataclass actually knows about so a state.json
+        # written by a newer version (with extra fields) still loads on an
+        # older binary. Missing fields fall back to dataclass defaults.
+        known_fields = {f.name for f in fields(SessionData)}
+        unknown = sorted(set(raw) - known_fields)
+        filtered = {k: v for k, v in raw.items() if k in known_fields}
+        try:
+            data = SessionData(**filtered)
+        except TypeError as e:
+            raise ValueError(
+                f"Session {session_id} state.json is missing required fields: {e}"
+            ) from e
+        session = cls(data)
+        if unknown:
+            session._unknown_fields_on_load = unknown
+        return session
 
     @classmethod
     def load_latest(cls) -> "Session | None":
@@ -202,6 +225,10 @@ class Session:
         self.data.tool_signature = {
             "management": REGISTRY.signature("management"),
             "work": REGISTRY.signature("work"),
+            # ceo-only tools (currently just ask_user) live in their own
+            # bucket -- without persisting them, schema changes to
+            # ceo-only tools would silently slip past the resume diff.
+            "ceo": REGISTRY.signature("ceo"),
         }
         self.root_dir.mkdir(parents=True, exist_ok=True)
         # Atomic write.
@@ -270,11 +297,13 @@ class Session:
         self,
         current_mgmt: dict[str, str],
         current_work: dict[str, str],
+        current_ceo: dict[str, str],
     ) -> str | None:
         """Compare a current tool signature against the one stored at save time.
         Returns a short human-readable summary, or None if nothing changed."""
         saved_mgmt = self.data.tool_signature.get("management", {})
         saved_work = self.data.tool_signature.get("work", {})
+        saved_ceo = self.data.tool_signature.get("ceo", {})
 
         def diff(saved: dict[str, str], current: dict[str, str]) -> list[str]:
             lines: list[str] = []
@@ -291,7 +320,8 @@ class Session:
 
         mgmt_diff = diff(saved_mgmt, current_mgmt)
         work_diff = diff(saved_work, current_work)
-        if not mgmt_diff and not work_diff:
+        ceo_diff = diff(saved_ceo, current_ceo)
+        if not mgmt_diff and not work_diff and not ceo_diff:
             return None
 
         out = ["Tool changes since this session was paused:"]
@@ -301,4 +331,7 @@ class Session:
         if work_diff:
             out.append("Worker tools:")
             out.extend(work_diff)
+        if ceo_diff:
+            out.append("CEO-only tools:")
+            out.extend(ceo_diff)
         return "\n".join(out)
