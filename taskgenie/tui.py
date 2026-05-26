@@ -9,6 +9,7 @@ from rich.cells import cell_len, set_cell_size
 from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape as _md_escape
 from rich.measure import Measurement
 from rich.panel import Panel
 from rich.segment import Segment
@@ -314,7 +315,10 @@ class TUI:
                     self.agents[parent_id].children_ids.append(aid)
             else:
                 self.root_id = aid
-            self._log(f"[dim]spawn[/] {event.agent_name} ({view.role_type})")
+            self._log(
+                f"[dim]spawn[/] {_md_escape(event.agent_name)} "
+                f"({_md_escape(view.role_type)})"
+            )
             self.focus_id = aid
             return
 
@@ -341,7 +345,10 @@ class TUI:
             view.last_tool_args = args
             self.tool_calls_total += 1
             view.push_activity("tool", tool, tool_args=dict(args))
-            self._log(f"[cyan]{view.name}[/] -> {tool}({_short_args(args)})")
+            self._log(
+                f"[cyan]{_md_escape(view.name)}[/] -> "
+                f"{_md_escape(tool)}({_md_escape(_short_args(args))})"
+            )
             self._touch(view)
         elif kind == "llm_call":
             self.llm_calls += 1
@@ -353,8 +360,9 @@ class TUI:
                 f"hired {data.get('child_name')} as {data.get('role_type')}",
             )
             self._log(
-                f"[green]{view.name}[/] hired [bold]{data.get('child_name')}[/] "
-                f"as {data.get('role_type')}"
+                f"[green]{_md_escape(view.name)}[/] hired "
+                f"[bold]{_md_escape(data.get('child_name', ''))}[/] "
+                f"as {_md_escape(data.get('role_type', ''))}"
             )
         elif kind == "assign":
             view.push_activity(
@@ -362,8 +370,9 @@ class TUI:
                 f"-> {data.get('agent_name')}: {_trunc(data.get('task', ''), 120)}",
             )
             self._log(
-                f"[blue]{view.name}[/] assigned task to "
-                f"[bold]{data.get('agent_name')}[/]: {_trunc(data.get('task', ''), 80)}"
+                f"[blue]{_md_escape(view.name)}[/] assigned task to "
+                f"[bold]{_md_escape(data.get('agent_name', ''))}[/]: "
+                f"{_md_escape(_trunc(data.get('task', ''), 80))}"
             )
         elif kind == "review":
             verdict = "ACCEPTED" if data.get("accepted") else "REJECTED"
@@ -373,8 +382,8 @@ class TUI:
             )
             style = "green" if data.get("accepted") else "red"
             self._log(
-                f"[{style}]{view.name} review {verdict}[/]: "
-                f"{_trunc(data.get('feedback', ''), 100)}"
+                f"[{style}]{_md_escape(view.name)} review {verdict}[/]: "
+                f"{_md_escape(_trunc(data.get('feedback', ''), 100))}"
             )
         elif kind == "fire":
             view.push_activity(
@@ -382,17 +391,18 @@ class TUI:
                 f"fired {data.get('agent_name')}: {_trunc(data.get('reason', ''), 120)}",
             )
             self._log(
-                f"[red]{view.name} fired {data.get('agent_name')}[/] -- "
-                f"{_trunc(data.get('reason', ''), 80)}"
+                f"[red]{_md_escape(view.name)} fired "
+                f"{_md_escape(data.get('agent_name', ''))}[/] -- "
+                f"{_md_escape(_trunc(data.get('reason', ''), 80))}"
             )
         elif kind == "rehire":
             view.push_activity("rehire", "rehired with new charter")
-            self._log(f"[yellow]{view.name} rehired[/] with new charter")
+            self._log(f"[yellow]{_md_escape(view.name)} rehired[/] with new charter")
         elif kind == "complete":
             view.report = data.get("report", "")
             view.status = "done"
             view.push_activity("complete", _trunc(data.get("report", ""), 200))
-            self._log(f"[green]{view.name} complete[/]")
+            self._log(f"[green]{_md_escape(view.name)} complete[/]")
             self._touch(view)
         elif kind == "follow_up_suggested":
             entry = {
@@ -406,8 +416,8 @@ class TUI:
                 f"↑ {_trunc(entry['what'], 140)}",
             )
             self._log(
-                f"[magenta]{view.name} ↑ follow-up[/]: "
-                f"{_trunc(data.get('what', ''), 80)}"
+                f"[magenta]{_md_escape(view.name)} ↑ follow-up[/]: "
+                f"{_md_escape(_trunc(data.get('what', ''), 80))}"
             )
             self._touch(view)
         elif kind == "blocked":
@@ -420,9 +430,9 @@ class TUI:
                 f"reason: {_trunc(view.blocker_reason, 100)} (needs: {_trunc(view.blocker_needs, 60)})",
             )
             self._log(
-                f"[orange1]{view.name} BLOCKED[/] -- "
-                f"{_trunc(view.blocker_reason, 70)} "
-                f"[dim](needs: {_trunc(view.blocker_needs, 50)})[/]"
+                f"[orange1]{_md_escape(view.name)} BLOCKED[/] -- "
+                f"{_md_escape(_trunc(view.blocker_reason, 70))} "
+                f"[dim](needs: {_md_escape(_trunc(view.blocker_needs, 50))})[/]"
             )
             self._touch(view)
         elif kind == "question":
@@ -432,13 +442,16 @@ class TUI:
             view.status = "asking"
             view.push_activity("question", _trunc(view.question, 200))
             self._log(
-                f"[cyan]{view.name} ASKING USER[/]: "
-                f"{_trunc(view.question, 90)}"
+                f"[cyan]{_md_escape(view.name)} ASKING USER[/]: "
+                f"{_md_escape(_trunc(view.question, 90))}"
             )
             self._touch(view)
         elif kind == "error":
             view.push_activity("error", _trunc(data.get("message", ""), 200))
-            self._log(f"[red]error in {view.name}[/]: {_trunc(data.get('message', ''), 100)}")
+            self._log(
+                f"[red]error in {_md_escape(view.name)}[/]: "
+                f"{_md_escape(_trunc(data.get('message', ''), 100))}"
+            )
 
     def _log(self, line: str) -> None:
         self.recent_events.append(line)

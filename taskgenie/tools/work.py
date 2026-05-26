@@ -207,7 +207,10 @@ def _safe_path(scratch_dir: str, rel_path: str) -> Path:
     base = Path(scratch_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
     target = (base / rel_path).resolve()
-    if not str(target).startswith(str(base)):
+    # Use parents-containment (NOT str.startswith) so a sibling whose
+    # name shares a prefix with base -- e.g. /tmp/scratch-evil vs
+    # /tmp/scratch -- is correctly rejected. target == base is also fine.
+    if target != base and base not in target.parents:
         raise ValueError(f"Path escapes scratch dir: {rel_path}")
     return target
 

@@ -225,7 +225,7 @@ class Agent:
                 continue
             empty_turn_count = 0
 
-            for tc in tool_calls:
+            for i, tc in enumerate(tool_calls):
                 name = tc["name"]
                 try:
                     args = json.loads(tc["arguments"]) if tc["arguments"] else {}
@@ -243,6 +243,7 @@ class Agent:
                     report = args.get("report", content or "")
                     self._set_status("done", report=report)
                     self._emit("complete", report=report)
+                    self._seal_tool_batch(tool_calls, i, "Completed.")
                     return RunResult(
                         kind="done", report=report, follow_ups=list(self.follow_ups)
                     )
@@ -260,6 +261,7 @@ class Agent:
                         needs=needs,
                         partial_progress=partial,
                     )
+                    self._seal_tool_batch(tool_calls, i, "Blocker reported to parent.")
                     return RunResult(
                         kind="blocked",
                         reason=reason,
@@ -279,6 +281,7 @@ class Agent:
                         options=options,
                         context=qctx,
                     )
+                    self._seal_tool_batch(tool_calls, i, "Awaiting user response.")
                     return RunResult(
                         kind="question",
                         question=question,
@@ -325,6 +328,32 @@ class Agent:
             kind="exhausted",
             error=f"{self.name} exhausted turn limit of {CONFIG.max_turns_per_agent}",
         )
+
+    def _seal_tool_batch(
+        self,
+        tool_calls: list[dict[str, Any]],
+        finishing_index: int,
+        finishing_content: str,
+    ) -> None:
+        """Append tool-result stubs for every unanswered tool_call_id when
+        the run loop is about to return early on `complete` / `report_blocker`
+        / `ask_user`. The matching assistant turn has already declared all
+        these IDs in its `tool_calls`; if we don't seal them, the next time
+        these messages hit the API (e.g., a follow-up turn) the API will
+        400 because a tool_call has no matching tool reply.
+        """
+        finishing_name = tool_calls[finishing_index]["name"]
+        for i in range(finishing_index, len(tool_calls)):
+            tc = tool_calls[i]
+            if i == finishing_index:
+                content = finishing_content
+            else:
+                content = (
+                    f"[skipped: agent returned after `{finishing_name}` in the same turn]"
+                )
+            self.messages.append(
+                {"role": "tool", "tool_call_id": tc["id"], "content": content}
+            )
 
     def _build_assistant_message(
         self, content: str, tool_calls: list[dict[str, Any]]
