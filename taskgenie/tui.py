@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from typing import Any
 
@@ -26,6 +27,12 @@ STATUS_STYLE = {
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPAWN_FLASH_SECONDS = 1.2
+ACTIVITY_LOG_CAP = 200
+ACTIVITY_DISPLAY_CAP = 40
+THINKING_THRESHOLD_SECONDS = 2.0
+
+SCREEN_MAIN = 1
+SCREEN_LOG = 2
 
 
 def _trunc(text: str, n: int) -> str:
@@ -70,6 +77,19 @@ class AgentView:
         self.children_ids: list[str] = []
         self.spawn_time: float = time.time()
         self.last_activity: float = time.time()
+        # Per-agent activity log: each entry {ts, kind, text, tool_args}.
+        # Accumulates over the agent's whole life so a worker doing 5 LLM
+        # turns appears as 5 entries rather than one ephemeral overwritten
+        # narration line. Capped to ACTIVITY_LOG_CAP.
+        self.activity_log: list[dict[str, Any]] = []
+
+    def push_activity(self, kind: str, text: str, **extra: Any) -> None:
+        entry: dict[str, Any] = {"ts": time.time(), "kind": kind, "text": text}
+        if extra:
+            entry.update(extra)
+        self.activity_log.append(entry)
+        if len(self.activity_log) > ACTIVITY_LOG_CAP:
+            self.activity_log = self.activity_log[-ACTIVITY_LOG_CAP:]
 
 
 def _fmt_count(n: int) -> str:
@@ -105,6 +125,12 @@ class TUI:
         self.completion_tokens: int = 0
         self.tool_calls_total: int = 0
         self.start_time: float = time.time()
+        self._screen: int = SCREEN_MAIN
+        # Keyboard input state. Set in _setup_input(), cleaned by _restore_input().
+        self._termios_old: Any = None
+        self._stdin_fd: int | None = None
+        self._reader_attached: bool = False
+        self._input_loop: asyncio.AbstractEventLoop | None = None
 
     # ---- event handling ----------------------------------------------------
 
@@ -163,7 +189,6 @@ class TUI:
 
         if kind == "spawn":
             if aid in self.agents:
-                # Already loaded via rehydrate — skip duplicate spawn from replay.
                 return
             view = AgentView(
                 agent_id=aid,
@@ -190,9 +215,13 @@ class TUI:
             view.status = data.get("status", view.status)
             if "task" in data:
                 view.task = data["task"]
+                view.push_activity("task", _trunc(data["task"], 200))
             self._touch(view)
         elif kind == "narrate":
-            view.narration = data.get("text", "")
+            text = data.get("text", "")
+            view.narration = text
+            if text:
+                view.push_activity("narrate", text)
             self._touch(view)
         elif kind == "tool_call":
             tool = data.get("tool", "")
@@ -200,6 +229,7 @@ class TUI:
             view.last_tool = tool
             view.last_tool_args = args
             self.tool_calls_total += 1
+            view.push_activity("tool", tool, tool_args=dict(args))
             self._log(f"[cyan]{view.name}[/] -> {tool}({_short_args(args)})")
             self._touch(view)
         elif kind == "llm_call":
@@ -207,41 +237,62 @@ class TUI:
             self.prompt_tokens += int(data.get("prompt_tokens", 0) or 0)
             self.completion_tokens += int(data.get("completion_tokens", 0) or 0)
         elif kind == "hire":
+            view.push_activity(
+                "hire",
+                f"hired {data.get('child_name')} as {data.get('role_type')}",
+            )
             self._log(
                 f"[green]{view.name}[/] hired [bold]{data.get('child_name')}[/] "
                 f"as {data.get('role_type')}"
             )
         elif kind == "assign":
+            view.push_activity(
+                "assign",
+                f"-> {data.get('agent_name')}: {_trunc(data.get('task', ''), 120)}",
+            )
             self._log(
                 f"[blue]{view.name}[/] assigned task to "
                 f"[bold]{data.get('agent_name')}[/]: {_trunc(data.get('task', ''), 80)}"
             )
         elif kind == "review":
             verdict = "ACCEPTED" if data.get("accepted") else "REJECTED"
+            view.push_activity(
+                "review",
+                f"{verdict}: {_trunc(data.get('feedback', ''), 140)}",
+            )
             style = "green" if data.get("accepted") else "red"
             self._log(
                 f"[{style}]{view.name} review {verdict}[/]: "
                 f"{_trunc(data.get('feedback', ''), 100)}"
             )
         elif kind == "fire":
+            view.push_activity(
+                "fire",
+                f"fired {data.get('agent_name')}: {_trunc(data.get('reason', ''), 120)}",
+            )
             self._log(
                 f"[red]{view.name} fired {data.get('agent_name')}[/] -- "
                 f"{_trunc(data.get('reason', ''), 80)}"
             )
         elif kind == "rehire":
+            view.push_activity("rehire", "rehired with new charter")
             self._log(f"[yellow]{view.name} rehired[/] with new charter")
         elif kind == "complete":
             view.report = data.get("report", "")
             view.status = "done"
+            view.push_activity("complete", _trunc(data.get("report", ""), 200))
             self._log(f"[green]{view.name} complete[/]")
             self._touch(view)
         elif kind == "follow_up_suggested":
-            view.follow_ups.append(
-                {
-                    "what": data.get("what", ""),
-                    "rationale": data.get("rationale", ""),
-                    "who": data.get("who", ""),
-                }
+            entry = {
+                "what": data.get("what", ""),
+                "rationale": data.get("rationale", ""),
+                "who": data.get("who", ""),
+            }
+            view.follow_ups.append(entry)
+            view.push_activity(
+                "follow_up",
+                f"↑ {_trunc(entry['what'], 140)}",
             )
             self._log(
                 f"[magenta]{view.name} ↑ follow-up[/]: "
@@ -253,6 +304,10 @@ class TUI:
             view.blocker_needs = data.get("needs", "")
             view.partial_progress = data.get("partial_progress", "")
             view.status = "blocked"
+            view.push_activity(
+                "blocked",
+                f"reason: {_trunc(view.blocker_reason, 100)} (needs: {_trunc(view.blocker_needs, 60)})",
+            )
             self._log(
                 f"[orange1]{view.name} BLOCKED[/] -- "
                 f"{_trunc(view.blocker_reason, 70)} "
@@ -264,18 +319,108 @@ class TUI:
             view.question_options = list(data.get("options", []) or [])
             view.question_context = data.get("context", "")
             view.status = "asking"
+            view.push_activity("question", _trunc(view.question, 200))
             self._log(
                 f"[cyan]{view.name} ASKING USER[/]: "
                 f"{_trunc(view.question, 90)}"
             )
             self._touch(view)
         elif kind == "error":
+            view.push_activity("error", _trunc(data.get("message", ""), 200))
             self._log(f"[red]error in {view.name}[/]: {_trunc(data.get('message', ''), 100)}")
 
     def _log(self, line: str) -> None:
         self.recent_events.append(line)
-        if len(self.recent_events) > 30:
-            self.recent_events = self.recent_events[-30:]
+        # The log screen has a whole panel now -- keep more history than
+        # the old quarter-panel ever could hold.
+        if len(self.recent_events) > 500:
+            self.recent_events = self.recent_events[-500:]
+
+    # ---- input handling ----------------------------------------------------
+
+    def _setup_input(self) -> None:
+        """Wire stdin to feed _handle_key without blocking.
+
+        Unix: termios cbreak + loop.add_reader. cbreak leaves ISIG on,
+        so Ctrl+C still raises KeyboardInterrupt as expected.
+        Windows: nothing here; the render tick polls msvcrt.kbhit().
+        Not a tty (tests, piped, CI): no-op; keybindings become inert.
+        """
+        if not sys.stdin.isatty():
+            return
+        if sys.platform == "win32":
+            return
+        try:
+            import termios
+            import tty
+
+            self._stdin_fd = sys.stdin.fileno()
+            self._termios_old = termios.tcgetattr(self._stdin_fd)
+            tty.setcbreak(self._stdin_fd)
+            self._input_loop = asyncio.get_running_loop()
+            self._input_loop.add_reader(self._stdin_fd, self._on_stdin_unix)
+            self._reader_attached = True
+        except Exception:
+            # If anything goes wrong (no real tty, locked-down env),
+            # don't crash the TUI -- just lose keybindings for this run.
+            self._termios_old = None
+            self._stdin_fd = None
+            self._reader_attached = False
+
+    def _restore_input(self) -> None:
+        if (
+            self._reader_attached
+            and self._stdin_fd is not None
+            and self._input_loop is not None
+        ):
+            try:
+                self._input_loop.remove_reader(self._stdin_fd)
+            except Exception:
+                pass
+            self._reader_attached = False
+        if self._termios_old is not None and self._stdin_fd is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._termios_old)
+            except Exception:
+                pass
+            self._termios_old = None
+
+    def _on_stdin_unix(self) -> None:
+        try:
+            ch = sys.stdin.read(1)
+        except (OSError, ValueError):
+            return
+        if ch:
+            self._handle_key(ch)
+
+    def _poll_keys_windows(self) -> None:
+        if sys.platform != "win32" or not sys.stdin.isatty():
+            return
+        try:
+            import msvcrt
+        except ImportError:
+            return
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            # Extended scancodes (function/arrow keys) come as two bytes;
+            # drop the second so it doesn't get reinterpreted as ASCII.
+            if ch in (b"\x00", b"\xe0"):
+                msvcrt.getch()
+                continue
+            try:
+                self._handle_key(ch.decode("utf-8", errors="ignore"))
+            except UnicodeDecodeError:
+                pass
+
+    def _handle_key(self, ch: str) -> None:
+        if ch == "\t":
+            self._screen = SCREEN_LOG if self._screen == SCREEN_MAIN else SCREEN_MAIN
+        elif ch == "1":
+            self._screen = SCREEN_MAIN
+        elif ch == "2":
+            self._screen = SCREEN_LOG
 
     # ---- rendering ---------------------------------------------------------
 
@@ -287,10 +432,8 @@ class TUI:
         else:
             label.append("● ", style=style)
 
-        # Spawn flash: pulse the name in bold cyan for a moment after spawn.
         elapsed_since_spawn = now - view.spawn_time
         if elapsed_since_spawn < SPAWN_FLASH_SECONDS:
-            # decay from bold bright cyan to normal
             label.append(view.name, style="bold bright_cyan")
             label.append(" [NEW]", style="bright_cyan dim")
         else:
@@ -314,21 +457,7 @@ class TUI:
         return tree
 
     def _add_node(self, parent_node: Tree, agent_id: str, now: float) -> None:
-        """Render the management skeleton + a spotlight worker per manager.
-
-        Tree policy:
-          - Show CEO + every manager / sub-manager as expanded nodes.
-          - Summarise each agent's worker children inline on the parent's
-            label as "[Nw Md] workers" so all managers stay visible regardless
-            of fan-out.
-          - Under each manager, also expand ONE spotlight worker -- the most
-            recently active working one -- with their narration in quotes,
-            so the user can see WHICH worker is currently generating without
-            having to read the active panel. If no worker is currently
-            working under this manager, no spotlight line is added.
-          - Done subtrees with no active descendants collapse to one line
-            with "(N done)" inline.
-        """
+        """Render the management skeleton + a spotlight worker per manager."""
         v = self.agents[agent_id]
         label = self._agent_label(v, now)
 
@@ -349,7 +478,6 @@ class TUI:
         blocked_workers = [c for c in workers if c.status in ("blocked", "asking")]
         working_workers = [c for c in workers if c.status == "working"]
 
-        # Collapse a fully-done subtree to one line.
         if v.status == "done" and not active_managers and not active_workers:
             collapsed = Text()
             collapsed.append_text(label)
@@ -359,7 +487,6 @@ class TUI:
             parent_node.add(collapsed)
             return
 
-        # Inline worker summary on this node's label.
         if workers:
             label.append("  ")
             label.append("[", style="dim")
@@ -377,18 +504,10 @@ class TUI:
 
         node = parent_node.add(label)
 
-        # Pick the spotlight worker -- the working worker with the most
-        # recent activity, the one most likely to be "currently generating"
-        # under this manager. They get their full narration on the row; the
-        # others get a quieter representation but still appear in the tree.
         spotlight_id: str | None = None
         if working_workers:
             spotlight_id = max(working_workers, key=lambda w: w.last_activity).id
 
-        # Show ALL workers as tree rows. Active first (with spotlight at the
-        # top of that group), then done. Cap to keep pathological fan-outs
-        # bounded -- but unlike the previous "spotlight-only" pass, every
-        # worker that fits is visible, including idle and done ones.
         ordered_workers: list[AgentView] = []
         if spotlight_id is not None:
             ordered_workers.append(self.agents[spotlight_id])
@@ -425,9 +544,6 @@ class TUI:
                 )
             )
 
-        # Recurse into manager children. Cap to keep deep ragged trees
-        # bounded, but in practice the cap rarely triggers because managers
-        # don't fan out as wide as workers do.
         cap = 10
         ordered_managers = active_managers + done_managers
         for child in ordered_managers[:cap]:
@@ -438,74 +554,38 @@ class TUI:
                 Text(f"…+{hidden} more managers", style="dim italic")
             )
 
-    def _agent_action_summary(self, v: "AgentView") -> Text:
-        """One-line current-action summary for the active panel."""
-        text = Text()
-        if v.status == "blocked":
-            text.append("⚠ ", style="orange1 bold")
-            text.append(_trunc(v.blocker_reason or "blocked", 30), style="orange1")
-        elif v.status == "asking":
-            text.append("? ", style="cyan bold")
-            text.append(_trunc(v.question or "asking user", 30), style="cyan")
-        elif v.last_tool:
-            text.append(v.last_tool, style="cyan bold")
-            if v.last_tool_args:
-                short = _short_args(v.last_tool_args)
-                text.append(f"({_trunc(short, 28)})", style="dim")
-        elif v.narration:
-            text.append(f"“{_trunc(v.narration, 34)}”", style="italic dim")
+    def _format_activity_entry(self, entry: dict[str, Any]) -> Text:
+        """One row of an agent's activity log. Kind drives color + prefix."""
+        kind = entry.get("kind", "")
+        text = entry.get("text", "")
+        line = Text()
+        prefix_style = {
+            "narrate": ("dim", "say"),
+            "tool": ("cyan", "tool"),
+            "task": ("blue", "task"),
+            "hire": ("green", "hire"),
+            "assign": ("blue", "assign"),
+            "review": ("magenta", "review"),
+            "fire": ("red", "fire"),
+            "rehire": ("yellow", "rehire"),
+            "complete": ("green", "done"),
+            "follow_up": ("magenta", "↑"),
+            "blocked": ("orange1", "blocked"),
+            "question": ("cyan", "ask"),
+            "error": ("red", "error"),
+        }
+        style, label = prefix_style.get(kind, ("white", kind or "·"))
+        line.append(f"{label:>7} ", style=f"{style} dim")
+        if kind == "tool":
+            line.append(text, style=f"{style} bold")
+            tool_args = entry.get("tool_args") or {}
+            if tool_args:
+                line.append(f"({_short_args(tool_args)})", style="dim")
+        elif kind == "narrate":
+            line.append(f"“{text}”", style="italic")
         else:
-            text.append("(starting up)", style="dim")
-        return text
-
-    def _build_active_panel(self) -> Panel:
-        """All currently-active (not idle/done/fired) agents in one place.
-
-        Sorts deepest-first so workers (who actually do visible work) lead
-        instead of being drowned out by orchestrating managers.
-        """
-        now = time.time()
-        active = [
-            v for v in self.agents.values()
-            if v.status in ("working", "blocked", "asking", "exhausted")
-        ]
-        # Count summary for the title.
-        counts: dict[str, int] = {}
-        for v in active:
-            counts[v.status] = counts.get(v.status, 0) + 1
-        title_bits = [f"{counts[k]}{k[0]}" for k in ("working", "blocked", "asking", "exhausted") if counts.get(k)]
-        title = "active" + (f" ({' '.join(title_bits)})" if title_bits else "")
-
-        if not active:
-            return Panel(
-                Text("(no active agents)", style="dim italic"),
-                title=title,
-                border_style="dim",
-            )
-
-        active.sort(key=lambda v: (-v.depth, -v.last_activity))
-        cap = 14
-        lines: list[Any] = []
-        for v in active[:cap]:
-            style = STATUS_STYLE.get(v.status, "white")
-            line = Text()
-            if v.status == "working":
-                line.append(_spinner_char(now) + " ", style=style)
-            else:
-                line.append("● ", style=style)
-            role_tag = {"ceo": "C", "manager": "M", "worker": "W"}.get(v.role_type, "?")
-            line.append(f"[{role_tag}] ", style="dim")
-            indent = "  " * min(v.depth, 4)
-            line.append(f"{indent}{v.name}", style="bold")
-            line.append("  ", style="dim")
-            line.append_text(self._agent_action_summary(v))
-            lines.append(line)
-        if len(active) > cap:
-            lines.append(
-                Text(f"  …and {len(active) - cap} more active", style="dim italic")
-            )
-
-        return Panel(Group(*lines), title=title, border_style="yellow")
+            line.append(text, style=style)
+        return line
 
     def _build_focus(self) -> Panel:
         if not self.focus_id or self.focus_id not in self.agents:
@@ -516,33 +596,32 @@ class TUI:
             )
         v = self.agents[self.focus_id]
         style = STATUS_STYLE.get(v.status, "white")
+        now = time.time()
 
         header = Text()
         header.append(v.name, style="bold")
         header.append(f"  {v.role_type} / ", style="dim")
         header.append(v.status, style=style)
+        # Liveness: if the agent is "working" but hasn't emitted anything
+        # for a while, the LLM is mid-call. Show a thinking timer so a
+        # silent worker still looks alive.
+        if v.status == "working":
+            silent_for = now - v.last_activity
+            if silent_for >= THINKING_THRESHOLD_SECONDS:
+                header.append(
+                    f"  · thinking {int(silent_for)}s {_spinner_char(now)}",
+                    style="yellow italic",
+                )
 
-        body_parts: list[Any] = [header, Text("")]
+        body_parts: list[Any] = [header]
 
         if v.task:
+            body_parts.append(Text(""))
             body_parts.append(Text("task:", style="dim"))
             body_parts.append(Text(_trunc(v.task, 600), style="italic"))
-            body_parts.append(Text(""))
-
-        if v.narration:
-            body_parts.append(Text("saying:", style="dim"))
-            body_parts.append(Text(v.narration, style="italic"))
-            body_parts.append(Text(""))
-
-        if v.last_tool:
-            tool_line = Text()
-            tool_line.append("tool: ", style="dim")
-            tool_line.append(v.last_tool, style="cyan bold")
-            tool_line.append(f"({_short_args(v.last_tool_args)})", style="dim")
-            body_parts.append(tool_line)
-            body_parts.append(Text(""))
 
         if v.status == "blocked":
+            body_parts.append(Text(""))
             body_parts.append(Text("BLOCKER", style="bold orange1"))
             body_parts.append(Text(f"reason: {v.blocker_reason}", style="orange1"))
             body_parts.append(Text(f"needs:  {v.blocker_needs}", style="orange1"))
@@ -550,6 +629,7 @@ class TUI:
                 body_parts.append(Text(f"partial: {v.partial_progress}", style="orange1 dim"))
 
         if v.status == "asking" or v.question:
+            body_parts.append(Text(""))
             body_parts.append(Text("QUESTION FOR USER", style="bold cyan"))
             body_parts.append(Text(v.question, style="cyan"))
             if v.question_context:
@@ -561,9 +641,14 @@ class TUI:
                 for i, opt in enumerate(v.question_options, 1):
                     body_parts.append(Text(f"  {i}. {opt}", style="cyan"))
 
-        if v.status == "done" and v.report:
-            body_parts.append(Text("report:", style="green dim"))
-            body_parts.append(Text(_trunc(v.report, 800), style="green"))
+        # Activity log: the actual "watch it grow" surface. Latest at the
+        # top so the most recent thing this agent did stays visible even
+        # when the panel runs out of vertical space.
+        if v.activity_log:
+            body_parts.append(Text(""))
+            body_parts.append(Text(f"activity ({len(v.activity_log)}):", style="dim"))
+            for entry in reversed(v.activity_log[-ACTIVITY_DISPLAY_CAP:]):
+                body_parts.append(self._format_activity_entry(entry))
 
         if v.follow_ups:
             body_parts.append(Text(""))
@@ -589,7 +674,6 @@ class TUI:
         )
 
     def _build_header(self) -> Panel:
-        """One-line live status: agent counts, LLM calls, tokens, elapsed."""
         counts: dict[str, int] = {}
         for v in self.agents.values():
             counts[v.status] = counts.get(v.status, 0) + 1
@@ -637,58 +721,59 @@ class TUI:
         line.append(_fmt_duration(elapsed), style="bold")
         return Panel(line, border_style="cyan", title="TaskGenie")
 
-    def _build_log(self) -> Panel:
+    def _build_log_panel(self, *, title_suffix: str = "") -> Panel:
         if not self.recent_events:
             body: Text = Text("(waiting for events)", style="dim italic")
         else:
-            body = Text.from_markup("\n".join(self.recent_events[-20:]))
-        return Panel(body, title="event log", border_style="dim")
+            body = Text.from_markup("\n".join(self.recent_events))
+        title = "event log"
+        if title_suffix:
+            title = f"{title} {title_suffix}"
+        return Panel(body, title=title, border_style="dim")
+
+    def _build_footer(self) -> Text:
+        line = Text()
+        main_style = "reverse bold" if self._screen == SCREEN_MAIN else "dim"
+        log_style = "reverse bold" if self._screen == SCREEN_LOG else "dim"
+        line.append(" [1] focus + tree ", style=main_style)
+        line.append("   ", style="dim")
+        line.append(" [2] event log ", style=log_style)
+        line.append("    [Tab] swap  ·  Ctrl+C exit", style="dim")
+        return line
 
     def _render(self) -> Layout:
-        """Header strip + 2x2 grid:
-            header (live counters)
-            focus    | hierarchy
-            active   | event log
-        """
+        """Header strip + body + footer. Body switches with the active screen."""
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="top", ratio=1),
-            Layout(name="bottom", ratio=1),
-        )
-        layout["top"].split_row(
-            Layout(name="focus", ratio=1),
-            Layout(name="tree", ratio=1),
-        )
-        layout["bottom"].split_row(
-            Layout(name="active", ratio=1),
-            Layout(name="log", ratio=1),
+            Layout(name="body", ratio=1),
+            Layout(name="footer", size=1),
         )
         layout["header"].update(self._build_header())
-        layout["focus"].update(self._build_focus())
-        layout["tree"].update(
-            Panel(self._build_tree(), border_style="cyan", title="hierarchy")
-        )
-        layout["active"].update(self._build_active_panel())
-        layout["log"].update(self._build_log())
+        layout["footer"].update(self._build_footer())
+
+        if self._screen == SCREEN_LOG:
+            layout["body"].update(
+                self._build_log_panel(title_suffix=f"({len(self.recent_events)})")
+            )
+        else:
+            layout["body"].split_row(
+                Layout(name="focus", ratio=1),
+                Layout(name="tree", ratio=1),
+            )
+            layout["body"]["focus"].update(self._build_focus())
+            layout["body"]["tree"].update(
+                Panel(self._build_tree(), border_style="cyan", title="hierarchy")
+            )
         return layout
 
     # ---- main loop ---------------------------------------------------------
 
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
-        # Snapshot any agents that exist BEFORE we subscribe. The CEO is
-        # always one of them (created in __main__ before tui.run() is
-        # scheduled), and on --resume every rehydrated agent is too.
-        # Without this, their spawn events are lost (BUS has no
-        # buffering for late subscribers) and they never appear in the
-        # tree -- which makes subsequent manager spawns orphans that get
-        # set as root_id one after another, hiding the CEO entirely.
         self._snapshot_initial_agents()
         q = BUS.subscribe()
-        # Alt-screen mode prevents flicker when the layout outgrows the
-        # terminal height; fall back to inline mode when stdout isn't a tty
-        # (tests, CI capture, piped output).
         use_screen = bool(getattr(self.console, "is_terminal", False))
+        self._setup_input()
         try:
             with Live(
                 self._render(),
@@ -705,6 +790,10 @@ class TUI:
                         self._handle_event(event)
                     except asyncio.TimeoutError:
                         pass
+                    # Windows: stdin can't be add_reader'd, so we poll
+                    # once per render tick. Unix already fed any
+                    # keypresses via the reader callback.
+                    self._poll_keys_windows()
                     live.update(self._render())
                     if stop_when.done():
                         while not q.empty():
@@ -712,4 +801,5 @@ class TUI:
                         live.update(self._render())
                         break
         finally:
+            self._restore_input()
             BUS.unsubscribe(q)
