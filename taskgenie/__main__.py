@@ -471,7 +471,9 @@ async def _drive_session(
                 return 2
             session.mark_unblock(user_response)
             tool_diff = session.diff_tools_against(
-                REGISTRY.signature("management"), REGISTRY.signature("work")
+                REGISTRY.signature("management"),
+                REGISTRY.signature("work"),
+                REGISTRY.signature("ceo"),
             )
             message = _build_unblock_message(user_response, tool_diff)
             continue
@@ -544,7 +546,9 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
         _print_banner(console, session, mcp)
 
         tool_diff = session.diff_tools_against(
-            REGISTRY.signature("management"), REGISTRY.signature("work")
+            REGISTRY.signature("management"),
+            REGISTRY.signature("work"),
+            REGISTRY.signature("ceo"),
         )
         if tool_diff:
             console.print(Panel(tool_diff, title="Tool changes", border_style="cyan"))

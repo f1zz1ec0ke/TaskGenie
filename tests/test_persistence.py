@@ -159,6 +159,7 @@ async def test_tool_diff_on_resume() -> None:
         diff = reloaded.diff_tools_against(
             REGISTRY.signature("management"),
             REGISTRY.signature("work"),
+            REGISTRY.signature("ceo"),
         )
         assert diff is not None
         assert "_fake_new_tool" in diff and "new" in diff
