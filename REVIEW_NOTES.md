@@ -441,10 +441,20 @@ left out because each is non-trivial OR borderline cosmetic:
 
 ### Observability gaps
 
-- **`RunResult.to_tool_payload` carries no compaction telemetry**
+- ~~**`RunResult.to_tool_payload` carries no compaction telemetry**
   (orchestrator L3 from round 3). The parent agent learns nothing
   about how often the child compacted; the data is on the JSONL log
-  but not in the structured reply.
+  but not in the structured reply.~~ **FIXED in branch
+  `claude/compaction-telemetry`.** Agent gains `compaction_stats`
+  (count, skipped, failed, messages_compacted, tokens_saved,
+  duration_ms), updated in `_maybe_compact`'s finally, persisted
+  across rehydrate. `RunResult` carries the snapshot; `to_tool_payload`
+  projects it into a `compaction` field (zero entries dropped to keep
+  the reply tight) so parents can read child churn directly. Manager
+  and CEO prompts now explain how to interpret a high count (split
+  the task across siblings next time). TUI focus panel shows a
+  one-line cumulative summary. `tests/test_compaction_telemetry.py`
+  covers the full surface.
 
 ### Test coverage gaps still open
 

@@ -110,6 +110,20 @@ class Agent:
         # re-triggering every turn when one compact didn't bring the
         # history below threshold.
         self._compaction_floor: int = 0
+        # Running tally of compaction activity for THIS agent. Surfaced
+        # in RunResult.compaction_stats so the parent (via
+        # await_results) can see whether their child had to compact and
+        # how aggressively -- useful signal for "this task was too big
+        # for one agent, split it next time". Updated in
+        # _maybe_compact's finally block.
+        self.compaction_stats: dict[str, int | float] = {
+            "count": 0,             # successful compactions
+            "skipped": 0,           # CompactionSkipped + "no shrink"
+            "failed": 0,            # CompactionTransientFailure + unexpected
+            "messages_compacted": 0,   # cumulative (before - after) on success
+            "tokens_saved": 0,         # cumulative token reduction on success
+            "duration_ms": 0.0,        # cumulative archivist LLM time
+        }
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
         self.workspace_dir = Agent.WORKSPACE_ROOT
         Agent.REGISTRY[self.id] = self
@@ -145,6 +159,7 @@ class Agent:
             "follow_ups": self.follow_ups,
             "read_workspace_paths": sorted(self.read_workspace_paths),
             "compaction_floor": self._compaction_floor,
+            "compaction_stats": dict(self.compaction_stats),
         }
 
     @classmethod
@@ -171,6 +186,18 @@ class Agent:
         # sessions don't immediately re-compact on the first turn after
         # restart.
         agent._compaction_floor = d.get("compaction_floor", len(agent.messages))
+        # Restore compaction telemetry from the snapshot; default to a
+        # zeroed-out shape so resumed sessions still track activity from
+        # the new run (cumulative across resumes, like read_workspace_paths).
+        saved_stats = d.get("compaction_stats") or {}
+        agent.compaction_stats = {
+            "count": int(saved_stats.get("count", 0)),
+            "skipped": int(saved_stats.get("skipped", 0)),
+            "failed": int(saved_stats.get("failed", 0)),
+            "messages_compacted": int(saved_stats.get("messages_compacted", 0)),
+            "tokens_saved": int(saved_stats.get("tokens_saved", 0)),
+            "duration_ms": float(saved_stats.get("duration_ms", 0.0)),
+        }
         agent.scratch_dir = d["scratch_dir"]
         agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
@@ -258,6 +285,18 @@ class Agent:
         self.status = status
         self._emit("state", status=status, **extra)
 
+    def _result(self, **kwargs: Any) -> RunResult:
+        """Build a RunResult with THIS agent's compaction telemetry attached.
+
+        Single source of truth so every return path in `run()` exposes
+        the per-agent compaction stats. The parent (via
+        `await_results` -> `RunResult.to_tool_payload`) sees the same
+        snapshot regardless of which exit branch fired.
+        """
+        return RunResult(
+            compaction_stats=dict(self.compaction_stats), **kwargs
+        )
+
     async def _maybe_compact(self, force: bool = False) -> bool:
         """If the message history is approaching the context window,
         hand it to the Archivist and swap in the compacted version.
@@ -309,6 +348,13 @@ class Agent:
             "before_messages": before,
             "before_tokens": before_tokens,
         }
+        # Tracks which compaction_stats bucket to bump in the finally
+        # block. "failed" is the conservative default so an
+        # unanticipated exception bubbling out of compact_messages still
+        # registers (rather than silently zeroing the stats).
+        outcome: str = "failed"
+        new_messages_len = before
+        after_tokens: int | None = None
         try:
             try:
                 new_messages = await compact_messages(self.name, self.messages)
@@ -322,6 +368,7 @@ class Agent:
                     reason=f"skipped: {e.reason}",
                     after_messages=before,
                 )
+                outcome = "skipped"
                 return False
             except CompactionTransientFailure as e:
                 # Transient failure -- don't advance floor; let the
@@ -331,6 +378,7 @@ class Agent:
                     reason=f"transient: {e.reason}",
                     after_messages=before,
                 )
+                outcome = "failed"
                 return False
             # Defensive: archivist should always shrink on success path,
             # but a misbehaving stub might not. Treat as skipped.
@@ -341,18 +389,39 @@ class Agent:
                     reason="archivist returned no shrink",
                     after_messages=len(new_messages),
                 )
+                outcome = "skipped"
                 return False
             self.messages = new_messages
             self._compaction_floor = len(self.messages)
+            new_messages_len = len(new_messages)
             after_tokens = count_tokens(self.messages)
             end_payload.update(
                 success=True,
-                after_messages=len(new_messages),
+                after_messages=new_messages_len,
                 after_tokens=after_tokens,
             )
+            outcome = "success"
             return True
         finally:
-            end_payload["duration_ms"] = (time.monotonic() - start) * 1000
+            duration_ms = (time.monotonic() - start) * 1000
+            end_payload["duration_ms"] = duration_ms
+            # Tally for the parent-visible telemetry. duration_ms is
+            # cumulative across every attempt (success/skipped/failed)
+            # because the wall-time cost was incurred either way.
+            self.compaction_stats["duration_ms"] += duration_ms
+            if outcome == "success":
+                self.compaction_stats["count"] += 1
+                self.compaction_stats["messages_compacted"] += (
+                    before - new_messages_len
+                )
+                if after_tokens is not None:
+                    self.compaction_stats["tokens_saved"] += max(
+                        0, before_tokens - after_tokens
+                    )
+            elif outcome == "skipped":
+                self.compaction_stats["skipped"] += 1
+            else:
+                self.compaction_stats["failed"] += 1
             self._emit("compaction_end", **end_payload)
 
     async def run(self, task: str) -> RunResult:
@@ -391,7 +460,7 @@ class Agent:
                                 "error",
                                 message=f"LLM call failed after compaction: {e2}",
                             )
-                            return RunResult(
+                            return self._result(
                                 kind="error",
                                 error=f"{self.name} LLM failure: {e2}",
                             )
@@ -403,14 +472,14 @@ class Agent:
                                 f"LLM call failed (compaction couldn't help): {e}"
                             ),
                         )
-                        return RunResult(
+                        return self._result(
                             kind="error",
                             error=f"{self.name} LLM failure: {e}",
                         )
                 else:
                     self._set_status("error", error=str(e))
                     self._emit("error", message=f"LLM call failed: {e}")
-                    return RunResult(
+                    return self._result(
                         kind="error", error=f"{self.name} LLM failure: {e}"
                     )
 
@@ -434,7 +503,7 @@ class Agent:
                 if empty_turn_count >= 2:
                     self._set_status("done", report=content)
                     self._emit("complete", report=content)
-                    return RunResult(kind="done", report=content or "[no output]")
+                    return self._result(kind="done", report=content or "[no output]")
                 self.messages.append(
                     {
                         "role": "user",
@@ -467,7 +536,7 @@ class Agent:
                     self._set_status("done", report=report)
                     self._emit("complete", report=report)
                     self._seal_tool_batch(tool_calls, i, "Completed.")
-                    return RunResult(
+                    return self._result(
                         kind="done", report=report, follow_ups=list(self.follow_ups)
                     )
 
@@ -485,7 +554,7 @@ class Agent:
                         partial_progress=partial,
                     )
                     self._seal_tool_batch(tool_calls, i, "Blocker reported to parent.")
-                    return RunResult(
+                    return self._result(
                         kind="blocked",
                         reason=reason,
                         needs=needs,
@@ -505,7 +574,7 @@ class Agent:
                         context=qctx,
                     )
                     self._seal_tool_batch(tool_calls, i, "Awaiting user response.")
-                    return RunResult(
+                    return self._result(
                         kind="question",
                         question=question,
                         options=list(options),
@@ -612,13 +681,13 @@ class Agent:
                         )
                     self._emit("error", message=err)
                     self._set_status("error", error=err)
-                    return RunResult(
+                    return self._result(
                         kind="error",
                         error=f"{self.name} tool pipeline failure: {e}",
                     )
 
         self._set_status("exhausted")
-        return RunResult(
+        return self._result(
             kind="exhausted",
             error=f"{self.name} exhausted turn limit of {CONFIG.max_turns_per_agent}",
         )

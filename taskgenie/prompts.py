@@ -49,7 +49,12 @@ You will receive ONE task from the user. Follow this loop:
    manager. Departments are independent — a failure in one doesn't require \
    restarting the others.
 5. ACT on FOLLOW_UPS. If the team surfaced gaps that matter for the user's task, \
-   hire a new sibling department manager to handle them in parallel before completing.
+   hire a new sibling department manager to handle them in parallel before completing. \
+   Also watch each result's `compaction` field (present when a subordinate's history \
+   grew large enough to need archivist compaction). A subordinate with a high \
+   `compaction.count` (3+) ran out of context window mid-task; for any follow-up or \
+   re-assign, SPLIT that work across multiple parallel siblings instead of doubling \
+   down on the same manager. Acknowledge it in your retrospective.
 6. When satisfied, call `complete` with the appropriate final answer (see task-type \
    guidance below). Your final answer MUST end with a section titled \
    `## Process retrospective` containing a brief, honest reflection on the run \
@@ -230,6 +235,14 @@ Each entry in await_results carries `status` plus payload:
     subordinates noticed should also be done. Decide for each: handle locally (hire a \
     new sibling on your team), or pass up via `suggest_follow_up` so YOUR parent can \
     consider it.
+  - Any entry may also carry `compaction`: a small object summarising whether the \
+    subordinate had to compress its message history mid-task (fields: count, skipped, \
+    failed, messages_compacted, tokens_saved, duration_ms; zero-valued fields are \
+    omitted). If `count` is high (say 3+), the task was too big for one agent's \
+    context window -- next time, SPLIT this work across multiple parallel \
+    subordinates rather than re-assigning the same one. A high `failed` count means \
+    the Archivist couldn't help; consider hiring a smaller-scope replacement. A \
+    single compaction is normal for a long-running worker and not a concern.
 
 YOU MAY ALSO `suggest_follow_up` yourself when you notice work adjacent to your \
 charter that would help the broader task but is out of your scope. Call it any time \

@@ -108,6 +108,16 @@ class AgentView:
         # turns appears as 5 entries rather than one ephemeral overwritten
         # narration line. Capped to ACTIVITY_LOG_CAP.
         self.activity_log: list[dict[str, Any]] = []
+        # Running compaction telemetry mirroring agent.compaction_stats.
+        # Updated by compaction_end events so the focus panel can render a
+        # summary line ("compacted 3x, saved 12.4k tokens") rather than
+        # making the user count log entries.
+        self.compaction_count: int = 0
+        self.compaction_skipped: int = 0
+        self.compaction_failed: int = 0
+        self.compaction_tokens_saved: int = 0
+        self.compaction_messages_compacted: int = 0
+        self.compaction_duration_ms: float = 0.0
 
     def push_activity(self, kind: str, text: str, **extra: Any) -> None:
         entry: dict[str, Any] = {"ts": time.time(), "kind": kind, "text": text}
@@ -504,12 +514,17 @@ class TUI:
                 f"{before} messages"
             )
         elif kind == "compaction_end":
-            dur_s = float(data.get("duration_ms", 0) or 0) / 1000.0
+            duration_ms = float(data.get("duration_ms", 0) or 0)
+            view.compaction_duration_ms += duration_ms
+            dur_s = duration_ms / 1000.0
             if data.get("success"):
                 before = data.get("before_messages", 0)
                 after = data.get("after_messages", 0)
                 before_tok = data.get("before_tokens", 0)
                 after_tok = data.get("after_tokens", 0)
+                view.compaction_count += 1
+                view.compaction_messages_compacted += max(0, before - after)
+                view.compaction_tokens_saved += max(0, before_tok - after_tok)
                 view.push_activity(
                     "compaction",
                     f"archivist: compacted {before}→{after} messages "
@@ -524,6 +539,12 @@ class TUI:
                 # Agent sends `reason` (R76); fall back to `error` for
                 # older event-log entries.
                 reason = data.get("reason") or data.get("error") or "no detail"
+                # Distinguish structural skip vs transient failure from
+                # the reason prefix (compact_messages tags them).
+                if str(reason).startswith("transient:"):
+                    view.compaction_failed += 1
+                else:
+                    view.compaction_skipped += 1
                 view.push_activity(
                     "compaction",
                     f"archivist: compaction skipped ({dur_s:.1f}s): "
@@ -861,6 +882,38 @@ class TUI:
             body_parts.append(Text(f"activity ({len(v.activity_log)}):", style="dim"))
             for entry in reversed(v.activity_log[-ACTIVITY_DISPLAY_CAP:]):
                 body_parts.append(self._format_activity_entry(entry))
+
+        # Compaction summary -- shown when this agent had to compact at
+        # least once. Lets the operator see "this worker burned 3
+        # archivist calls" without scrolling activity log for compaction
+        # entries.
+        if (
+            v.compaction_count
+            or v.compaction_skipped
+            or v.compaction_failed
+        ):
+            body_parts.append(Text(""))
+            line = Text()
+            line.append("context compaction: ", style="dim")
+            line.append(f"{v.compaction_count}", style="blue bold")
+            line.append(" ok", style="blue dim")
+            if v.compaction_skipped:
+                line.append(f"  {v.compaction_skipped}", style="yellow bold")
+                line.append(" skipped", style="yellow dim")
+            if v.compaction_failed:
+                line.append(f"  {v.compaction_failed}", style="red bold")
+                line.append(" failed", style="red dim")
+            if v.compaction_tokens_saved:
+                line.append(
+                    f"  · saved {_fmt_count(v.compaction_tokens_saved)} tokens",
+                    style="dim",
+                )
+            if v.compaction_duration_ms:
+                line.append(
+                    f"  · {v.compaction_duration_ms / 1000.0:.1f}s archivist time",
+                    style="dim",
+                )
+            body_parts.append(line)
 
         if v.follow_ups:
             body_parts.append(Text(""))
