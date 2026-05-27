@@ -39,7 +39,10 @@ ARCHIVIST_SYSTEM_PROMPT = (
     "  - Key decisions made and WHY.\n"
     "  - Files created, modified, or read (mention paths).\n"
     "  - Blockers encountered and how they were resolved.\n"
-    "  - Results of any code execution that matter for future decisions.\n\n"
+    "  - Results of any code execution that matter for future decisions, "
+    "INCLUDING which exec tool ran it (exec_code = scratch / private, "
+    "exec_workspace = shared deliverables) -- the CWD changes what the "
+    "result means for next steps.\n\n"
     "DROP:\n"
     "  - Verbatim narrations.\n"
     "  - Tool-call argument JSON.\n"
@@ -47,6 +50,31 @@ ARCHIVIST_SYSTEM_PROMPT = (
     "  - Redundant exploration.\n\n"
     "Reply with ONLY the summary paragraph. No preamble. No JSON. No quotes."
 )
+
+
+class CompactionSkipped(Exception):
+    """Raised by `compact_messages` when the history cannot be safely
+    compacted (e.g. degenerate alternation that would slice past the
+    original task, or a non-user message at the task index). The caller
+    distinguishes this from transient LLM failures so the repeat-compact
+    floor is only advanced for GENUINE no-ops, not for retryable blips.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class CompactionTransientFailure(Exception):
+    """Raised by `compact_messages` when the Archivist's LLM call failed
+    in a way that COULD succeed on retry (network, rate limit, empty
+    content). Caller does NOT advance the floor for these so the next
+    threshold cross retries.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _safe_recent_keep(messages: list[dict[str, Any]], keep_recent: int) -> int:
@@ -99,20 +127,31 @@ async def compact_messages(
     messages: list[dict[str, Any]],
     keep_recent: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a compacted copy of `messages`. On failure, returns the
-    input unchanged so the caller can decide what to do.
+    """Return a compacted copy of `messages`.
 
-    NOTE: this function does NOT publish bus events. The caller (Agent)
-    is responsible for emitting `compaction_start` / `compaction_end`
-    around the await so the TUI can route the activity to the right
-    target agent's display.
+    Raises `CompactionSkipped` when the history can't be safely compacted
+    (degenerate alternation, non-user original task, not enough middle).
+    Raises `CompactionTransientFailure` when the Archivist's own LLM call
+    failed in a way that could succeed on retry. Caller distinguishes
+    these so the repeat-compact floor only advances for genuine skips.
+
+    Does NOT publish bus events; the caller (Agent) emits
+    `compaction_start` / `compaction_end` around the await so the TUI
+    can route activity to the right target agent's display.
     """
     if keep_recent is None:
         keep_recent = CONFIG.compact_keep_recent
     # Snap keep_recent forward if the slice would dangle a tool_call_id.
-    keep_recent = _safe_recent_keep(messages, keep_recent)
-    if len(messages) <= keep_recent + 2:
-        return messages  # nothing meaningful to compact
+    adjusted_keep = _safe_recent_keep(messages, keep_recent)
+    if len(messages) <= adjusted_keep + 2:
+        # Snap consumed everything (or nearly everything). This is the
+        # degenerate alternating-history case: the recent band swallowed
+        # the would-be middle. Not a transient failure -- the history
+        # structure itself prevents compaction.
+        raise CompactionSkipped(
+            f"recent band ({adjusted_keep} messages) too large vs total "
+            f"({len(messages)}) to leave a meaningful middle"
+        )
 
     system_msg = messages[0]
     # Find the first non-system message; that's the original task.
@@ -120,20 +159,37 @@ async def compact_messages(
     while first_real_idx < len(messages) and messages[first_real_idx].get("role") == "system":
         first_real_idx += 1
     if first_real_idx >= len(messages):
-        return messages
+        raise CompactionSkipped("no non-system messages in history")
     original_task = messages[first_real_idx]
+    # The compacted output puts the original task at position 1. If that
+    # message is an assistant turn WITH tool_calls, the matching tool
+    # replies (now in the summarised middle) become dangling refs and
+    # the next API call 400s. Bail in that specific case. Plain
+    # assistant messages without tool_calls are fine (tests pre-populate
+    # this shape; production always starts with role="user").
+    if (
+        original_task.get("role") == "assistant"
+        and (original_task.get("tool_calls") or [])
+    ):
+        raise CompactionSkipped(
+            f"original task at index {first_real_idx} is an assistant "
+            "turn with tool_calls; compacting would orphan tool_call_ids"
+        )
 
-    middle = messages[first_real_idx + 1 : -keep_recent]
-    recent = messages[-keep_recent:]
+    middle = messages[first_real_idx + 1 : -adjusted_keep]
+    recent = messages[-adjusted_keep:]
     if len(middle) < 2:
-        return messages  # not enough fat to be worth a round-trip
+        raise CompactionSkipped(
+            f"middle band only {len(middle)} message(s) -- not worth a round-trip"
+        )
 
     try:
-        # bypass_semaphore: archivist calls are triggered BY agents that
-        # are already holding (or about to acquire) the LLM concurrency
-        # semaphore. Sharing the budget would let two concurrent compacts
-        # exhaust max_concurrent_llm and starve the real agents that
-        # spawned them. Archivist is a system task, not a user-facing one.
+        # bypass_semaphore: archivist calls go through a dedicated
+        # semaphore inside LLM.chat (not the agent semaphore), so concurrent
+        # archivist fanout can't DOS the local model. Past comments in
+        # this module claimed the caller "already holds" the agent
+        # semaphore -- that was wrong; _maybe_compact runs BEFORE the
+        # agent's own LLM.chat.
         response = await LLM.chat(
             messages=[
                 {"role": "system", "content": ARCHIVIST_SYSTEM_PROMPT},
@@ -141,7 +197,7 @@ async def compact_messages(
                     "role": "user",
                     "content": (
                         f"Compress this conversation history (messages "
-                        f"{first_real_idx + 1}-{len(messages) - keep_recent - 1} "
+                        f"{first_real_idx + 1}-{len(messages) - adjusted_keep - 1} "
                         f"of {len(messages)} for agent {target_name!r}). "
                         f"Reply with one dense paragraph."
                         f"\n\n--- TRANSCRIPT ---\n"
@@ -152,13 +208,16 @@ async def compact_messages(
             tools=None,
             bypass_semaphore=True,
         )
-    except Exception:
-        # No bus emit here; caller's compaction_end event records the failure.
-        return messages
+    except Exception as e:
+        raise CompactionTransientFailure(
+            f"archivist LLM call raised: {type(e).__name__}: {e}"
+        ) from e
 
     summary = (response.get("content") or "").strip()
     if not summary:
-        return messages
+        raise CompactionTransientFailure(
+            "archivist LLM returned empty content"
+        )
 
     summary_msg = {
         "role": "user",

@@ -351,22 +351,11 @@ async def test_overwrite_after_read_warns(tmp_path: Path) -> None:
     # Set up an existing file the worker will later read + overwrite.
     (session.project_dir / "config.py").write_text("VERSION = 1\n", encoding="utf-8")
 
-    # Simulate the read_workspace call sitting in the worker's message history.
-    worker.messages.append(
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "tc-1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_workspace",
-                        "arguments": json.dumps({"path": "config.py"}),
-                    },
-                }
-            ],
-        }
-    )
+    # Simulate a prior successful read: populate the persistent set
+    # directly (round 3 stopped trusting the message-scan path because
+    # it false-positived on FAILED reads -- it now relies solely on
+    # the set, which is populated by _read_workspace on success).
+    worker.read_workspace_paths.add("config.py")
 
     # Overwrite after read -> warning in response
     res = await write(

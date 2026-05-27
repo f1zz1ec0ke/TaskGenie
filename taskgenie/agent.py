@@ -7,7 +7,11 @@ import time
 import uuid
 from typing import Any, Literal
 
-from taskgenie.archivist import compact_messages
+from taskgenie.archivist import (
+    CompactionSkipped,
+    CompactionTransientFailure,
+    compact_messages,
+)
 from taskgenie.config import CONFIG
 from taskgenie.context import count_tokens, dump_large_tool_result, should_compact
 from taskgenie.events import BUS, Event
@@ -48,8 +52,19 @@ def _is_context_length_error(exc: Exception) -> bool:
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         err = body.get("error", {})
-        if isinstance(err, dict) and err.get("code") == "context_length_exceeded":
-            return True
+        if isinstance(err, dict):
+            # OpenAI shape: error.code == "context_length_exceeded".
+            if err.get("code") == "context_length_exceeded":
+                return True
+            # Anthropic shape: error.type == "invalid_request_error" with a
+            # message about prompt length. Pair the type-check with a
+            # regex match on the message so we don't false-positive on
+            # other invalid_request_error variants (bad model, malformed
+            # tool args, etc.).
+            if err.get("type") == "invalid_request_error":
+                msg = err.get("message", "")
+                if isinstance(msg, str) and _CTX_LIMIT_RE.search(msg):
+                    return True
     return bool(_CTX_LIMIT_RE.search(str(exc)))
 
 
@@ -129,6 +144,7 @@ class Agent:
             "blocker_needs": self.blocker_needs,
             "follow_ups": self.follow_ups,
             "read_workspace_paths": sorted(self.read_workspace_paths),
+            "compaction_floor": self._compaction_floor,
         }
 
     @classmethod
@@ -149,7 +165,12 @@ class Agent:
         agent.blocker_needs = d.get("blocker_needs", "")
         agent.follow_ups = d.get("follow_ups", [])
         agent.read_workspace_paths = set(d.get("read_workspace_paths", []) or [])
-        agent._compaction_floor = 0
+        # Persisted across save/resume so the R9 repeat-compact guard
+        # isn't silently reset every resume. Pre-round-three snapshots
+        # don't have this field; fall back to len(messages) so resumed
+        # sessions don't immediately re-compact on the first turn after
+        # restart.
+        agent._compaction_floor = d.get("compaction_floor", len(agent.messages))
         agent.scratch_dir = d["scratch_dir"]
         agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
@@ -158,13 +179,24 @@ class Agent:
     @classmethod
     def bulk_load(cls, agents: dict[str, dict[str, Any]]) -> None:
         """Rehydrate a previously-saved set of agents into REGISTRY.
-        Resets REGISTRY first so a fresh process starts clean."""
+        Resets REGISTRY first so a fresh process starts clean.
+
+        Re-emits `spawn`/`state`/`blocked` events tagged `replay=True` so
+        the live TUI can paint the rehydrated tree while persistent
+        consumers (event_logger -> stats.compute) can ignore the
+        replays for counter purposes.
+        """
         cls.REGISTRY.clear()
         # Two passes: instantiate all, then patch parent/child links so order
         # doesn't matter.
         for d in agents.values():
             cls._rehydrate_one(d)
-        for d in agents.values():
+        # Sort by depth ASC so re-emitted spawn events arrive parent-first.
+        # If a child's spawn arrived before its parent's, the TUI would
+        # treat the child as root (or build an incomplete tree) until
+        # the parent's spawn corrected things.
+        ordered = sorted(agents.values(), key=lambda d: d.get("depth", 0))
+        for d in ordered:
             agent = cls.REGISTRY[d["id"]]
             parent_id = d.get("parent_id")
             if parent_id:
@@ -172,8 +204,6 @@ class Agent:
             agent.children = [
                 cls.REGISTRY[cid] for cid in d.get("child_ids", []) if cid in cls.REGISTRY
             ]
-            # Re-emit a spawn event so any subscriber (e.g. a TUI bootstrapping
-            # from the bus) can paint the rehydrated tree.
             BUS.publish(
                 Event(
                     "spawn",
@@ -185,6 +215,7 @@ class Agent:
                         "parent_name": agent.parent.name if agent.parent else None,
                         "depth": agent.depth,
                         "system_prompt": agent.system_prompt,
+                        "replay": True,
                     },
                 )
             )
@@ -193,7 +224,7 @@ class Agent:
                     "state",
                     agent.id,
                     agent.name,
-                    data={"status": agent.status},
+                    data={"status": agent.status, "replay": True},
                 )
             )
             if agent.status == "blocked":
@@ -206,6 +237,7 @@ class Agent:
                             "reason": agent.blocker_reason,
                             "needs": agent.blocker_needs,
                             "partial_progress": "",
+                            "replay": True,
                         },
                     )
                 )
@@ -236,9 +268,19 @@ class Agent:
         Returns True if compaction actually shrank the history.
 
         Emits `compaction_start` / `compaction_end` events on BUS so the
-        TUI can surface compaction activity on THIS agent's row rather
-        than as a depth-99 ghost tree node (the archivist function itself
-        no longer publishes anything to the bus).
+        TUI can surface compaction activity on THIS agent's row. The
+        archivist function itself no longer publishes anything to the
+        bus. We use try/finally so `compaction_end` ALWAYS lands once
+        `compaction_start` has fired -- otherwise a CancelledError mid-
+        compact (e.g. parent fires this agent via `_tool_fire` -> task
+        cancel) would leave the TUI showing "compacting..." forever.
+
+        Floor advancement policy:
+          - Genuine no-op (CompactionSkipped: history structure prevents
+            compaction)     -> advance floor; don't retry every turn.
+          - Transient failure (CompactionTransientFailure: LLM blip)
+                            -> DO NOT advance; retry on next threshold cross.
+          - Success         -> advance floor to new len.
         """
         if not force:
             if not should_compact(
@@ -263,43 +305,55 @@ class Agent:
             keep_recent=CONFIG.compact_keep_recent,
         )
         start = time.monotonic()
+        end_payload: dict[str, Any] = {
+            "before_messages": before,
+            "before_tokens": before_tokens,
+        }
         try:
-            new_messages = await compact_messages(self.name, self.messages)
-        except Exception as e:
-            duration_ms = (time.monotonic() - start) * 1000
-            self._emit(
-                "compaction_end",
-                success=False,
-                error=str(e),
-                duration_ms=duration_ms,
-            )
-            return False
-        duration_ms = (time.monotonic() - start) * 1000
-        if len(new_messages) >= before:
-            # Archivist couldn't help (LLM failure, no-op summary).
-            # Advance the floor anyway so we don't keep retrying every turn.
+            try:
+                new_messages = await compact_messages(self.name, self.messages)
+            except CompactionSkipped as e:
+                # Structural no-op -- advance floor so we don't keep
+                # invoking the archivist on the same history every
+                # turn.
+                self._compaction_floor = len(self.messages)
+                end_payload.update(
+                    success=False,
+                    reason=f"skipped: {e.reason}",
+                    after_messages=before,
+                )
+                return False
+            except CompactionTransientFailure as e:
+                # Transient failure -- don't advance floor; let the
+                # next threshold cross retry.
+                end_payload.update(
+                    success=False,
+                    reason=f"transient: {e.reason}",
+                    after_messages=before,
+                )
+                return False
+            # Defensive: archivist should always shrink on success path,
+            # but a misbehaving stub might not. Treat as skipped.
+            if len(new_messages) >= before:
+                self._compaction_floor = len(self.messages)
+                end_payload.update(
+                    success=False,
+                    reason="archivist returned no shrink",
+                    after_messages=len(new_messages),
+                )
+                return False
+            self.messages = new_messages
             self._compaction_floor = len(self.messages)
-            self._emit(
-                "compaction_end",
-                success=False,
-                before_messages=before,
+            after_tokens = count_tokens(self.messages)
+            end_payload.update(
+                success=True,
                 after_messages=len(new_messages),
-                duration_ms=duration_ms,
+                after_tokens=after_tokens,
             )
-            return False
-        self.messages = new_messages
-        self._compaction_floor = len(self.messages)
-        after_tokens = count_tokens(self.messages)
-        self._emit(
-            "compaction_end",
-            success=True,
-            before_messages=before,
-            after_messages=len(new_messages),
-            before_tokens=before_tokens,
-            after_tokens=after_tokens,
-            duration_ms=duration_ms,
-        )
-        return True
+            return True
+        finally:
+            end_payload["duration_ms"] = (time.monotonic() - start) * 1000
+            self._emit("compaction_end", **end_payload)
 
     async def run(self, task: str) -> RunResult:
         self.messages.append({"role": "user", "content": task})
@@ -582,6 +636,11 @@ class Agent:
         these messages hit the API (e.g., a follow-up turn) the API will
         400 because a tool_call has no matching tool reply.
         """
+        if not (0 <= finishing_index < len(tool_calls)):
+            raise ValueError(
+                f"_seal_tool_batch finishing_index {finishing_index} out of "
+                f"range for tool_calls of length {len(tool_calls)}"
+            )
         finishing_name = tool_calls[finishing_index]["name"]
         for i in range(finishing_index, len(tool_calls)):
             tc = tool_calls[i]

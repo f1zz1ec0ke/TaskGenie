@@ -77,9 +77,25 @@ LLM/token counters, and a chronological event stream.
   Cursor / LM Studio format) at the project root and TaskGenie spawns
   each server as a subprocess and surfaces its tools to workers
   automatically.
-- **Real `exec_code`.** Subprocess with cwd-scoped scratch dir,
-  scrubbed env, configurable timeout. Not a security sandbox — Docker
-  isolation will land as an opt-in backend.
+- **`exec_code` + `exec_workspace`.** Subprocess with cwd-scoped
+  scratch dir or workspace dir respectively, scrubbed env, configurable
+  timeout. Workers use `exec_code` for intermediate computation
+  (private), `exec_workspace` to actually run/test deliverables they
+  produced (e.g. `python game.py`). `$TASKGENIE_WORKSPACE` /
+  `$TASKGENIE_SCRATCH` are exposed in both so cross-dir snippets work.
+  Not a security sandbox — Docker isolation will land as an opt-in
+  backend.
+- **Context-window management.** Each agent runs an "Archivist" pass
+  before any LLM call that would cross
+  `TASKGENIE_COMPACT_AT_PCT * TASKGENIE_CTX_WINDOW`. The Archivist is
+  a one-shot LLM summarisation that compresses the middle band of the
+  agent's history into a single `[archived summary]` user message,
+  preserving the original task and the last N turns verbatim.
+  Out-of-band tool outputs over `TASKGENIE_DUMP_OVER_BYTES` are
+  written to scratch and replaced inline with a one-line pointer the
+  agent can `read_file` if needed. Together these keep long-running
+  workers (the new `max_turns=1000` default) from blowing the model's
+  context budget.
 - **Artifacts every run.** On completion, the CEO's final report is
   written verbatim to `final.md`, rendered to a self-contained
   `final.html`, and bundled with stats + agent tree into `final.json`
@@ -290,6 +306,8 @@ tests/
   test_review_prc.py      # MCP timeout, proc-tree kill, MCP close logging, edit cleanup
   test_review_prd.py      # token counting, dump_large_tool_result, archivist, retry
   test_review_rt2.py      # round-two: pipeline guard, ctx-error matcher, exec_code workspace, etc.
+  test_review_rt3.py      # round-three: hardlink/parent-symlink, recursive truncation,
+                          #              archivist skip-vs-transient, stats replay-aware, etc.
 ```
 
 ## Status

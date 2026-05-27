@@ -157,24 +157,29 @@ async def test_retry_replays_last_followup(tmp_path: Path) -> None:
 
     console = Console(file=io.StringIO(), force_terminal=False)
     inputs = iter(["tweak A", "/retry", "/done"])
+    # Save & restore the original so a failed assert doesn't poison
+    # subsequent tests that import cli_module.
+    real_read = cli_module._read_followup_input
     cli_module._read_followup_input = lambda _c: next(inputs, None)  # type: ignore[assignment]
-
-    rc = await cli_module._drive_session(
-        console=console,
-        session=session,
-        mcp=_NoopMCP(),
-        ceo=ceo,
-        tui=TUI(task=session.data.task),
-        first_message=session.data.task,
-        logger=None,
-        extra_output=None,
-    )
-    assert rc == 0
-    # History should have 2 follow-up entries (the original "tweak A" + the /retry replay)
-    followups = [h for h in session.data.history if h["kind"] == "followup"]
-    assert len(followups) == 2
-    assert followups[0]["text"] == "tweak A"
-    assert followups[1]["text"] == "tweak A"  # /retry replays the same text
+    try:
+        rc = await cli_module._drive_session(
+            console=console,
+            session=session,
+            mcp=_NoopMCP(),
+            ceo=ceo,
+            tui=TUI(task=session.data.task),
+            first_message=session.data.task,
+            logger=None,
+            extra_output=None,
+        )
+        assert rc == 0
+        # History should have 2 follow-up entries (the original "tweak A" + the /retry replay)
+        followups = [h for h in session.data.history if h["kind"] == "followup"]
+        assert len(followups) == 2
+        assert followups[0]["text"] == "tweak A"
+        assert followups[1]["text"] == "tweak A"  # /retry replays the same text
+    finally:
+        cli_module._read_followup_input = real_read  # type: ignore[assignment]
     print("[retry_replays_last_followup] OK")
 
 

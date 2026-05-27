@@ -10,6 +10,7 @@ Run with: python -m tests.test_tui
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 from pathlib import Path
 
@@ -33,7 +34,9 @@ from taskgenie.tui import (
 
 def _render_to_string(tui: TUI) -> str:
     """Render the TUI to a plain string so we can grep for content."""
-    buf = Console(file=open("/dev/null", "w"), force_terminal=False, width=200)
+    # io.StringIO instead of open("/dev/null") so the test works on
+    # Windows runners where /dev/null doesn't exist.
+    buf = Console(file=io.StringIO(), force_terminal=False, width=200)
     with buf.capture() as captured:
         buf.print(tui._render())
     return captured.get()

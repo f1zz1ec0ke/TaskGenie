@@ -213,8 +213,8 @@ _ASK_USER_SCHEMA = {
             "two reasonable interpretations. Do NOT use for trivial decisions you can "
             "make yourself, or for things the user already specified in their original "
             "request. Cheaper to ask once now than rebuild 300 steps of work later. "
-            "Subordinates can't see this tool; if they need user input they "
-            "`report_blocker` and you decide whether to convert that into an `ask_user`."
+            "This is yours alone — when subordinates `report_blocker` you can decide "
+            "whether to convert their blocker into an `ask_user` of your own."
         ),
         "parameters": {
             "type": "object",

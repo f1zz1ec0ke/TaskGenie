@@ -78,7 +78,7 @@ class SessionData:
     task: str
     started_at: str
     last_saved_at: str
-    status: str  # "running" | "blocked" | "done" | "abandoned" | "error"
+    status: str  # "running" | "blocked" | "asking" | "done" | "abandoned" | "error"
     ceo_id: str | None
     project_dir: str = ""  # absolute path to ./TaskGenie/<project>/
     agents: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -236,6 +236,13 @@ class Session:
         # set, a stray datetime) from raising mid-write and orphaning the
         # temp file. The try/finally below cleans up any temp that didn't
         # make it through `os.replace`.
+        #
+        # IMPORTANT: capture tmp_path the moment NamedTemporaryFile opens
+        # -- not after json.dump succeeds. The previous version captured
+        # it AFTER the write/flush/fsync, so the cleanup branch was
+        # skipped on exactly the json.dump failure it was supposed to
+        # handle. tempfile.NamedTemporaryFile(delete=False) creates the
+        # file on disk before yielding, so .name is valid immediately.
         tmp_path: str | None = None
         consumed = False
         try:
@@ -247,10 +254,10 @@ class Session:
                 delete=False,
                 encoding="utf-8",
             ) as tmp:
+                tmp_path = tmp.name  # CAPTURE FIRST so finally can clean up on any subsequent failure
                 json.dump(asdict(self.data), tmp, indent=2, default=str)
                 tmp.flush()
                 os.fsync(tmp.fileno())
-                tmp_path = tmp.name
             os.replace(tmp_path, self.state_path)
             consumed = True
             # fsync the directory on POSIX so the rename itself is
@@ -326,12 +333,22 @@ class Session:
         current_ceo: dict[str, str],
     ) -> str | None:
         """Compare a current tool signature against the one stored at save time.
-        Returns a short human-readable summary, or None if nothing changed."""
-        saved_mgmt = self.data.tool_signature.get("management", {})
-        saved_work = self.data.tool_signature.get("work", {})
-        saved_ceo = self.data.tool_signature.get("ceo", {})
+        Returns a short human-readable summary, or None if nothing changed.
 
-        def diff(saved: dict[str, str], current: dict[str, str]) -> list[str]:
+        A bucket key that was NEVER recorded in tool_signature (None, not {})
+        is treated as "no signature available; skip" -- otherwise pre-round-2
+        sessions (which had no `ceo` bucket) would spuriously report every
+        current CEO tool as new on resume.
+        """
+        saved_mgmt = self.data.tool_signature.get("management")
+        saved_work = self.data.tool_signature.get("work")
+        saved_ceo = self.data.tool_signature.get("ceo")
+
+        def diff(
+            saved: dict[str, str] | None, current: dict[str, str]
+        ) -> list[str]:
+            if saved is None:
+                return []  # bucket wasn't recorded; can't diff meaningfully
             lines: list[str] = []
             saved_keys = set(saved)
             current_keys = set(current)

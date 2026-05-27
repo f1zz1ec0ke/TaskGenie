@@ -91,10 +91,20 @@ def _safe_jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if isinstance(k, (str, int, float, bool)) or k is None:
+            # Stringify EVERY non-str key explicitly so we don't rely on
+            # json's silent coercion. Without this, `{True: 'a', 'true': 'b'}`
+            # and `{1: 'a', '1': 'b'}` collide on the JSON side (both keys
+            # serialize to the same string) and one value is silently
+            # dropped. Better to make the coercion visible.
+            if isinstance(k, str):
                 safe_k = k
+            elif k is None:
+                safe_k = "null"
+            elif isinstance(k, bool):
+                safe_k = "true" if k else "false"
+            elif isinstance(k, (int, float)):
+                safe_k = str(k)
             else:
-                # Tuple keys and similar -- repr is a deterministic stringification.
                 safe_k = repr(k)
             out[safe_k] = _safe_jsonable(v)
         return out
