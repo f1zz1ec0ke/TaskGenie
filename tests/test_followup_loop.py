@@ -211,7 +211,10 @@ async def test_reset_fires_team_but_keeps_ceo(tmp_path: Path) -> None:
     (session.project_dir / "keepme.txt").write_text("preserved", encoding="utf-8")
 
     console = Console(file=io.StringIO(), force_terminal=False)
-    fired = cli_module._reset_team(session, ceo, console)
+    # _reset_team became async in the polish PR (it now awaits in-flight
+    # child task cancellations so the new run()-exit drain doesn't see
+    # an empty dict and let them leak).
+    fired = await cli_module._reset_team(session, ceo, console)
 
     assert fired == 2  # mgr + worker
     assert ceo.status != "fired"

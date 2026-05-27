@@ -96,6 +96,11 @@ LLM/token counters, and a chronological event stream.
   agent can `read_file` if needed. Together these keep long-running
   workers (the new `max_turns=1000` default) from blowing the model's
   context budget.
+  When the child completes, the parent's `await_results` reply
+  carries a `compaction` field (count / skipped / failed /
+  tokens_saved / duration_ms — zero fields dropped) so the manager
+  can see "this child needed 3 compactions" and split the task
+  across siblings on the next pass.
 - **Artifacts every run.** On completion, the CEO's final report is
   written verbatim to `final.md`, rendered to a self-contained
   `final.html`, and bundled with stats + agent tree into `final.json`
@@ -294,29 +299,45 @@ taskgenie/
   __main__.py       # CLI (new / --resume / --list / --output / --project)
 
 tests/
-  test_loop.py            # happy path + full escalation chain
-  test_persistence.py     # save/load/resume + tool-diff
-  test_follow_ups.py      # bottom-up follow_up propagation
-  test_followup_loop.py   # CEO follow-up turns after `complete`
-  test_interactivity.py   # ask_user round-trip + artifact extension inference
-  test_workspace.py       # workspace tools, modes, edits, UTF-8, JSON safety
-  test_tui.py             # activity log, key handling, off-tty no-op
-  test_review_pra.py      # tool-call sealing, symlink rejection, markup escape
-  test_review_prb.py      # session load defensive, ceo-bucket diff, exhaustion, JSON args
-  test_review_prc.py      # MCP timeout, proc-tree kill, MCP close logging, edit cleanup
-  test_review_prd.py      # token counting, dump_large_tool_result, archivist, retry
-  test_review_rt2.py      # round-two: pipeline guard, ctx-error matcher, exec_code workspace, etc.
-  test_review_rt3.py      # round-three: hardlink/parent-symlink, recursive truncation,
-                          #              archivist skip-vs-transient, stats replay-aware, etc.
+  test_loop.py              # happy path + full escalation chain
+  test_persistence.py       # save/load/resume + tool-diff
+  test_follow_ups.py        # bottom-up follow_up propagation
+  test_followup_loop.py     # CEO follow-up turns after `complete`
+  test_interactivity.py     # ask_user round-trip + artifact extension inference
+  test_workspace.py         # workspace tools, modes, edits, UTF-8, JSON safety
+  test_tui.py               # activity log, key handling, off-tty no-op
+  test_review_pra.py        # tool-call sealing, symlink rejection, markup escape
+  test_review_prb.py        # session load defensive, ceo-bucket diff, exhaustion, JSON args
+  test_review_prc.py        # MCP timeout, proc-tree kill, MCP close logging, edit cleanup
+  test_review_prd.py        # token counting, dump_large_tool_result, archivist, retry
+  test_review_rt2.py        # round-two: pipeline guard, ctx-error matcher, exec_code workspace
+  test_review_rt3.py        # round-three: hardlink/parent-symlink, recursive truncation,
+                            #              archivist skip-vs-transient, stats replay-aware
+  test_compaction_telemetry.py  # compaction_stats surfaced via to_tool_payload + TUI panel
+  test_polish_coverage.py   # _tool_review/_rehire/_fire-cancel, bulk_load edges, MCP
+                            # name-collision, resume of asking-status, TUI tool_args clip,
+                            # _ColumnOverflowTree narrow-width, _run_resume snapshot-after-mark
 ```
 
 ## Status
 
-- All listed features above are implemented and covered by smoke tests.
-- `exec_code` runs real subprocesses with a timeout but isn't a
-  security sandbox; Docker-backed isolation will land later as an
-  opt-in backend.
-- The MCP client uses stdio transport only (no HTTP MCP yet).
+- The features listed above are implemented, exercised by the test
+  files inventoried just above, and reviewed across three rounds of
+  multi-agent code review (notes in `REVIEW_NOTES.md`). What's
+  **explicitly NOT a goal** for v1:
+  - `exec_code` / `exec_workspace` run real subprocesses with a
+    timeout and an env scrub but are **not a security sandbox**.
+    Docker-backed isolation is an opt-in we'll add later if someone
+    runs this in an environment where the agent's network access
+    matters.
+  - The MCP client uses stdio transport only (no HTTP MCP yet).
+  - No sound/APU emulation work, no Docker, no native binary builds.
+- **Known limitations covered in `REVIEW_NOTES.md`** (deliberately
+  deferred to a focused future PR, not surprises): bus queues are
+  unbounded; `task_assignments` cleanup on cancelled child tasks is
+  best-effort (`_drain_pending_assignments` sweeps at `run()` exit);
+  `_ColumnOverflowTree` may over-truncate very long agent labels at
+  very narrow terminal widths.
 - Per-role LLM temperatures are not yet supported — use whatever your
   model lab recommends as a single value.
 - The tree pane caps at 10 workers per manager + 10 sub-managers per

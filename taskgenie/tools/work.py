@@ -192,6 +192,81 @@ _LIST_WORKSPACE_SCHEMA = {
     },
 }
 
+_COPY_TO_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "copy_to_workspace",
+        "description": (
+            "Copy a file from your PRIVATE scratch directory INTO the SHARED workspace. "
+            "Use this when you've prepared a deliverable in scratch (e.g. `exec_code` "
+            "generated `out.bin`, you scaffolded with `cookiecutter`, you decoded a "
+            "fetch response) and want to promote it to the workspace as the final "
+            "artifact. Bytes never travel through your message history -- this is the "
+            "right tool for binary or large content that would explode `read_file` + "
+            "`write_workspace` round-trips.\n\n"
+            "MODES (chooses how to handle an existing file at the destination):\n"
+            "  - 'create' (DEFAULT): FAILS if workspace/<dest_workspace_path> already "
+            "exists. Catches accidental clobbers. If you genuinely intend to replace, "
+            "retry with mode='overwrite'.\n"
+            "  - 'overwrite': replaces the workspace file. If you previously "
+            "read_workspace'd the destination, the response carries the same "
+            "lost-update warning write_workspace emits -- read-then-overwrite is the "
+            "anti-pattern. Use `edit_workspace` for surgical changes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scratch_path": {
+                    "type": "string",
+                    "description": "Source path relative to your scratch directory.",
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "Destination path relative to the workspace root.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["create", "overwrite"],
+                    "description": "How to handle an existing workspace file. Defaults to 'create'.",
+                },
+            },
+            "required": ["scratch_path", "workspace_path"],
+        },
+    },
+}
+
+_COPY_FROM_WORKSPACE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "copy_from_workspace",
+        "description": (
+            "Copy a file from the SHARED workspace INTO your PRIVATE scratch directory. "
+            "Use this when you need to work on a deliverable locally (e.g. modify a "
+            "teammate's draft before running tests, post-process a binary asset, stage "
+            "a file as exec_code input) without going through `read_workspace` -> "
+            "`write_file` -- bytes stay off the LLM context.\n\n"
+            "Always replaces the scratch destination if it exists (your scratch is "
+            "private, no clobber-warning needed). Records the source path the same way "
+            "`read_workspace` does, so a later `copy_to_workspace(..., mode='overwrite')` "
+            "back to the same workspace path still surfaces the lost-update warning."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "workspace_path": {
+                    "type": "string",
+                    "description": "Source path relative to the workspace root.",
+                },
+                "scratch_path": {
+                    "type": "string",
+                    "description": "Destination path relative to your scratch directory.",
+                },
+            },
+            "required": ["workspace_path", "scratch_path"],
+        },
+    },
+}
+
 _EXEC_CODE_SCHEMA = {
     "type": "function",
     "function": {
@@ -719,6 +794,157 @@ async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _stream_copy(src_fd: int, dst_fd: int) -> int:
+    """Stream-copy bytes from src_fd to dst_fd in 64KB chunks. Returns the
+    total bytes copied. Caller is responsible for closing both fds."""
+    total = 0
+    while True:
+        chunk = os.read(src_fd, 1 << 16)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            n = os.write(dst_fd, view)
+            view = view[n:]
+        total += len(chunk)
+    return total
+
+
+async def _copy_to_workspace(agent: Any, args: dict[str, Any]) -> str:
+    scratch_rel = args["scratch_path"]
+    workspace_rel = args["workspace_path"]
+    mode = args.get("mode", "create")
+    if mode not in ("create", "overwrite"):
+        return (
+            f"ERROR: unknown mode {mode!r}; copy_to_workspace expects "
+            "'create' or 'overwrite'"
+        )
+
+    scratch_base = Path(agent.scratch_dir)
+    src = _safe_path(str(scratch_base), scratch_rel)
+    ws_base = _workspace_or_error(agent)
+    if isinstance(ws_base, str):
+        return ws_base
+    dst = _safe_path(str(ws_base), workspace_rel)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Lost-update warning if the worker previously read the destination
+    # path from workspace. Mirrors the write_workspace(mode='overwrite')
+    # check so cross-tool behaviour is consistent.
+    norm_dst = _normalize_workspace_path(workspace_rel)
+    previously_read = (
+        mode == "overwrite"
+        and norm_dst in _agent_read_workspace_paths(agent)
+    )
+
+    # Open source first; if it doesn't exist or is a symlink/hardlink we
+    # want to fail before we've created the destination.
+    try:
+        src_fd = _safe_open(src, scratch_base, os.O_RDONLY)
+    except FileNotFoundError:
+        return f"ERROR: scratch source file does not exist: {scratch_rel}"
+    except OSError as e:
+        m = _path_safety_error(scratch_rel, e)
+        if m is not None:
+            return m
+        raise
+
+    try:
+        if mode == "create":
+            dst_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        else:
+            dst_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        try:
+            dst_fd = _safe_open(dst, ws_base, dst_flags)
+        except FileExistsError:
+            return (
+                f"ERROR: workspace/{workspace_rel} already exists. "
+                "Use mode='overwrite' to replace, or pick a different "
+                "destination path."
+            )
+        except OSError as e:
+            m = _path_safety_error(f"workspace/{workspace_rel}", e)
+            if m is not None:
+                return m
+            raise
+        try:
+            total = _stream_copy(src_fd, dst_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+    msg = (
+        f"copied {total} bytes from scratch/{scratch_rel} "
+        f"to workspace/{workspace_rel}"
+    )
+    if previously_read:
+        msg += (
+            "\nWARNING: you previously read this workspace file and then "
+            "overwrote it via copy_to_workspace. If you intended to modify "
+            "rather than replace, you may have lost another agent's "
+            "concurrent changes. Use `edit_workspace(old_text, new_text)` "
+            "for read-then-modify cycles."
+        )
+    return msg
+
+
+async def _copy_from_workspace(agent: Any, args: dict[str, Any]) -> str:
+    workspace_rel = args["workspace_path"]
+    scratch_rel = args["scratch_path"]
+
+    ws_base = _workspace_or_error(agent)
+    if isinstance(ws_base, str):
+        return ws_base
+    src = _safe_path(str(ws_base), workspace_rel)
+    scratch_base = Path(agent.scratch_dir)
+    dst = _safe_path(str(scratch_base), scratch_rel)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        src_fd = _safe_open(src, ws_base, os.O_RDONLY)
+    except FileNotFoundError:
+        return (
+            f"ERROR: workspace source file does not exist: {workspace_rel}"
+        )
+    except OSError as e:
+        m = _path_safety_error(f"workspace/{workspace_rel}", e)
+        if m is not None:
+            return m
+        raise
+
+    try:
+        # Scratch is private to this agent -- always overwrite the dest
+        # without the "file exists" handshake. No clobber risk because
+        # nobody else writes to this agent's scratch.
+        dst_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        try:
+            dst_fd = _safe_open(dst, scratch_base, dst_flags)
+        except OSError as e:
+            m = _path_safety_error(scratch_rel, e)
+            if m is not None:
+                return m
+            raise
+        try:
+            total = _stream_copy(src_fd, dst_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+    # Record the workspace source path the same way _read_workspace does
+    # so a subsequent copy_to_workspace(mode='overwrite') back to the
+    # same path triggers the lost-update warning.
+    paths = getattr(agent, "read_workspace_paths", None)
+    if paths is not None:
+        paths.add(_normalize_workspace_path(workspace_rel))
+
+    return (
+        f"copied {total} bytes from workspace/{workspace_rel} "
+        f"to scratch/{scratch_rel}"
+    )
+
+
 def _scrubbed_env(agent: Any | None = None) -> dict[str, str]:
     extras = os.environ.get("TASKGENIE_EXEC_ENV_PASSTHROUGH", "")
     passthrough = _DEFAULT_PASSTHROUGH | {k.strip() for k in extras.split(",") if k.strip()}
@@ -868,6 +1094,15 @@ def register_builtin_work_tools() -> None:
     REGISTRY.register(_EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace)
     REGISTRY.register(
         _EXEC_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_exec_workspace
+    )
+    # Copy tools sit beside the workspace write/edit pair: same mode='create' /
+    # 'overwrite' semantics + same hardlink/symlink/TOCTOU defense via
+    # _safe_open at both source and destination.
+    REGISTRY.register(
+        _COPY_TO_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_copy_to_workspace
+    )
+    REGISTRY.register(
+        _COPY_FROM_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_copy_from_workspace
     )
 
 

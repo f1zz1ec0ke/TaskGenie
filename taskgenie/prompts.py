@@ -354,6 +354,14 @@ available include:
   workspace where REAL deliverable files live. Use scratch for thinking, \
   workspace for shipping.
 
+  For MOVING BYTES between scratch and workspace without round-tripping \
+  through your message history (binary files, large content, anything \
+  `exec_code` produced in scratch that should now be a deliverable), \
+  use `copy_to_workspace(scratch_path, workspace_path)` or \
+  `copy_from_workspace(workspace_path, scratch_path)`. Same `mode='create'` \
+  default semantics as write_workspace; bytes never travel through the \
+  LLM context.
+
   ONE RULE FOR PICKING THE RIGHT WRITE TOOL:
     - Is the file BRAND NEW (doesn't exist yet)? -> `write_workspace`. \
       Default mode='create' will fail loud if you guessed wrong, which is \

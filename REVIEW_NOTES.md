@@ -412,10 +412,98 @@ Deferred items from rounds 1 + 2 that took <10 LOC each:
 
 ---
 
+## Polish pass — done in branch `claude/polish-and-gap-fill`
+
+Knocked out the test-coverage gaps + the small real-but-bounded items
++ the doc gaps + a self-review pass that surfaced 15 findings (8 of
+which I'd introduced in this same PR), all addressed. Bus queue
+bounding and the tmux-Live overlap left for a focused PR each.
+
+**New tools** (option 1 from dogfooding feedback — workers need to
+move binary / large files between scratch and workspace without
+round-tripping through the LLM context):
+
+- `copy_to_workspace(scratch_path, workspace_path, mode='create')`
+  — same `create`/`overwrite` semantics as `write_workspace`,
+  preserves the lost-update warning on `mode='overwrite'` after a
+  prior `read_workspace`/`copy_from_workspace`. Streams in 64KB
+  chunks via the existing `_safe_open` defense (NOFOLLOW, hardlink
+  refusal, parent-symlink TOCTOU re-check) on BOTH source and
+  destination.
+- `copy_from_workspace(workspace_path, scratch_path)` — always
+  overwrites scratch (your private dir, no clobber risk). Records
+  the source path the same way `read_workspace` does so a later
+  `copy_to_workspace(mode='overwrite')` back to the same workspace
+  path still surfaces the lost-update warning.
+
+**Review fixes** (self-applied via /code-review --fix; 9 agents
+across 5 correctness angles + 3 cleanup angles + altitude):
+
+- `Agent.run()` no longer drains pending child tasks on inter-turn
+  PAUSES (`kind="question"` / `kind="blocked"`) — only on terminal
+  exits (`done` / `error` / `exhausted`). Cancelling on question
+  would have orphaned `[assign(h1), assign(h2), ask_user(...)]`
+  batches: the parent re-invokes `run()` after the user answers
+  expecting those handles to still be awaitable.
+- `Agent.run()` now has a `except BaseException` clause that
+  transitions to `status='error'` before re-raising, so an
+  unhandled exception (CancelledError from `_tool_fire`,
+  programming bug in compaction) no longer leaves the agent stuck
+  at `status='working'` permanently.
+- `_drain_pending_assignments` body simplified: dropped the
+  misleading `if not t.cancelled()` guard (`cancelled()` is only
+  True after the task has finished unwinding, so the guard never
+  short-circuited); added `asyncio.shield` + `wait_for(timeout=2s)`
+  + broad `except` so cascading cancellation during shutdown
+  doesn't itself orphan the children we're trying to clean up.
+- `_run_session` switched to `asyncio.wait(..., return_when=
+  FIRST_EXCEPTION)`: a TUI raise mid-run now propagates promptly
+  instead of hanging on a blocked CEO until external cancellation.
+  The R13 test now actually exercises the cleanup contract it
+  was meant to.
+- `_reset_team` became async and cancels-and-awaits in-flight
+  `ceo.task_assignments` before wiping the dict. Without this, the
+  new run()-exit drain saw an empty dict on the next run() call
+  and the orphaned tasks dangled to shutdown.
+- `_ColumnOverflowTree` gains a cheap pre-check: when the tree has
+  ≤ ~80% of `avail_h` nodes, skip the wide-render entirely. Stops
+  paying ~4ms/tick at 8 fps for the common small-tree case.
+- `_NoopMCP` test stub now sets `registered_tools` / `connect_errors`
+  in `__init__` instead of as class attrs (no more mutable-default
+  leak).
+- Test isolation: `_isolated_data_paths(tmp_path)` context manager
+  captures the original `CONFIG.data_dir` instead of restoring to a
+  hard-coded `'.taskgenie'` literal (which would have clobbered any
+  `TASKGENIE_DATA_DIR` env override). Same context also pins
+  `TASKGENIE_PROJECTS_DIR` so resume tests don't leak `./TaskGenie/`
+  subdirectories.
+- MCP collision tests: pre-registration moved INSIDE the try/finally
+  with defensive unregister beforehand, so prior test pollution
+  can't skip the cleanup.
+- New test: `test_ceo_prompt_still_carries_followup_anchor` —
+  asserts the CEO prompt still has the FOLLOW-UP TURNS section
+  that the terse `_build_followup_message` depends on.
+- New tests for the drain-on-terminal-only contract
+  (`test_run_drain_skips_on_question_return` +
+  `test_run_drain_fires_on_done_return`).
+
+**Other polish:**
+
+- `tests/test_polish_coverage.py` (now 39 tests, was 22 at first
+  draft): `_tool_review`, `_tool_rehire`, `_tool_fire`
+  cancellation, `bulk_load` edge cases, `RunResult.to_tool_payload`
+  per RunKind, MCP name-collision, resume of `status="asking"`,
+  R12/R13/R22/R24/R27, plus the copy-tools tests above.
+- `AGENTS.md` at repo root: navigation, conventions, how to add a
+  tool/event/config knob, where to look first when things break.
+- README status section honest about what's covered vs out-of-scope
+  for v1.
+- README test inventory + worker tool-list mention of copy tools.
+
 ## Still deferred — surfaced for the next pass
 
-These were known going in or surfaced in round 3 but were intentionally
-left out because each is non-trivial OR borderline cosmetic:
+Bus queue bounding (the one big real-but-bounded item) plus a handful
+of edge cases that didn't fit cleanly in a polish PR:
 
 ### Real-but-bounded (worth a focused PR eventually)
 
@@ -423,17 +511,11 @@ left out because each is non-trivial OR borderline cosmetic:
   unbounded `asyncio.Queue`. Only bites when a subscriber forgets
   `unsubscribe`. Right answer: bounded queue + drop-oldest when full.
   ~30 LOC + a test.
-- **`task_assignments` leak on cancelled child tasks** (orchestrator
-  M5 from round 2). Generates "Task was destroyed but pending"
-  warnings at shutdown. Cleanup pass in `_tool_fire` and at end of
-  `run`.
 - **`_kill_proc_tree` pid-reuse race** (theoretical on Linux; the
   parent hasn't reaped). Would need a tighter "wait for child
   briefly, only then killpg" sequence.
 - **`console.input` overlap after `Live` exits the alternate screen**
   (presentation 4 from round 2). Tmux/screen-specific cosmetic.
-- **`_ColumnOverflowTree` measurement floor of 200 cells** over-truncates
-  labels longer than the terminal width but shorter than 200. Edge case.
 - **`_unique_project_dir` TOCTOU** across simultaneous CLI invocations.
   Not realistic for a single-user tool.
 - **`count_tokens` called 3x on the success compaction path**
@@ -458,31 +540,12 @@ left out because each is non-trivial OR borderline cosmetic:
 
 ### Test coverage gaps still open
 
-- `_tool_review`, `_tool_rehire` have no direct tests (only indirect
-  via happy-path scenarios). `_tool_fire` is now tested for state
-  emit (round 3) but not for cancellation semantics.
-- `bulk_load` parent-relinking has no test for missing-parent or
-  absent-child-id cases.
-- `result.RunResult.to_tool_payload` has zero direct coverage
-  (mentioned as a bright spot in round 1 — should test the kinds).
-- MCP namespace collision / `_connect_server` / `_register_mcp_tool`
-  still uncovered (only the timeout + close paths are tested).
-- Resume of `status="asking"` (user quit mid-question without
-  answering) has no test of the resume code path.
-- Direct tests for round-two R12 (Ctrl+C → snapshot), R13 (dangling
-  ceo_task cleanup), R22 (TUI tool_args truncation explicitly), R24
-  (Measurement narrow-width clamp), R27 (`_run_resume` snapshot after
-  every mark_*) — only covered implicitly today.
+- `_connect_server` integration path (full subprocess spawn) -- only
+  collision-handling and timeout/close are unit-tested.
 
 ### Doc gaps
 
-- **No `AGENTS.md`.** Acknowledged from round 1; would be a fresh
-  doc-only PR.
-- **CEO prompt's `FOLLOW-UP TURNS` section duplicates content** that
-  `_build_followup_message` writes at runtime. Minor token waste.
-- **Status section in README** says all features are "covered by smoke
-  tests" — true at a high level, but a reader might overestimate the
-  coverage given the gaps above.
+(empty — handled in the polish pass.)
 
 ### Won't-fix
 
