@@ -156,6 +156,23 @@ def _truncate_segments(seg_list: list[Segment], max_width: int) -> list[Segment]
     return out
 
 
+def _count_tree_nodes(tree: Tree, cap: int) -> int:
+    """Count up to `cap` nodes in `tree` (root + all descendants).
+    Short-circuits once cap is hit so the count for huge trees stays
+    bounded. Used as a cheap O(min(N, cap)) pre-check to skip the
+    expensive wide-render when the tree obviously fits in the panel.
+    """
+    count = 1  # the root itself contributes a line
+    stack: list[Tree] = list(getattr(tree, "children", []) or [])
+    while stack and count < cap:
+        node = stack.pop()
+        count += 1
+        kids = getattr(node, "children", None)
+        if kids:
+            stack.extend(kids)
+    return count
+
+
 class _ColumnOverflowTree:
     """Tree wrapper that flows into more columns when it would overflow.
 
@@ -184,11 +201,28 @@ class _ColumnOverflowTree:
             yield self._tree
             return
 
+        # Cheap pre-check: a Tree's logical line count is bounded by
+        # 1 + (descendants). At ~80% of avail_h or fewer total nodes,
+        # there's no plausible way the rendered output overflows --
+        # skip the (somewhat expensive) wide-render and yield directly.
+        # Stops us paying ~4ms/tick at 8 fps for the common small-tree
+        # case (CEO + a handful of managers + workers).
+        max_safe_nodes = max(1, int(avail_h * 0.8))
+        if _count_tree_nodes(self._tree, max_safe_nodes + 1) <= max_safe_nodes:
+            yield self._tree
+            return
+
         # Render once at a wide width AND uncapped height so we measure
         # the tree's full extent. render_lines() crops to options.height
         # otherwise, which would hide the very overflow we want to detect.
+        # The wide width must exceed any plausible single-label cell
+        # count -- if a label wraps during the wide-render, our
+        # line-count overflow detection mis-counts. 200 was too tight
+        # for trees with very long agent names (300+ chars from a
+        # role_type/status suffix on top of the name); 4096 covers any
+        # realistic case without meaningfully changing render cost.
         wide_opts = options.update(
-            width=max(avail_w, 200), height=None
+            width=max(avail_w, 4096), height=None
         )
         wide_lines = console.render_lines(self._tree, wide_opts, pad=False)
         # Drop trailing blank lines Rich sometimes adds.

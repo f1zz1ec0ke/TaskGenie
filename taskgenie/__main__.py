@@ -150,7 +150,24 @@ async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
     ceo_task = asyncio.create_task(ceo.run(message), name="ceo")
     tui_task = asyncio.create_task(tui.run(stop_when=ceo_task), name="tui")
     try:
-        return await ceo_task
+        # FIRST_EXCEPTION: if either task raises, return immediately so we
+        # can surface the failure (rather than hanging on a blocked CEO
+        # while the TUI has already died). If both complete without
+        # exceptions, this still waits for both -- equivalent to
+        # ALL_COMPLETED in the happy path.
+        done, _pending = await asyncio.wait(
+            {ceo_task, tui_task}, return_when=asyncio.FIRST_EXCEPTION
+        )
+        for t in done:
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                # Propagate the failure. The finally below will cancel
+                # whichever task is still in flight.
+                raise exc
+        # All clean -- ceo_task carries the RunResult.
+        return ceo_task.result()
     finally:
         # If anything raised (CancelledError on Ctrl+C, an unrelated TUI
         # exception, the CEO bubbling something up) we still need both
@@ -188,23 +205,27 @@ def _read_followup_input(console: Console) -> str | None:
 
 
 def _build_followup_message(user_text: str) -> str:
-    return (
-        f"USER FOLLOW-UP: {user_text}\n\n"
-        "The team you previously hired and the workspace files all persist. "
-        "Decide whether to re-assign existing managers (they keep their "
-        "memory of what they built), hire new managers/workers for new "
-        "facets of this follow-up, or `fire` and replace if a previous "
-        "role is now wrong. Call `list_workspace` first if you need to "
-        "see what's currently in the project before deciding. "
-        "Call `complete` when this follow-up is addressed."
-    )
+    # Kept terse on purpose: the FOLLOW-UP TURNS section of the CEO
+    # prompt already explains team persistence, list_workspace use,
+    # re-assign-vs-rehire-vs-fire, and when to complete. Repeating that
+    # guidance every follow-up turn is dead weight in the context window.
+    return f"USER FOLLOW-UP: {user_text}\n\nCall `complete` when this follow-up is addressed."
 
 
-def _reset_team(session: Session, ceo: Agent, console: Console) -> int:
+async def _reset_team(session: Session, ceo: Agent, console: Console) -> int:
     """Fire every subordinate (recursively), but keep the CEO and the
     workspace files. The CEO is told the team is gone; the next user
     task is effectively a fresh start with the existing workspace as
-    context."""
+    context.
+
+    Async because we cancel+await any in-flight child tasks the CEO
+    had queued -- without this, replacing `task_assignments = {}`
+    leaves the underlying asyncio.Task objects alive in the event
+    loop. The new `_drain_pending_assignments` at run()-exit sees the
+    empty dict and reaps nothing; the tasks dangle to 'Task was
+    destroyed but it is pending!' at shutdown. Cancelling here closes
+    that gap.
+    """
     fired_count = 0
     for agent in list(Agent.REGISTRY.values()):
         if agent.id == ceo.id:
@@ -220,6 +241,20 @@ def _reset_team(session: Session, ceo: Agent, console: Console) -> int:
         # state.json unbounded. The TUI's own self.agents view still
         # has them and renders the "fired" filter, so no visual loss.
         Agent.REGISTRY.pop(agent.id, None)
+    # Cancel + await CEO's pending children BEFORE wiping the dict.
+    # Otherwise the task references survive only in the event loop,
+    # untracked anywhere, and asyncio warns at process exit.
+    pending = [t for t in ceo.task_assignments.values() if not t.done()]
+    for t in pending:
+        t.cancel()
+    if pending:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=2.0,
+            )
+        except (asyncio.TimeoutError, Exception):
+            pass  # best-effort; /reset shouldn't hang the CLI
     ceo.children = []
     ceo.task_assignments = {}
     ceo.task_targets = {}
@@ -436,7 +471,7 @@ async def _drive_session(
                     next_followup = last_followup
                     break
                 if raw == "/reset":
-                    _reset_team(session, ceo, console)
+                    await _reset_team(session, ceo, console)
                     _snapshot(session, ceo)
                     continue  # back to prompt; next non-command input is the fresh task
                 if raw.startswith("/"):

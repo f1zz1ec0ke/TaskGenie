@@ -424,10 +424,88 @@ class Agent:
                 self.compaction_stats["failed"] += 1
             self._emit("compaction_end", **end_payload)
 
+    # Bounded shutdown for the drain. A child stuck in a non-cancellable
+    # path (synchronous MCP RPC, exec_code subprocess that hasn't reached a
+    # checkpoint) would otherwise hang the parent's `run()` indefinitely.
+    # 2s is generous for normal cancellation; missed cleanups print the
+    # familiar asyncio warning rather than freeze the CLI.
+    _DRAIN_TIMEOUT_SECONDS: float = 2.0
+
+    async def _drain_pending_assignments(self) -> None:
+        """Cancel and await any in-flight child tasks that weren't
+        explicitly awaited via `_tool_await_results`.
+
+        Called from `run()`'s finally ONLY on terminal returns
+        (done / error / exhausted). Question/blocked returns are
+        inter-turn pauses where the parent will re-invoke `run()` and
+        expects child handles to still be awaitable -- draining there
+        would convert in-flight work into 'cancelled' on resume.
+
+        Shielded against external cancellation so a Ctrl+C arriving
+        during the drain doesn't itself orphan the children we're
+        trying to clean up. Bounded by `_DRAIN_TIMEOUT_SECONDS` so a
+        stuck child can't hang shutdown. Exceptions from the drain
+        itself are suppressed so they don't mask the original return
+        value (or the original exception unwinding through `run()`).
+        """
+        pending = [
+            t for t in self.task_assignments.values() if not t.done()
+        ]
+        if not pending:
+            return
+        for t in pending:
+            t.cancel()
+        try:
+            await asyncio.shield(
+                asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=self._DRAIN_TIMEOUT_SECONDS,
+                )
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            # Best-effort. A stuck child or a re-arming cancellation
+            # MUST NOT replace the return value of run() or escape from
+            # its finally block.
+            pass
+
+    # Run kinds that mean the agent is FINISHED -- terminal exits where
+    # the parent will not call `run()` again on this agent (or, if it
+    # does via rehire, will reset the message history). Drain on these.
+    # Question and blocked are PAUSES: the same parent will re-invoke
+    # run() after the user responds, expecting pending child tasks to
+    # still be awaitable.
+    _TERMINAL_KINDS = frozenset({"done", "error", "exhausted"})
+
     async def run(self, task: str) -> RunResult:
         self.messages.append({"role": "user", "content": task})
         self._set_status("working", task=task)
 
+        result: RunResult | None = None
+        try:
+            result = await self._run_loop()
+            return result
+        except BaseException as exc:
+            # Without this clause, an unhandled exception bubbling out
+            # of _run_loop would leave self.status='working' permanently;
+            # the parent / TUI would see the agent stuck. Transition to
+            # 'error' BEFORE re-raising so observers get a terminal
+            # state. CancelledError is intentionally re-raised: the
+            # caller (typically _tool_await_results or _run_session)
+            # owns the cancellation semantics.
+            try:
+                self._set_status("error", error=f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass  # _set_status emit failure must not mask the original
+            raise
+        finally:
+            # Only sweep on terminal exits. Inter-turn pauses (question /
+            # blocked) leave child tasks alive so the next run() can
+            # await them. result is None iff an exception is propagating;
+            # treat that as terminal too (the agent isn't coming back).
+            if result is None or result.kind in self._TERMINAL_KINDS:
+                await self._drain_pending_assignments()
+
+    async def _run_loop(self) -> RunResult:
         empty_turn_count = 0
         for _turn in range(CONFIG.max_turns_per_agent):
             # Pre-call compaction: if we're approaching the context
