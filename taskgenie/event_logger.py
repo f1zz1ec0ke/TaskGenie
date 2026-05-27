@@ -17,23 +17,40 @@ from taskgenie.events import BUS, Event
 # Cap any individual string field in an event's `data` payload to keep the
 # log line size bounded. Large tool outputs are already dump-routed to
 # scratch by `dump_large_tool_result`, but `tool_call.args` (the original
-# arguments) and very long narrations would otherwise blow the file size
-# up to MBs per session, especially now that max_turns_per_agent defaults
-# to 1000.
-_MAX_EVENT_FIELD_BYTES = 16 * 1024
+# arguments -- a DICT) and very long narrations would otherwise blow the
+# file size up to MBs per session, especially now that max_turns_per_agent
+# defaults to 1000. Round-three confirmed the previous shallow truncator
+# missed the largest realistic offender (write_workspace's content arg
+# nested inside the args dict).
+_MAX_EVENT_FIELD_CHARS = 16 * 1024
 
 
 def _truncate_for_log(data: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for k, v in data.items():
-        if isinstance(v, str) and len(v) > _MAX_EVENT_FIELD_BYTES:
-            out[k] = (
-                v[:_MAX_EVENT_FIELD_BYTES]
-                + f"…[truncated for log; original {len(v)} bytes]"
-            )
-        else:
-            out[k] = v
-    return out
+    """Recursively cap every string leaf in `data`. Walks dicts and lists
+    so nested content (notably `tool_call.args.content`) is truncated."""
+
+    def trunc(v: Any) -> Any:
+        if isinstance(v, str):
+            if len(v) > _MAX_EVENT_FIELD_CHARS:
+                return (
+                    v[:_MAX_EVENT_FIELD_CHARS]
+                    + f"…[truncated for log; original {len(v)} chars]"
+                )
+            return v
+        if isinstance(v, dict):
+            return {k: trunc(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [trunc(x) for x in v]
+        if isinstance(v, (bytes, bytearray)):
+            if len(v) > _MAX_EVENT_FIELD_CHARS:
+                return (
+                    repr(bytes(v[:_MAX_EVENT_FIELD_CHARS]))
+                    + f"…[truncated for log; original {len(v)} bytes]"
+                )
+            return repr(bytes(v))
+        return v
+
+    return {k: trunc(v) for k, v in data.items()}
 
 
 class JSONLEventLogger:

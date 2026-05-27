@@ -222,8 +222,15 @@ async def test_archivist_compacts_middle_messages() -> None:
 
 
 async def test_archivist_falls_back_on_llm_failure() -> None:
-    """If the Archivist's own LLM call fails, return the original messages
-    so the caller can decide what to do (don't lose history)."""
+    """Round 3 changed the API: instead of silently returning unchanged
+    messages on LLM failure, `compact_messages` raises
+    `CompactionTransientFailure` so the caller (`_maybe_compact`) can
+    distinguish "transient blip, retry next threshold" from a
+    structural no-op and avoid advancing the compaction-floor for
+    transient failures.
+    """
+    from taskgenie.archivist import CompactionTransientFailure
+
     msgs = [
         {"role": "system", "content": "..."},
         {"role": "user", "content": "task"},
@@ -234,18 +241,26 @@ async def test_archivist_falls_back_on_llm_failure() -> None:
     ]
     original_llm = archivist_module.LLM
     archivist_module.LLM = _FailingLLM()
+    raised = False
     try:
-        new_msgs = await archivist_module.compact_messages("W", msgs, keep_recent=2)
+        try:
+            await archivist_module.compact_messages("W", msgs, keep_recent=2)
+        except CompactionTransientFailure as e:
+            raised = True
+            assert "simulated LLM failure" in str(e), e
     finally:
         archivist_module.LLM = original_llm
-
-    # Returned unchanged.
-    assert new_msgs == msgs
+    assert raised, "expected CompactionTransientFailure"
     print("[archivist_falls_back_on_llm_failure] OK")
 
 
 async def test_archivist_noop_for_short_history() -> None:
-    """If there's nothing meaningful to compact, return the input."""
+    """If there's nothing meaningful to compact, `compact_messages`
+    raises `CompactionSkipped` (round 3 distinguishes this from a
+    transient failure so the floor advances appropriately).
+    """
+    from taskgenie.archivist import CompactionSkipped
+
     msgs = [
         {"role": "system", "content": "..."},
         {"role": "user", "content": "task"},
@@ -254,12 +269,15 @@ async def test_archivist_noop_for_short_history() -> None:
     # LLM should never be called for a no-op compaction.
     original_llm = archivist_module.LLM
     archivist_module.LLM = _FailingLLM()  # would raise if invoked
+    raised = False
     try:
-        new_msgs = await archivist_module.compact_messages("W", msgs, keep_recent=6)
+        try:
+            await archivist_module.compact_messages("W", msgs, keep_recent=6)
+        except CompactionSkipped:
+            raised = True
     finally:
         archivist_module.LLM = original_llm
-
-    assert new_msgs == msgs
+    assert raised, "expected CompactionSkipped"
     print("[archivist_noop_for_short_history] OK")
 
 

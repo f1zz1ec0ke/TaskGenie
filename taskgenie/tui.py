@@ -60,6 +60,27 @@ def _short_args(args: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+_ACTIVITY_TRIM_CHARS = 200
+
+
+def _trim_for_activity(value: Any) -> Any:
+    """Recursively clip string leaves so a single fat tool_args dict can't
+    hold MBs of content alive in `AgentView.activity_log`.
+
+    Preserves structure (keys, list ordering) so the rendered display in
+    _format_activity_entry still gets the same shape it always did.
+    """
+    if isinstance(value, str):
+        if len(value) > _ACTIVITY_TRIM_CHARS:
+            return value[:_ACTIVITY_TRIM_CHARS] + "…(truncated)"
+        return value
+    if isinstance(value, dict):
+        return {k: _trim_for_activity(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_trim_for_activity(v) for v in value]
+    return value
+
+
 class AgentView:
     def __init__(self, agent_id: str, name: str, role_type: str, depth: int) -> None:
         self.id = agent_id
@@ -87,6 +108,16 @@ class AgentView:
         # turns appears as 5 entries rather than one ephemeral overwritten
         # narration line. Capped to ACTIVITY_LOG_CAP.
         self.activity_log: list[dict[str, Any]] = []
+        # Running compaction telemetry mirroring agent.compaction_stats.
+        # Updated by compaction_end events so the focus panel can render a
+        # summary line ("compacted 3x, saved 12.4k tokens") rather than
+        # making the user count log entries.
+        self.compaction_count: int = 0
+        self.compaction_skipped: int = 0
+        self.compaction_failed: int = 0
+        self.compaction_tokens_saved: int = 0
+        self.compaction_messages_compacted: int = 0
+        self.compaction_duration_ms: float = 0.0
 
     def push_activity(self, kind: str, text: str, **extra: Any) -> None:
         entry: dict[str, Any] = {"ts": time.time(), "kind": kind, "text": text}
@@ -353,18 +384,15 @@ class TUI:
             view.last_tool = tool
             view.last_tool_args = args
             self.tool_calls_total += 1
-            # Truncate string values in tool_args at push time. The
-            # display path uses _short_args (40-char cap) anyway, so the
-            # full bytes were dead weight -- and with up to 200 entries
-            # per agent, an active worker doing many large
+            # Truncate string leaves anywhere in tool_args at push time.
+            # The display path uses _short_args (40-char cap) anyway, so
+            # the full bytes were dead weight -- and with up to 200
+            # entries per agent, an active worker doing many large
             # write_workspace calls held megabytes of redundant content
-            # per AgentView.
-            trimmed_args = {
-                k: (v[:200] + "…(truncated)")
-                if isinstance(v, str) and len(v) > 200
-                else v
-                for k, v in args.items()
-            }
+            # per AgentView. Recurses into nested dicts/lists so
+            # write_workspace.content (or any future nested-dict tool
+            # arg) doesn't slip past the trim.
+            trimmed_args = _trim_for_activity(args)
             view.push_activity("tool", tool, tool_args=trimmed_args)
             self._log(
                 f"[cyan]{_md_escape(view.name)}[/] -> "
@@ -486,12 +514,17 @@ class TUI:
                 f"{before} messages"
             )
         elif kind == "compaction_end":
-            dur_s = float(data.get("duration_ms", 0) or 0) / 1000.0
+            duration_ms = float(data.get("duration_ms", 0) or 0)
+            view.compaction_duration_ms += duration_ms
+            dur_s = duration_ms / 1000.0
             if data.get("success"):
                 before = data.get("before_messages", 0)
                 after = data.get("after_messages", 0)
                 before_tok = data.get("before_tokens", 0)
                 after_tok = data.get("after_tokens", 0)
+                view.compaction_count += 1
+                view.compaction_messages_compacted += max(0, before - after)
+                view.compaction_tokens_saved += max(0, before_tok - after_tok)
                 view.push_activity(
                     "compaction",
                     f"archivist: compacted {before}→{after} messages "
@@ -503,15 +536,23 @@ class TUI:
                     f"{before}→{after} messages"
                 )
             else:
-                err = data.get("error", "no-op")
+                # Agent sends `reason` (R76); fall back to `error` for
+                # older event-log entries.
+                reason = data.get("reason") or data.get("error") or "no detail"
+                # Distinguish structural skip vs transient failure from
+                # the reason prefix (compact_messages tags them).
+                if str(reason).startswith("transient:"):
+                    view.compaction_failed += 1
+                else:
+                    view.compaction_skipped += 1
                 view.push_activity(
                     "compaction",
-                    f"archivist: compaction failed ({dur_s:.1f}s): "
-                    f"{_trunc(str(err), 100)}",
+                    f"archivist: compaction skipped ({dur_s:.1f}s): "
+                    f"{_trunc(str(reason), 100)}",
                 )
                 self._log(
-                    f"[red]{_md_escape(view.name)} archivist compaction failed[/]: "
-                    f"{_md_escape(_trunc(str(err), 80))}"
+                    f"[yellow]{_md_escape(view.name)} archivist skipped[/]: "
+                    f"{_md_escape(_trunc(str(reason), 80))}"
                 )
 
     def _log(self, line: str) -> None:
@@ -761,7 +802,13 @@ class TUI:
             "compaction": ("blue", "ctx"),
         }
         style, label = prefix_style.get(kind, ("white", kind or "·"))
-        line.append(f"{label:>7} ", style=f"{style} dim")
+        # Right-justify using cell width (CJK / fullwidth chars count as 2)
+        # rather than character count, so the column stays aligned when
+        # labels include arrows / fullwidth glyphs (e.g. "↑" for follow_up
+        # has cell width 1 in most terminals; future labels with cell
+        # width 2 would otherwise drift the column).
+        label_pad = max(0, 7 - cell_len(label))
+        line.append((" " * label_pad) + label + " ", style=f"{style} dim")
         if kind == "tool":
             line.append(text, style=f"{style} bold")
             tool_args = entry.get("tool_args") or {}
@@ -835,6 +882,38 @@ class TUI:
             body_parts.append(Text(f"activity ({len(v.activity_log)}):", style="dim"))
             for entry in reversed(v.activity_log[-ACTIVITY_DISPLAY_CAP:]):
                 body_parts.append(self._format_activity_entry(entry))
+
+        # Compaction summary -- shown when this agent had to compact at
+        # least once. Lets the operator see "this worker burned 3
+        # archivist calls" without scrolling activity log for compaction
+        # entries.
+        if (
+            v.compaction_count
+            or v.compaction_skipped
+            or v.compaction_failed
+        ):
+            body_parts.append(Text(""))
+            line = Text()
+            line.append("context compaction: ", style="dim")
+            line.append(f"{v.compaction_count}", style="blue bold")
+            line.append(" ok", style="blue dim")
+            if v.compaction_skipped:
+                line.append(f"  {v.compaction_skipped}", style="yellow bold")
+                line.append(" skipped", style="yellow dim")
+            if v.compaction_failed:
+                line.append(f"  {v.compaction_failed}", style="red bold")
+                line.append(" failed", style="red dim")
+            if v.compaction_tokens_saved:
+                line.append(
+                    f"  · saved {_fmt_count(v.compaction_tokens_saved)} tokens",
+                    style="dim",
+                )
+            if v.compaction_duration_ms:
+                line.append(
+                    f"  · {v.compaction_duration_ms / 1000.0:.1f}s archivist time",
+                    style="dim",
+                )
+            body_parts.append(line)
 
         if v.follow_ups:
             body_parts.append(Text(""))
@@ -943,10 +1022,21 @@ class TUI:
                 self._build_log_panel(title_suffix=f"({len(self.recent_events)})")
             )
         else:
-            layout["body"].split_row(
-                Layout(name="focus", ratio=1),
-                Layout(name="tree", ratio=1),
-            )
+            # Narrow terminals: a 50/50 split_row gives each side ~25 cols,
+            # which collapses the tree column-overflow logic AND wraps the
+            # focus labels into noise. Stack vertically when the terminal
+            # can't comfortably support side-by-side panels.
+            term_width = self.console.size.width
+            if term_width < 70:
+                layout["body"].split_column(
+                    Layout(name="focus", ratio=2),
+                    Layout(name="tree", ratio=1),
+                )
+            else:
+                layout["body"].split_row(
+                    Layout(name="focus", ratio=1),
+                    Layout(name="tree", ratio=1),
+                )
             layout["body"]["focus"].update(self._build_focus())
             layout["body"]["tree"].update(
                 Panel(

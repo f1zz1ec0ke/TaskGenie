@@ -72,8 +72,13 @@ def _read_unblock_input(console: Console, prompt: str = "you > ") -> str | None:
     )
     try:
         response = console.input(f"[bold yellow]{prompt}[/] ").strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return None
+    # KeyboardInterrupt is intentionally NOT caught -- let it bubble to
+    # _drive_session's Ctrl+C handler so the snapshot+rc=130 contract
+    # holds at the input prompt too (R75). Otherwise the only escape
+    # from the prompt was typing 'abandon', which violates the
+    # "Ctrl+C anywhere saves state and exits" promise.
     if response.lower() in ABANDON_TOKENS:
         return None
     return response
@@ -108,8 +113,9 @@ def _read_answer_input(console: Console, options: list[str]) -> str | None:
     console.print(hint)
     try:
         response = console.input("[bold cyan]answer > [/] ").strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return None
+    # KeyboardInterrupt deliberately uncaught -- see _read_unblock_input.
     if response.lower() in ABANDON_TOKENS:
         return None
     if options and response.isdigit():
@@ -164,14 +170,19 @@ FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset"}
 
 def _read_followup_input(console: Console) -> str | None:
     """Prompt the user for a follow-up task or slash command after CEO
-    completes a turn. Returns None on EOF/Ctrl+C/empty input."""
+    completes a turn. Returns None on EOF/empty input.
+
+    KeyboardInterrupt is intentionally uncaught so the outer Ctrl+C
+    handler in `_drive_session` snapshots + returns 130 instead of
+    silently exiting the follow-up loop.
+    """
     console.print(
         "[dim]Type a follow-up task, or one of: "
         "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/][/]"
     )
     try:
         response = console.input("[bold cyan]you > [/] ").strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return None
     return response or None
 
@@ -199,11 +210,16 @@ def _reset_team(session: Session, ceo: Agent, console: Console) -> int:
         if agent.id == ceo.id:
             continue
         if agent.status != "fired":
-            agent.status = "fired"
-            BUS.publish(
-                Event("state", agent.id, agent.name, data={"status": "fired"})
-            )
+            # Use _set_status (not direct mutation + manual publish) so
+            # the transition goes through the same path as _tool_fire
+            # (R11) -- consistent event payload, future-proof for any
+            # side effects _set_status grows.
+            agent._set_status("fired", reason="user /reset")
             fired_count += 1
+        # GC from REGISTRY entirely so successive /resets don't grow
+        # state.json unbounded. The TUI's own self.agents view still
+        # has them and renders the "fired" filter, so no visual loss.
+        Agent.REGISTRY.pop(agent.id, None)
     ceo.children = []
     ceo.task_assignments = {}
     ceo.task_targets = {}
@@ -232,7 +248,11 @@ async def _print_status_panel(
     """Show the current agent tree + stats without giving a new task."""
     from rich.tree import Tree as RTree
 
-    if ceo.id not in Agent.REGISTRY:
+    # Verify the CEO instance is STILL the registered one (not just that
+    # the id is present). If anyone rebound REGISTRY[ceo.id] to a fresh
+    # Agent (e.g., a future feature that swaps the root), we'd be reading
+    # stale .children off a detached object.
+    if Agent.REGISTRY.get(ceo.id) is not ceo:
         console.print("[red]CEO is no longer in the registry.[/]")
         return
     root_label = f"[bold]{ceo.name}[/] [dim]{ceo.role_type}/{ceo.status}[/]"
@@ -621,6 +641,44 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                     border_style="green",
                 )
             )
+            followup = _read_followup_input(console)
+            if followup is None or followup == "/done":
+                console.print("[dim]Nothing changed.[/]")
+                return 0
+            session.mark_followup(followup)
+            _snapshot(session, ceo)
+            message = _build_followup_message(followup)
+        elif session.data.status in ("abandoned", "error"):
+            # Resuming a session that previously ended (user abandoned
+            # or it errored out). Don't pretend it's a regular blocker
+            # -- tell the user what happened, then offer a fresh
+            # follow-up. R61.
+            border = "red" if session.data.status == "error" else "yellow"
+            title = (
+                "Session previously errored"
+                if session.data.status == "error"
+                else "Session was abandoned"
+            )
+            # Try to surface the last error/abandon detail from history.
+            last_terminal = next(
+                (
+                    h for h in reversed(session.data.history)
+                    if h["kind"] in ("error", "abandoned")
+                ),
+                None,
+            )
+            detail = (
+                last_terminal.get("text", "")
+                if last_terminal
+                else ""
+            )
+            body = (
+                f"[bold]Status:[/] {session.data.status}\n"
+                + (f"[bold]Detail:[/] {detail}\n" if detail else "")
+                + "Give a follow-up task to pick the work back up, or "
+                "type [cyan]/done[/] to leave it as-is."
+            )
+            console.print(Panel(body, title=title, border_style=border))
             followup = _read_followup_input(console)
             if followup is None or followup == "/done":
                 console.print("[dim]Nothing changed.[/]")

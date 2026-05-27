@@ -91,15 +91,20 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
             if last_ts is None or ts > last_ts:
                 last_ts = ts
 
+        # bulk_load re-emits spawn/state/blocked events tagged with
+        # `replay=True` on resume so the live TUI can rebuild its tree.
+        # Persistent counters must NOT see them as fresh events --
+        # otherwise blockers_total/escalated_to_user double-count on
+        # every resume, and the per-agent AgentSummary would have been
+        # re-initialised (the first-spawn-wins guard below handles spawn
+        # specifically but `blocked` had its own counter to mis-bump).
+        if data.get("replay"):
+            continue
+
         if kind == "spawn" and aid:
-            # Resume re-publishes a `spawn` event for every rehydrated agent
-            # so live subscribers (the TUI) can rebuild their views. Stats,
-            # however, is computed by REPLAY of the persistent JSONL log,
-            # which now includes both the original and the replayed spawn.
-            # Reinitialising AgentSummary on the replay would wipe every
-            # counter accumulated before the resume; aggregate totals
-            # (incremented elsewhere) wouldn't reset, leaving the panel
-            # internally inconsistent. Keep the FIRST spawn only.
+            # Even with the `replay` filter above catching round-3 sessions,
+            # keep this first-spawn-wins guard for older event logs that
+            # don't tag replays.
             if aid not in agents:
                 agents[aid] = AgentSummary(
                     name=ev.get("agent_name") or aid,

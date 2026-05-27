@@ -25,6 +25,9 @@ EventKind = Literal[
     "compaction_start",
     "compaction_end",
 ]
+# Note: all kinds the agent emits via `_emit` should be in this Literal.
+# If you add a new emit call site, add the kind here too -- otherwise
+# the type checker requires `# type: ignore[arg-type]` at the call site.
 
 
 @dataclass

@@ -167,11 +167,14 @@ async def test_tool_diff_on_resume() -> None:
 
         # Cleanup the test mutations so other tests aren't poisoned.
         REGISTRY.unregister("_fake_new_tool")
-        from taskgenie.tools.work import register_builtin_work_tools
-        # Re-register exec_code (and the others, idempotent on already-registered fails).
-        # We unregistered only exec_code, so just re-register that one.
+        # Re-register exec_code with the CURRENT version. Hard-coding a
+        # stale "0.1" here polluted cross-test state -- any subsequent
+        # test inspecting the registry would see a fake older
+        # exec_code. Round-three confirmed exec_code is at version 0.3.
         from taskgenie.tools.work import _EXEC_CODE_SCHEMA, _exec_code
-        REGISTRY.register(_EXEC_CODE_SCHEMA, kind="work", version="0.1", dispatcher=_exec_code)
+        REGISTRY.register(
+            _EXEC_CODE_SCHEMA, kind="work", version="0.3", dispatcher=_exec_code
+        )
         print("[tool_diff_on_resume] OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -151,7 +151,7 @@ async def test_write_text_safe_refuses_symlink_at_leaf(tmp_path: Path) -> None:
 
     for mode in ("create", "overwrite", "append"):
         try:
-            _write_text_safe(leaf, "boom", mode)
+            _write_text_safe(leaf, base, "boom", mode)
         except (FileExistsError, OSError) as e:
             # Both are acceptable -- create gets EEXIST (the symlink IS
             # a file from open()'s POV); overwrite/append get ELOOP.
@@ -166,17 +166,27 @@ async def test_write_text_safe_refuses_symlink_at_leaf(tmp_path: Path) -> None:
 
 
 def test_safe_path_rejects_nul_byte(tmp_path: Path) -> None:
-    """R33: NUL bytes in paths should be rejected upfront rather than
-    surfacing as confusing OSError further down the stack."""
+    """R33: NUL bytes (and other control chars; R68) in paths should be
+    rejected upfront rather than surfacing as confusing OSError further
+    down the stack."""
     base = tmp_path / "scratch"
     base.mkdir()
     try:
         _safe_path(str(base), "foo\x00bar")
     except ValueError as e:
-        assert "NUL" in str(e), e
-        print("[safe_path_rejects_nul_byte] OK")
-        return
-    raise AssertionError("expected ValueError for NUL byte")
+        assert "control character" in str(e) and "\\x00" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for NUL byte")
+
+    # Round-three R68: newlines and other control chars are also rejected.
+    try:
+        _safe_path(str(base), "foo\nbar")
+    except ValueError as e:
+        assert "control character" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for newline in path")
+
+    print("[safe_path_rejects_nul_byte] OK")
 
 
 # ---------------------------------------------------------------------------

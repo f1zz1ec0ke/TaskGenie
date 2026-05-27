@@ -9,8 +9,10 @@ import asyncio
 import errno
 import json
 import os
+import re
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -28,7 +30,11 @@ _READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read a file from your scratch directory. Returns the file contents as a string.",
+        "description": (
+            "Read a file from your PRIVATE scratch directory -- no other agent "
+            "sees these. Returns the file contents as a string. For SHARED "
+            "deliverables, use read_workspace instead."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -46,7 +52,11 @@ _WRITE_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "Write content to a file in your scratch directory. Creates parent directories as needed.",
+        "description": (
+            "Write content to a file in your PRIVATE scratch directory -- no "
+            "other agent sees these. Creates parent directories as needed. "
+            "For SHARED deliverables, use write_workspace instead."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -217,17 +227,20 @@ _EXEC_WORKSPACE_SCHEMA = {
         "name": "exec_workspace",
         "description": (
             "Execute a short Python or shell snippet IN THE SHARED WORKSPACE directory "
-            "(CWD = workspace). Use this to run, test, or invoke deliverable files your "
-            "team produced via `write_workspace` -- e.g. `python game.py` to verify the "
-            "game launches, `pytest` to run a test suite, `node server.js`, etc. From "
-            "the snippet's POV, relative paths resolve against the workspace root, so "
-            "you can write portable commands without absolute paths.\n\n"
+            "(CWD = workspace). Use this for any work where the snippet must SEE or "
+            "PRODUCE shared deliverables:\n"
+            "  - run/test existing artifacts: `python game.py`, `pytest`, `node server.js`\n"
+            "  - generate scaffolding INTO workspace: `npm init -y`, `cookiecutter ...`, "
+            "`git clone ... .`, `cargo init`\n"
+            "Relative paths in your snippet resolve against the workspace root, so "
+            "portable commands just work.\n\n"
             "The mirror of `exec_code` (which runs in scratch). Same timeout, same "
-            "env-scrub semantics. State does NOT persist between calls. $TASKGENIE_SCRATCH "
-            "is exposed if your snippet also needs to write into scratch.\n\n"
-            "If your team has not produced any workspace files yet (no `write_workspace` "
-            "calls), this tool will run but the CWD will just be an empty directory -- "
-            "you probably want `exec_code` instead."
+            "env-scrub semantics. State does NOT persist between calls. Env vars "
+            "`$TASKGENIE_WORKSPACE` (the CWD's absolute path) and `$TASKGENIE_SCRATCH` "
+            "(your private dir) are BOTH exposed, so a snippet that reads from one and "
+            "writes to the other can.\n\n"
+            "Use `exec_code` instead when your snippet doesn't touch workspace at all "
+            "-- quick math, regex check, scratch-only file transform."
         ),
         "parameters": {
             "type": "object",
@@ -241,9 +254,16 @@ _EXEC_WORKSPACE_SCHEMA = {
 }
 
 
+_PATH_FORBIDDEN_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _safe_path(scratch_dir: str, rel_path: str) -> Path:
-    if "\x00" in rel_path:
-        raise ValueError(f"path contains NUL byte: {rel_path!r}")
+    bad = _PATH_FORBIDDEN_RE.search(rel_path)
+    if bad is not None:
+        raise ValueError(
+            f"path contains control character {bad.group()!r} (0x"
+            f"{ord(bad.group()):02x}): {rel_path!r}"
+        )
     base = Path(scratch_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
     target = (base / rel_path).resolve()
@@ -255,26 +275,117 @@ def _safe_path(scratch_dir: str, rel_path: str) -> Path:
     return target
 
 
-def _open_nofollow(p: Path, base_flags: int, perm: int = 0o600) -> int:
-    """`os.open(p, ...)` with O_NOFOLLOW added when supported.
+class _UnsafeOpenError(OSError):
+    """Raised by `_safe_open` when the post-open verification detects a
+    hardlink, a parent-component symlink traversal, or any other path
+    escape. Distinct from ELOOP (leaf symlink, caught by O_NOFOLLOW) so
+    dispatchers can produce a precise error message for the agent.
+    """
 
-    O_NOFOLLOW makes the open call FAIL with ELOOP if the leaf is a symlink,
-    closing the TOCTOU window between `_safe_path`'s .resolve() containment
-    check and the actual write. Without this, a symlink planted at the leaf
-    path between validation and write would redirect the write anywhere on
-    disk that the process can reach. Windows doesn't support symlinks
-    without admin and has no O_NOFOLLOW -- fall back to plain open there.
+
+def _safe_open(
+    p: Path, base: Path, base_flags: int, perm: int = 0o600
+) -> int:
+    """Open `p` defensively against the full path-safety attack surface:
+
+      1. Leaf symlink -- `O_NOFOLLOW` on the open call (kernel-level).
+      2. Hardlink -- after open, `fstat` the fd and refuse if
+         `st_nlink > 1`. `O_NOFOLLOW` does NOT cover this; a hardlink
+         shares an inode with another path but has its own dirent that
+         isn't a symlink, so the open succeeds.
+      3. Parent-component symlink (TOCTOU race where an attacker plants
+         `subdir` as a symlink between `_safe_path`'s validation and the
+         open) -- after open, read the fd's true path via
+         `/proc/self/fd/N` (Linux) and re-verify containment against
+         `base.resolve()`. `O_NOFOLLOW` only protects the LEAF, not
+         intermediate components, so the kernel happily traverses
+         `subdir -> /tmp` and opens `/tmp/file.txt`.
+
+    On non-Linux systems without `/proc/self/fd`, the parent-component
+    check is skipped; we still get hardlink + leaf-symlink protection.
+    Windows has no `O_NOFOLLOW` and no `st_nlink` semantics; the open
+    proceeds with whatever flags are available. (The threat model is
+    "operator runs TaskGenie on their own machine", so this is best-
+    effort hardening, not a security boundary.)
     """
     flags = base_flags
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
-    return os.open(str(p), flags, perm)
+
+    # Defer O_TRUNC until AFTER the post-open validation. If we let the
+    # kernel truncate at open time, a hardlink-to-/etc/passwd would be
+    # truncated to zero BEFORE we got a chance to refuse the write -- our
+    # "refused" return value would arrive with /etc/passwd already empty.
+    # The caller's `os.write` (or `ftruncate(fd, 0)` for overwrite) does
+    # the actual content change, after validation has cleared it.
+    defer_trunc = bool(flags & os.O_TRUNC)
+    if defer_trunc:
+        flags &= ~os.O_TRUNC
+    # If we're using O_CREAT|O_EXCL (mode='create'), the kernel atomically
+    # creates the file at the leaf BEFORE our post-open validation runs.
+    # If validation then rejects (e.g. parent symlink escaped), we want to
+    # rollback the create so we don't leave zero-byte detritus in the
+    # attacker-controlled location. Safe to unlink because EXCL guarantees
+    # WE created the file just now.
+    created_excl = bool(flags & os.O_EXCL) and bool(flags & os.O_CREAT)
+
+    fd = os.open(str(p), flags, perm)
+    try:
+        st = os.fstat(fd)
+        if hasattr(st, "st_nlink") and st.st_nlink > 1:
+            raise _UnsafeOpenError(
+                errno.EMLINK,
+                f"refused: {p!r} is a hardlink (st_nlink={st.st_nlink}); "
+                "multiple paths reference this inode, distrust for I/O",
+            )
+
+        # Parent-component TOCTOU re-check. /proc/self/fd/N gives the
+        # CANONICAL path of the open fd, after all symlink resolution.
+        # If it lands outside the base, the kernel followed a planted
+        # parent symlink between validation and open.
+        proc_link = f"/proc/self/fd/{fd}"
+        if os.path.exists(proc_link):
+            try:
+                actual = os.readlink(proc_link)
+            except OSError:
+                actual = None
+            if actual is not None:
+                actual_p = Path(actual)
+                base_resolved = Path(base).resolve()
+                if (
+                    actual_p != base_resolved
+                    and base_resolved not in actual_p.parents
+                ):
+                    raise _UnsafeOpenError(
+                        errno.ENOTRECOVERABLE
+                        if hasattr(errno, "ENOTRECOVERABLE")
+                        else errno.EACCES,
+                        f"refused: {p!r} resolves to {actual!r} which "
+                        f"escapes base {str(base_resolved)!r} (likely a "
+                        "parent-component symlink planted after validation)",
+                    )
+        # All checks passed -- now safe to apply the deferred truncate.
+        if defer_trunc:
+            os.ftruncate(fd, 0)
+    except BaseException:
+        if created_excl:
+            # Roll back the empty file we just atomically created via
+            # O_EXCL so the attacker-controlled location (if any) is
+            # left clean. Best-effort; ignore if unlink fails.
+            try:
+                os.unlink(str(p))
+            except OSError:
+                pass
+        os.close(fd)
+        raise
+
+    return fd
 
 
-def _write_text_safe(p: Path, content: str, mode: str) -> None:
-    """UTF-8 write that refuses to follow symlinks.
+def _write_text_safe(p: Path, base: Path, content: str, mode: str) -> None:
+    """UTF-8 write defended against symlink + hardlink + parent-TOCTOU.
 
     `mode` chooses the open semantics:
       - 'create'    -> O_CREAT|O_EXCL  (fails if exists, atomically)
@@ -290,7 +401,7 @@ def _write_text_safe(p: Path, content: str, mode: str) -> None:
     else:
         raise ValueError(f"unknown write mode: {mode!r}")
 
-    fd = _open_nofollow(p, flags)
+    fd = _safe_open(p, base, flags)
     try:
         data = content.encode("utf-8")
         view = memoryview(data)
@@ -301,10 +412,14 @@ def _write_text_safe(p: Path, content: str, mode: str) -> None:
         os.close(fd)
 
 
-def _read_text_safe(p: Path) -> str:
-    """UTF-8 read that refuses to follow symlinks. Raises FileNotFoundError
-    when `p` doesn't exist (caller maps to friendly tool error string)."""
-    fd = _open_nofollow(p, os.O_RDONLY)
+def _read_text_safe(p: Path, base: Path) -> str:
+    """UTF-8 read with the same safety guarantees as `_write_text_safe`.
+
+    Raises FileNotFoundError when `p` doesn't exist (caller maps to a
+    friendly tool error string); raises `_UnsafeOpenError` on hardlink
+    or parent-symlink traversal.
+    """
+    fd = _safe_open(p, base, os.O_RDONLY)
     try:
         chunks: list[bytes] = []
         while True:
@@ -317,33 +432,48 @@ def _read_text_safe(p: Path) -> str:
     return b"".join(chunks).decode("utf-8")
 
 
-def _symlink_refusal(label: str) -> str:
-    return (
-        f"ERROR: refused to follow symlink at {label!r}. "
-        "TaskGenie writes never traverse symlinks at the leaf path."
-    )
+def _path_safety_error(label: str, e: OSError) -> str | None:
+    """Map an OSError from `_safe_open` to a friendly agent-facing error
+    string, or None if it's not a path-safety error (caller should re-raise).
+    """
+    if isinstance(e, _UnsafeOpenError):
+        return f"ERROR: refused unsafe path at {label!r}: {e.strerror}"
+    if e.errno == errno.ELOOP:
+        return (
+            f"ERROR: refused to follow symlink at {label!r}. "
+            "TaskGenie writes never traverse symlinks at the leaf path."
+        )
+    return None
+
+
+def _scratch_base(agent: Any) -> Path:
+    return Path(agent.scratch_dir)
 
 
 async def _read_file(agent: Any, args: dict[str, Any]) -> str:
-    p = _safe_path(agent.scratch_dir, args["path"])
+    base = _scratch_base(agent)
+    p = _safe_path(str(base), args["path"])
     try:
-        return _read_text_safe(p)
+        return _read_text_safe(p, base)
     except FileNotFoundError:
         return f"ERROR: file does not exist: {args['path']}"
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            return _symlink_refusal(args["path"])
+        msg = _path_safety_error(args["path"], e)
+        if msg is not None:
+            return msg
         raise
 
 
 async def _write_file(agent: Any, args: dict[str, Any]) -> str:
-    p = _safe_path(agent.scratch_dir, args["path"])
+    base = _scratch_base(agent)
+    p = _safe_path(str(base), args["path"])
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _write_text_safe(p, args["content"], "overwrite")
+        _write_text_safe(p, base, args["content"], "overwrite")
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            return _symlink_refusal(args["path"])
+        msg = _path_safety_error(args["path"], e)
+        if msg is not None:
+            return msg
         raise
     return f"wrote {len(args['content'])} chars to {args['path']}"
 
@@ -356,60 +486,52 @@ def _workspace_or_error(agent: Any) -> Path | str:
     return base
 
 
+def _normalize_workspace_path(p: str) -> str:
+    """Canonicalise a workspace-relative path so `./game.py`, `game.py`,
+    and `dir/../game.py` all hash to the same key in `read_workspace_paths`."""
+    return os.path.normpath(p)
+
+
 async def _read_workspace(agent: Any, args: dict[str, Any]) -> str:
     base = _workspace_or_error(agent)
     if isinstance(base, str):
         return base
     p = _safe_path(str(base), args["path"])
     try:
-        text = _read_text_safe(p)
+        text = _read_text_safe(p, base)
     except FileNotFoundError:
         return f"ERROR: file does not exist in workspace: {args['path']}"
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            return _symlink_refusal(f"workspace/{args['path']}")
+        msg = _path_safety_error(f"workspace/{args['path']}", e)
+        if msg is not None:
+            return msg
         raise
     # Record so write_workspace(mode='overwrite') can warn the agent about
     # read-then-overwrite (lost-update anti-pattern) even after the
     # Archivist has compacted the original tool_call out of agent.messages.
+    # Normalised so `./foo` and `foo` are the same lookup key.
     paths = getattr(agent, "read_workspace_paths", None)
     if paths is not None:
-        paths.add(args["path"])
+        paths.add(_normalize_workspace_path(args["path"]))
     return text
 
 
 def _agent_read_workspace_paths(agent: Any) -> set[str]:
-    """Paths this agent has read from workspace this run.
+    """Paths this agent has read from workspace this run, as a normalised
+    set. Source of truth is `agent.read_workspace_paths` (populated by
+    `_read_workspace` on SUCCESSFUL reads only -- failed reads do NOT
+    populate). This is a persistent set that survives Archivist
+    compaction.
 
-    Unions two sources:
-      - `agent.read_workspace_paths` (the persistent set) -- survives
-        Archivist compaction.
-      - `agent.messages` scanned for `read_workspace` tool_calls --
-        catches paths read by agents without the field (test fakes,
-        very old rehydrated sessions) and is a defense-in-depth when
-        the set has been pruned for whatever reason.
-
-    Either source firing produces the lost-update warning; both being
-    empty produces no warning.
+    Before round-three we also scanned `agent.messages` for read_workspace
+    tool_calls; that union false-positived on FAILED reads (the message
+    scan saw the tool_call but not whether the response was an ERROR),
+    spuriously warning on fresh files.
     """
-    paths: set[str] = set()
     explicit = getattr(agent, "read_workspace_paths", None)
-    if explicit is not None:
-        paths.update(explicit)
-    for msg in getattr(agent, "messages", []):
-        if msg.get("role") != "assistant":
-            continue
-        for tc in msg.get("tool_calls", []) or []:
-            fn = tc.get("function", {})
-            if fn.get("name") != "read_workspace":
-                continue
-            try:
-                args = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(args.get("path"), str):
-                paths.add(args["path"])
-    return paths
+    if explicit is None:
+        return set()
+    return {_normalize_workspace_path(p) for p in explicit}
 
 
 async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
@@ -420,10 +542,11 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
     content = args["content"]
     mode = args.get("mode", "create")
+    norm_path = _normalize_workspace_path(args["path"])
 
     if mode == "create":
         try:
-            _write_text_safe(p, content, "create")
+            _write_text_safe(p, base, content, "create")
         except FileExistsError:
             return (
                 f"ERROR: workspace/{args['path']} already exists. "
@@ -432,8 +555,9 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
                 "mode='overwrite'."
             )
         except OSError as e:
-            if e.errno == errno.ELOOP:
-                return _symlink_refusal(f"workspace/{args['path']}")
+            msg = _path_safety_error(f"workspace/{args['path']}", e)
+            if msg is not None:
+                return msg
             raise
         return f"wrote (created) {len(content)} chars to workspace/{args['path']}"
 
@@ -443,12 +567,13 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
         # they're about to make the read+overwrite mistake. We still write
         # (overwrite is a legitimate sometimes-tool), but the warning steers
         # next-turn decisions toward edit_workspace.
-        previously_read = args["path"] in _agent_read_workspace_paths(agent)
+        previously_read = norm_path in _agent_read_workspace_paths(agent)
         try:
-            _write_text_safe(p, content, "overwrite")
+            _write_text_safe(p, base, content, "overwrite")
         except OSError as e:
-            if e.errno == errno.ELOOP:
-                return _symlink_refusal(f"workspace/{args['path']}")
+            msg = _path_safety_error(f"workspace/{args['path']}", e)
+            if msg is not None:
+                return msg
             raise
         msg = f"wrote (overwrote) {len(content)} chars to workspace/{args['path']}"
         if previously_read:
@@ -467,10 +592,11 @@ async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
         # writers may interleave. We document the limit in the schema rather
         # than block large appends.
         try:
-            _write_text_safe(p, content, "append")
+            _write_text_safe(p, base, content, "append")
         except OSError as e:
-            if e.errno == errno.ELOOP:
-                return _symlink_refusal(f"workspace/{args['path']}")
+            msg = _path_safety_error(f"workspace/{args['path']}", e)
+            if msg is not None:
+                return msg
             raise
         return f"appended {len(content)} chars to workspace/{args['path']}"
 
@@ -483,15 +609,16 @@ async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
         return base
     p = _safe_path(str(base), args["path"])
     try:
-        current = _read_text_safe(p)
+        current = _read_text_safe(p, base)
     except FileNotFoundError:
         return (
             f"ERROR: workspace/{args['path']} does not exist. "
             "Use `write_workspace(mode='create')` for a new file."
         )
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            return _symlink_refusal(f"workspace/{args['path']}")
+        msg = _path_safety_error(f"workspace/{args['path']}", e)
+        if msg is not None:
+            return msg
         raise
     old = args["old_text"]
     new = args["new_text"]
@@ -551,13 +678,44 @@ async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
     base = _workspace_or_error(agent)
     if isinstance(base, str):
         return base
-    files = sorted(p for p in base.rglob("*") if p.is_file())
-    if not files:
+    entries: list[tuple[str, str]] = []  # (relative_path, annotation)
+    symlinks: list[tuple[str, str]] = []
+    for p in sorted(base.rglob("*")):
+        rel = p.relative_to(base)
+        # Filter edit_workspace tempfiles -- they're internal artifacts
+        # only left behind by SIGKILL mid-edit; shouldn't pollute the
+        # agent's view of what they produced.
+        if p.name.endswith(".tg-edit-tmp"):
+            continue
+        # lstat avoids following symlinks; surface them explicitly so a
+        # planted link is visible rather than blending in as a regular
+        # file. Also recon-resistant -- the agent can't use list_workspace
+        # to confirm a planted symlink's target is readable.
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                target = os.readlink(str(p))
+            except OSError:
+                target = "?"
+            symlinks.append((str(rel), f"→ {target}"))
+            continue
+        if stat.S_ISREG(st.st_mode):
+            entries.append((str(rel), f"{st.st_size} bytes"))
+            continue
+        # Dirs / sockets / pipes / etc. are ignored for the listing.
+    if not entries and not symlinks:
         return "(workspace is empty)"
     lines = [f"workspace root: {base}"]
-    for p in files:
-        rel = p.relative_to(base)
-        lines.append(f"  {rel}  ({p.stat().st_size} bytes)")
+    for rel, annot in entries:
+        lines.append(f"  {rel}  ({annot})")
+    if symlinks:
+        lines.append("")
+        lines.append("symlinks (not opened by read/write tools):")
+        for rel, annot in symlinks:
+            lines.append(f"  {rel}  {annot}")
     return "\n".join(lines)
 
 
@@ -695,18 +853,22 @@ def scratch_for(agent_id: str, root: str | None = None) -> str:
 
 
 def register_builtin_work_tools() -> None:
+    # Order matters for the agent's reading: present scratch tools first
+    # (read/write/exec triplet on scratch), then the workspace tools
+    # (list/read/write/edit/exec quintet). Cross-references in tool
+    # descriptions resolve in reading order this way.
     REGISTRY.register(_READ_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_read_file)
     REGISTRY.register(_WRITE_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_write_file)
     REGISTRY.register(_EXEC_CODE_SCHEMA, kind="work", version="0.3", dispatcher=_exec_code)
+    # Workspace is shared across all agents in a session: workers write/edit/exec,
+    # managers and CEO read to verify deliverables.
+    REGISTRY.register(_LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace)
+    REGISTRY.register(_READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace)
+    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.1", dispatcher=_write_workspace)
+    REGISTRY.register(_EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace)
     REGISTRY.register(
         _EXEC_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_exec_workspace
     )
-    # Workspace is shared across all agents in a session: workers write/edit,
-    # managers and CEO read to verify deliverables.
-    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.1", dispatcher=_write_workspace)
-    REGISTRY.register(_EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace)
-    REGISTRY.register(_READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace)
-    REGISTRY.register(_LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace)
 
 
 register_builtin_work_tools()

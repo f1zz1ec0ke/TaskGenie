@@ -84,8 +84,16 @@ class MCPClient:
             # namespace with the server name.
             registered_name = f"{server_name}__{original_name}"
             if REGISTRY.get(registered_name) is not None:
+                # Append to per-server errors rather than clobbering. With
+                # multiple collisions per server, the previous code only
+                # surfaced the last one to the operator.
+                msg = (
+                    f"could not register {original_name}: "
+                    "name conflict even after prefixing"
+                )
+                prior = self._connect_errors.get(server_name)
                 self._connect_errors[server_name] = (
-                    f"could not register {original_name}: name conflict even after prefixing"
+                    f"{prior}; {msg}" if prior else msg
                 )
                 return
 
