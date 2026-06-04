@@ -28,10 +28,8 @@ LLM/token counters, and a chronological event stream.
 - **Recursive Agent primitive.** CEO, manager, and worker are the same
   class with different prompts and tool sets. The whole hierarchy
   collapses to one loop that calls itself.
-- **Multi-department CEO.** For multi-facet tasks ("build a game" → engine
-  + assets + polish + docs) the CEO hires several department managers
-  from the start and runs them in parallel. For single-chunk tasks one
-  manager is enough — the prompt teaches the call.
+- **Multi-department CEO.** For multi-facet tasks the CEO hires several department managers
+  from the start and runs them in parallel.
 - **Required Reviewer pattern.** Every team that produces a synthesis
   hires a dedicated Reviewer worker whose job is to honestly critique
   the team's output. Manager iterates until Reviewer signs off, then
@@ -39,12 +37,11 @@ LLM/token counters, and a chronological event stream.
 - **Shared deliverable workspace.** Workers produce real files via
   `write_workspace(path, content)` (create-by-default with explicit
   modes for overwrite/append) and modify them via
-  `edit_workspace(path, old_text, new_text)` — surgical edits with
+  `edit_workspace(path, old_text, new_text)` surgical edits with
   optimistic-concurrency conflict detection. Files land in a friendly
-  `./TaskGenie/<project>/` directory in the user's cwd, NOT buried in
-  session metadata.
+  `./TaskGenie/<project>/` directory in the user's cwd.
 - **Async parallel siblings.** A manager fans out by calling `assign`
-  N times, then one `await_results` gathers them. Each level chooses
+  N times, then one `await_results` gathers them, each level chooses
   its own fan-out.
 - **First-class blockers.** Any agent can `report_blocker(reason,
   needs, partial_progress)`. The blocker propagates up; each level can
@@ -52,9 +49,8 @@ LLM/token counters, and a chronological event stream.
   blockers prompt the user for guidance and the CEO resumes with full
   message history intact.
 - **Mid-task user questions.** The CEO can call `ask_user(question,
-  options, context)` to clarify ambiguities (output format, scope,
-  audience) BEFORE wasting work on the wrong interpretation. Distinct
-  from blockers — "I could guess but cheaper to ask now."
+  options, context)` to clarify ambiguities before working on the wrong
+  interpretation.
 - **Bottom-up follow-up suggestions.** Workers and managers can call
   `suggest_follow_up(what, rationale)` mid-run to flag adjacent work
   they noticed. The suggestion rides up with their final report; the
@@ -65,15 +61,8 @@ LLM/token counters, and a chronological event stream.
   changed, and work continues. `taskgenie --list` shows all sessions.
 - **Live TUI.** Two-screen layout with a persistent header strip
   (agent counts by status, LLM calls, tokens up/down, tool calls,
-  elapsed). **Screen 1** splits the focus pane (the most-recent agent's
-  full per-turn activity log — narrations, tool calls, hires,
-  reviews — accumulating as it works, plus a "thinking Ns…" liveness
-  timer when the LLM is mid-call) and the hierarchy (every manager,
-  every worker, with the spotlight worker's narration highlighted).
-  **Screen 2** gives the scrolling event log the whole canvas.
-  Press `Tab` to swap screens, or `1` / `2` to pin one. Keybindings
-  fall back to no-ops when stdout isn't a terminal.
-- **MCP client built in.** Drop a standard `mcp.json` (Claude Desktop /
+  elapsed).
+- **MCP client built in.** copy `mcp.example.json` (Claude Desktop /
   Cursor / LM Studio format) at the project root and TaskGenie spawns
   each server as a subprocess and surfaces its tools to workers
   automatically.
@@ -83,9 +72,9 @@ LLM/token counters, and a chronological event stream.
   (private), `exec_workspace` to actually run/test deliverables they
   produced (e.g. `python game.py`). `$TASKGENIE_WORKSPACE` /
   `$TASKGENIE_SCRATCH` are exposed in both so cross-dir snippets work.
-  Not a security sandbox — Docker isolation will land as an opt-in
-  backend (but i'm not doing it so make a pr if you want this fr).
-- **Context-window management.** Each agent runs an "Archivist" pass
+  Not a security sandbox. Run this in a VM. (Docker isolation will land as an opt-in
+  backend, but i'm not doing it so make a pr if you want this fr).
+- **Dynamic Context-window management.** Each agent runs an "Archivist" pass
   before any LLM call that would cross
   `TASKGENIE_COMPACT_AT_PCT * TASKGENIE_CTX_WINDOW`. The Archivist is
   a one-shot LLM summarisation that compresses the middle band of the
@@ -113,7 +102,7 @@ LLM/token counters, and a chronological event stream.
   deterministic stats panel reports agent counts by role, blockers
   (resolved internally vs escalated), reviews accepted/rejected,
   user questions, follow-ups raised, total LLM calls, total token
-  usage, tool calls, wall time — complemented by the CEO's
+  usage, tool calls, wall time, complemented by the CEO's
   qualitative "Process retrospective" section in the final report.
 
 ## Requirements
@@ -122,7 +111,7 @@ LLM/token counters, and a chronological event stream.
 - An OpenAI-compatible local endpoint (LM Studio, vLLM, llama.cpp
   server, etc.) with a tool-calling-capable model loaded.
 - (Tool calling) `npx` / `uvx` available on PATH if you want the default
-  MCP servers (Brave search via Node, Fetch via Python). An error message can briefly be seen on load if any tool fails to load. Be sure to disable tools in your local endpoint, let TaskGenie handle tools, configure mcp.json. 
+  MCP servers (Brave search via Node, Fetch via Python). An error message can briefly be seen on load if any tool fails to load. Highly recommended, also a brave api key is free.  
 
 ## Install
 
@@ -220,7 +209,7 @@ Set `TASKGENIE_PROJECTS_DIR` to change the `./TaskGenie/` root.
 | `TASKGENIE_CTX_WINDOW` | `128000` | Model context-window budget (tokens) the Archivist plans against |
 | `TASKGENIE_COMPACT_AT_PCT` | `0.6` | Fraction of `CTX_WINDOW` that triggers a pre-call compaction |
 | `TASKGENIE_COMPACT_KEEP_RECENT` | `3` | Most-recent messages preserved verbatim through a compaction |
-| `TASKGENIE_DUMP_OVER_BYTES` | `16384` | Tool replies larger than this are written to scratch; the in-memory message becomes a one-line pointer |
+| `TASKGENIE_DUMP_OVER_BYTES` | `131072` | +- 40k tokens. Tool replies larger than this are written to scratch; the in-memory message becomes a one-line pointer |
 | `TASKGENIE_DATA_DIR` | `.taskgenie` | Sessions, scratch, and event logs root |
 | `TASKGENIE_PROJECTS_DIR` | `TaskGenie` | Project (deliverables) directory root |
 | `TASKGENIE_MCP_CONFIG` | `./mcp.json` | Path to MCP server config |
@@ -327,14 +316,11 @@ tests/
   **Things to Note**:
   - `exec_code` / `exec_workspace` run real subprocesses with a
     timeout and an env scrub but are **not a security sandbox**.
-    Docker-backed isolation is an opt-in we'll add later if someone
-    runs this in an environment where the agent's network access
-    matters.
+    Run this in a VM for safety.
   - The MCP client uses stdio transport only (no HTTP MCP yet).
   - No sound/APU emulation work, no Docker, no native binary builds.
-- **Known limitations covered in `REVIEW_NOTES.md`** (deliberately
-  deferred to a focused future PR, not surprises): bus queues are
-  unbounded; `task_assignments` cleanup on cancelled child tasks is
+- **Known limitations** 
+  bus queues areunbounded; `task_assignments` cleanup on cancelled child tasks is
   best-effort (`_drain_pending_assignments` sweeps at `run()` exit);
   `_ColumnOverflowTree` may over-truncate very long agent labels at
   very narrow terminal widths.
