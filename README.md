@@ -84,7 +84,7 @@ LLM/token counters, and a chronological event stream.
   produced (e.g. `python game.py`). `$TASKGENIE_WORKSPACE` /
   `$TASKGENIE_SCRATCH` are exposed in both so cross-dir snippets work.
   Not a security sandbox — Docker isolation will land as an opt-in
-  backend.
+  backend (but i'm not doing it so make a pr if you want this fr).
 - **Context-window management.** Each agent runs an "Archivist" pass
   before any LLM call that would cross
   `TASKGENIE_COMPACT_AT_PCT * TASKGENIE_CTX_WINDOW`. The Archivist is
@@ -94,7 +94,7 @@ LLM/token counters, and a chronological event stream.
   Out-of-band tool outputs over `TASKGENIE_DUMP_OVER_BYTES` are
   written to scratch and replaced inline with a one-line pointer the
   agent can `read_file` if needed. Together these keep long-running
-  workers (the new `max_turns=1000` default) from blowing the model's
+  workers (the `max_turns=1000` default) from blowing the model's
   context budget.
   When the child completes, the parent's `await_results` reply
   carries a `compaction` field (count / skipped / failed /
@@ -121,8 +121,8 @@ LLM/token counters, and a chronological event stream.
 - Python 3.11+
 - An OpenAI-compatible local endpoint (LM Studio, vLLM, llama.cpp
   server, etc.) with a tool-calling-capable model loaded.
-- (optional) `npx` / `uvx` available on PATH if you want the example
-  MCP servers (Brave search via Node, Fetch via Python).
+- (Tool calling) `npx` / `uvx` available on PATH if you want the default
+  MCP servers (Brave search via Node, Fetch via Python). An error message can briefly be seen on load if any tool fails to load. Be sure to disable tools in your local endpoint, let TaskGenie handle tools, configure mcp.json. 
 
 ## Install
 
@@ -227,7 +227,7 @@ Set `TASKGENIE_PROJECTS_DIR` to change the `./TaskGenie/` root.
 
 ## MCP config (`mcp.json`)
 
-Standard Claude Desktop / Cursor / LM Studio format:
+Standard format:
 
 ```json
 {
@@ -322,9 +322,9 @@ tests/
 ## Status
 
 - The features listed above are implemented, exercised by the test
-  files inventoried just above, and reviewed across three rounds of
-  multi-agent code review (notes in `REVIEW_NOTES.md`). What's
-  **explicitly NOT a goal** for v1:
+  files inventoried just above.
+
+  **Things to Note**:
   - `exec_code` / `exec_workspace` run real subprocesses with a
     timeout and an env scrub but are **not a security sandbox**.
     Docker-backed isolation is an opt-in we'll add later if someone
@@ -338,7 +338,7 @@ tests/
   best-effort (`_drain_pending_assignments` sweeps at `run()` exit);
   `_ColumnOverflowTree` may over-truncate very long agent labels at
   very narrow terminal widths.
-- Per-role LLM temperatures are not yet supported — use whatever your
+- Per-role LLM temperatures are not supported, use whatever your
   model lab recommends as a single value.
 - The tree pane caps at 10 workers per manager + 10 sub-managers per
   parent with `…+N more` overflow lines; pathological fan-outs beyond

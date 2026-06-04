@@ -15,8 +15,8 @@ blowing through their model's context window. Two complementary tools:
    so a single chokepoint covers everything. Agents who need the full
    text later can `read_file` the pointer.
 
-A 4-char-per-token heuristic over-estimates a bit (real tokens average
-~3.5 chars in English, less for code), which is fine for a safety
+A 3-char-per-token heuristic optimises for code a bit (tokens average
+~3.5-4 chars in English, less for code), which is fine for a safety
 budget. The compaction threshold is set conservatively (80% of the
 window by default) so the slack absorbs heuristic error.
 """
@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-CHARS_PER_TOKEN = 4  # heuristic; tune downward if compaction never fires
+CHARS_PER_TOKEN = 3  # heuristic; tune as needed
 
 
 def count_tokens(messages: list[dict[str, Any]]) -> int:
@@ -80,33 +80,40 @@ def dump_large_tool_result(
     call_id: str,
     tool_name: str,
     threshold_bytes: int,
-) -> tuple[str, str | None]:
-    """If `result_str` exceeds `threshold_bytes`, write it to scratch and
-    return a (pointer_string, file_path) tuple. Otherwise return
-    (result_str, None) unchanged.
-
-    The pointer tells the agent (a) what tool produced this output,
-    (b) where it lives on disk, and (c) how to get the full text via
-    `read_file`. Format is stable so the agent's prompt can mention it.
-    """
+    chunk_margin: int = 4096,
+) -> tuple[str, list[str] | None]:
     if not result_str or len(result_str) <= threshold_bytes:
         return result_str, None
 
     Path(scratch_dir).mkdir(parents=True, exist_ok=True)
     safe_call = _SAFE_NAME_RE.sub("", call_id)[:24] or "x"
     safe_tool = _SAFE_NAME_RE.sub("", tool_name)[:24] or "tool"
-    # Append a short hash of the full call_id so two tool_calls in the
-    # same turn whose ids differ only beyond char 24 (or after non-alnum
-    # sanitisation) don't collide on the same filename and overwrite each
-    # other's dump.
     call_hash = hashlib.sha1(call_id.encode("utf-8")).hexdigest()[:8]
-    filename = f"tool-t{turn_idx}-{safe_tool}-{safe_call}-{call_hash}.log"
-    target = Path(scratch_dir) / filename
-    target.write_text(result_str, encoding="utf-8")
-    bytes_kb = max(1, len(result_str) // 1024)
+    base = f"tool-t{turn_idx}-{safe_tool}-{safe_call}-{call_hash}"
+
+    chunk_size = max(1, threshold_bytes - chunk_margin)
+    chunks = [result_str[i:i + chunk_size]
+              for i in range(0, len(result_str), chunk_size)]
+    n = len(chunks)
+    width = len(str(n))
+
+    paths: list[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        filename = f"{base}-{idx:0{width}d}.log"
+        target = Path(scratch_dir) / filename
+        target.write_text(chunk, encoding="utf-8")
+        paths.append(str(target))
+
+    total_kb = max(1, len(result_str) // 1024)
+    part_names = [f"{base}-{i:0{width}d}.log" for i in range(1, n + 1)]
+    if n <= 12:
+        how = "the parts in order: " + ", ".join(repr(p) for p in part_names)
+    else:
+        how = (f"{n} parts, {part_names[0]!r} through {part_names[-1]!r} "
+               f"(part k is '{base}-<k>.log', zero-padded to {width} digits)")
     pointer = (
-        f"[tool output dumped: {bytes_kb}KB from {tool_name!r}; "
-        f"full content saved to scratch file {filename!r}. "
-        f"Call `read_file(path={filename!r})` to retrieve it.]"
+        f"[tool output dumped: {total_kb}KB from {tool_name!r}, too large to "
+        f"inline; split into {how}. Call `read_file` on each part in order and "
+        f"concatenate the results to reconstruct the full output.]"
     )
-    return pointer, str(target)
+    return pointer, paths

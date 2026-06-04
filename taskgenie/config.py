@@ -39,9 +39,9 @@ class Config:
     # Default ctx_window matches Claude 3.5+ / many local models; smaller
     # models should override via TASKGENIE_CTX_WINDOW.
     ctx_window_tokens: int = _env_int("TASKGENIE_CTX_WINDOW", 128000)
-    compact_at_pct: float = _env_float("TASKGENIE_COMPACT_AT_PCT", 0.6)
+    compact_at_pct: float = _env_float("TASKGENIE_COMPACT_AT_PCT", 0.8)
     compact_keep_recent: int = _env_int("TASKGENIE_COMPACT_KEEP_RECENT", 3)
-    dump_tool_output_above_bytes: int = _env_int("TASKGENIE_DUMP_OVER_BYTES", 16384)
+    dump_tool_output_above_bytes: int = _env_int("TASKGENIE_DUMP_OVER_BYTES", 131072)
     data_dir: str = _env("TASKGENIE_DATA_DIR", ".taskgenie")
     mcp_config_path: str = _env("TASKGENIE_MCP_CONFIG", "./mcp.json")
 

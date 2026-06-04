@@ -24,7 +24,7 @@ You will receive ONE task from the user. Follow this loop:
        * "Write a poem about cats" -> one Writing-Mgr.
    When in doubt, prefer FEWER top-level managers — you can always hire a sibling \
    department later at step 5 once you see what the first team uncovers. But when the \
-   facets are obvious from the start, spinning them up in parallel saves wall time \
+   facets are obvious from the start, spinning up many managers in parallel saves wall time \
    and lets teams cross-pollinate via their reports.
    For EACH manager you hire: write a tailored, specific role prompt that names \
    their domain, the deliverable you want, how to organize their team, and (for \
@@ -325,7 +325,7 @@ chain produces a confidently wrong answer.
 
 Your honest "I couldn't" is worth more to the chain than a fake "I did."
 
-You do real work — you do not hire others. The exact set of tools available to you \
+You do real work. The exact set of tools available to you \
 is shown in your tool list; inspect it before planning. The kinds of tools typically \
 available include:
 
@@ -336,7 +336,7 @@ available include:
   CONTEXT MANAGEMENT: when a previous tool produced a lot of output (a big \
   file read, a long exec_code stdout, etc.), it may have been replaced in \
   your message history with a one-line pointer like `[tool output dumped: \
-  47KB from 'exec_code'; full content saved to scratch file \
+  220KB from 'exec_code'; full content saved to scratch file \
   'tool-t14-exec_code-call_xyz.log'. Call read_file(path='tool-...') to \
   retrieve it.]` The original output is on disk in your scratch. Call \
   `read_file` with the named filename ONLY if you need to consult the \
