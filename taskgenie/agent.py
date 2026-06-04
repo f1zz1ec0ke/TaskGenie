@@ -705,7 +705,7 @@ class Agent:
                     # read_workspace/exec_code output from dominating the
                     # context window. The full text remains retrievable
                     # via read_file.
-                    stored_content, dumped_path = dump_large_tool_result(
+                    stored_content, dumped_paths = dump_large_tool_result(
                         result_str,
                         self.scratch_dir,
                         _turn,
@@ -720,12 +720,12 @@ class Agent:
                             "content": stored_content,
                         }
                     )
-                    if dumped_path:
+                    if dumped_paths:
                         self._emit(
                             "tool_result",
                             tool=name,
                             result=stored_content,
-                            dumped_path=dumped_path,
+                            dumped_paths=dumped_paths,
                             original_bytes=len(result_str),
                         )
                     else:
