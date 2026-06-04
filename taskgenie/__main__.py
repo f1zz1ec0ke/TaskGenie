@@ -292,7 +292,7 @@ def _emit_json_result(
     print(json.dumps(obj, indent=2), file=sys.stdout)
 
 
-FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset"}
+FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset", "/export"}
 
 
 def _read_followup_input(console: Console) -> str | None:
@@ -305,7 +305,7 @@ def _read_followup_input(console: Console) -> str | None:
     """
     console.print(
         "[dim]Type a follow-up task, or one of: "
-        "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/][/]"
+        "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/] [cyan]/export[/][/]"
     )
     try:
         response = console.input("[bold cyan]you > [/] ").strip()
@@ -643,6 +643,24 @@ async def _drive_session(
                     await _reset_team(session, ceo, console)
                     _snapshot(session, ceo)
                     continue  # back to prompt; next non-command input is the fresh task
+                if raw == "/export":
+                    project_dir = session.project_dir
+                    if not project_dir.exists() or not any(project_dir.iterdir()):
+                        console.print(
+                            "[yellow]/export:[/] project directory is empty, nothing to export."
+                        )
+                        continue
+                    try:
+                        archive_path = shutil.make_archive(
+                            str(project_dir), "zip", root_dir=str(project_dir.parent),
+                            base_dir=project_dir.name,
+                        )
+                        console.print(
+                            f"[green]/export:[/] created [bold]{archive_path}[/]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]/export failed:[/] {e}")
+                    continue
                 if raw.startswith("/"):
                     console.print(
                         f"[yellow]Unknown command:[/] {raw}. "
@@ -1150,6 +1168,54 @@ def _show_stats(session_id: str) -> int:
     return 0
 
 
+def _show_tree(session_id: str) -> int:
+    """Print the agent hierarchy for a past session and exit."""
+    from rich.tree import Tree as RTree
+
+    console = Console()
+    try:
+        session = Session.load(session_id)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/]")
+        return 1
+    agents = session.data.agents
+    if not agents:
+        console.print(f"[dim]No agents recorded in session:[/] {session_id}")
+        return 0
+    ceo_id = session.data.ceo_id
+    if ceo_id and ceo_id in agents:
+        root_data = agents[ceo_id]
+    else:
+        # Fall back to first agent without a parent.
+        root_data = next(
+            (a for a in agents.values() if not a.get("parent_id")),
+            None,
+        )
+    if root_data is None:
+        console.print("[red]Cannot determine root agent.[/]")
+        return 1
+
+    def _label(a: dict) -> str:
+        return (
+            f"[bold]{a['name']}[/]  "
+            f"[dim]{a.get('role_type', '?')}/{a.get('status', '?')}[/]"
+        )
+
+    rtree = RTree(_label(root_data))
+
+    def _walk(parent_node, agent_data: dict) -> None:
+        for child_id in agent_data.get("child_ids", []):
+            child_data = agents.get(child_id)
+            if child_data is None:
+                continue
+            node = parent_node.add(_label(child_data))
+            _walk(node, child_data)
+
+    _walk(rtree, root_data)
+    console.print(Panel(rtree, title="Agent hierarchy", border_style="cyan"))
+    return 0
+
+
 def cli() -> None:
     setup_logging(getattr(CONFIG, "log_level", "WARNING"))
 
@@ -1159,6 +1225,7 @@ def cli() -> None:
   taskgenie --list                          # list all sessions
   taskgenie --list --filter "game"          # search sessions
   taskgenie --stats <session-id>            # view past run stats
+  taskgenie --tree <session-id>             # view agent hierarchy
   taskgenie --delete <session-id>           # delete a session
   taskgenie --delete <session-id> --force   # delete without confirmation
 """
@@ -1206,6 +1273,13 @@ def cli() -> None:
         default=None,
         metavar="SESSION_ID",
         help="Show the run stats panel for a past session without resuming it.",
+    )
+    parser.add_argument(
+        "--tree",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help="Print the agent hierarchy for a past session and exit.",
     )
     parser.add_argument(
         "-o",
@@ -1268,6 +1342,10 @@ def cli() -> None:
     if args.stats is not None:
         sys.exit(_show_stats(args.stats))
 
+    # --tree: early return
+    if args.tree is not None:
+        sys.exit(_show_tree(args.tree))
+
     if args.list:
         sys.exit(_list_sessions(filter_text=args.filter))
 
@@ -1285,7 +1363,7 @@ def cli() -> None:
         )
 
     if not args.task:
-        parser.error("provide a task, --resume, --list, --stats, or --delete")
+        parser.error("provide a task, --resume, --list, --stats, --tree, or --delete")
     task = " ".join(args.task)
     sys.exit(
         asyncio.run(

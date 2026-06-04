@@ -68,6 +68,9 @@ taskgenie --resume 2026-05-25-build-a-physics-game-e9bc
 # View stats for a past session
 taskgenie --stats <session-id>
 
+# View the agent hierarchy for a past session
+taskgenie --tree <session-id>
+
 # Delete a session
 taskgenie --delete <session-id>
 
@@ -86,7 +89,7 @@ When the CEO completes, you stay in the session:
 > you > make the level harder, double the ball pit count
 ```
 
-Commands: `/done`, `/status`, `/retry`, `/reset`.
+Commands: `/done`, `/status`, `/retry`, `/reset`, `/export`.
 
 ### TUI keyboard shortcuts
 

@@ -72,6 +72,8 @@ def _is_context_length_error(exc: Exception) -> bool:
 
 
 class Agent:
+    """Recursive agent: CEO, manager, and worker are all this class with different prompts/tools."""
+
     REGISTRY: dict[str, "Agent"] = {}
     # Optional scratch root injected by the active session; if None, falls back
     # to CONFIG.scratch_dir-derived behaviour.
@@ -487,6 +489,7 @@ class Agent:
     _TERMINAL_KINDS = frozenset({"done", "error", "exhausted"})
 
     async def run(self, task: str) -> RunResult:
+        """Execute the agent loop: narrate, call LLM, dispatch tools, repeat until terminal."""
         logger.debug(f"Agent {self.name} starting run")
         self.messages.append({"role": "user", "content": task})
         self._set_status("working", task=task)
