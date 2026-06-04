@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -20,6 +21,8 @@ from taskgenie.prompts import manager_prompt, worker_prompt
 from taskgenie.result import RunResult
 from taskgenie.tools import REGISTRY
 from taskgenie.tools.work import scratch_for
+
+logger = logging.getLogger(__name__)
 
 RoleType = Literal["ceo", "manager", "worker"]
 Status = Literal["idle", "working", "done", "blocked", "fired", "exhausted", "error"]
@@ -124,6 +127,8 @@ class Agent:
             "tokens_saved": 0,         # cumulative token reduction on success
             "duration_ms": 0.0,        # cumulative archivist LLM time
         }
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
         self.scratch_dir = scratch_for(self.id, root=Agent.SCRATCH_ROOT)
         self.workspace_dir = Agent.WORKSPACE_ROOT
         Agent.REGISTRY[self.id] = self
@@ -160,6 +165,8 @@ class Agent:
             "read_workspace_paths": sorted(self.read_workspace_paths),
             "compaction_floor": self._compaction_floor,
             "compaction_stats": dict(self.compaction_stats),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
         }
 
     @classmethod
@@ -198,6 +205,8 @@ class Agent:
             "tokens_saved": int(saved_stats.get("tokens_saved", 0)),
             "duration_ms": float(saved_stats.get("duration_ms", 0.0)),
         }
+        agent.prompt_tokens = d.get("prompt_tokens", 0)
+        agent.completion_tokens = d.get("completion_tokens", 0)
         agent.scratch_dir = d["scratch_dir"]
         agent.workspace_dir = Agent.WORKSPACE_ROOT
         cls.REGISTRY[agent.id] = agent
@@ -395,6 +404,7 @@ class Agent:
             self._compaction_floor = len(self.messages)
             new_messages_len = len(new_messages)
             after_tokens = count_tokens(self.messages)
+            logger.info(f"Agent {self.name} compaction: {before} -> {new_messages_len} messages")
             end_payload.update(
                 success=True,
                 after_messages=new_messages_len,
@@ -477,6 +487,7 @@ class Agent:
     _TERMINAL_KINDS = frozenset({"done", "error", "exhausted"})
 
     async def run(self, task: str) -> RunResult:
+        logger.debug(f"Agent {self.name} starting run")
         self.messages.append({"role": "user", "content": task})
         self._set_status("working", task=task)
 
@@ -505,8 +516,19 @@ class Agent:
             if result is None or result.kind in self._TERMINAL_KINDS:
                 await self._drain_pending_assignments()
 
+    def _model_override(self) -> str | None:
+        """Return the role-based model override for this agent, or None."""
+        if self.role_type == "ceo" and CONFIG.ceo_model:
+            return CONFIG.ceo_model
+        if self.role_type == "manager" and CONFIG.manager_model:
+            return CONFIG.manager_model
+        if self.role_type == "worker" and CONFIG.worker_model:
+            return CONFIG.worker_model
+        return None
+
     async def _run_loop(self) -> RunResult:
         empty_turn_count = 0
+        model_override = self._model_override()
         for _turn in range(CONFIG.max_turns_per_agent):
             # Pre-call compaction: if we're approaching the context
             # window, summarise older messages via the Archivist BEFORE
@@ -515,13 +537,14 @@ class Agent:
             await self._maybe_compact()
 
             try:
-                response = await LLM.chat(self.messages, tools=self.tools)
+                response = await LLM.chat(self.messages, tools=self.tools, model_override=model_override)
             except Exception as e:
                 # Reactive recovery: if the API said we exceeded the
                 # context window, force a compaction and retry ONCE. The
                 # heuristic in count_tokens occasionally under-counts a
                 # heavy tool_result so this path catches the long tail.
                 if _is_context_length_error(e):
+                    logger.warning(f"Agent {self.name} context length error, attempting recovery")
                     self._emit(
                         "error",
                         message=(
@@ -531,7 +554,7 @@ class Agent:
                     compacted = await self._maybe_compact(force=True)
                     if compacted:
                         try:
-                            response = await LLM.chat(self.messages, tools=self.tools)
+                            response = await LLM.chat(self.messages, tools=self.tools, model_override=model_override)
                         except Exception as e2:
                             self._set_status("error", error=str(e2))
                             self._emit(
@@ -555,6 +578,7 @@ class Agent:
                             error=f"{self.name} LLM failure: {e}",
                         )
                 else:
+                    logger.error(f"Agent {self.name} LLM failure: {e}")
                     self._set_status("error", error=str(e))
                     self._emit("error", message=f"LLM call failed: {e}")
                     return self._result(
@@ -568,6 +592,24 @@ class Agent:
                 completion_tokens=usage.get("completion_tokens", 0),
                 duration_ms=response.get("duration_ms", 0.0),
             )
+
+            # Accumulate per-agent token usage (cumulative across run() calls).
+            self.prompt_tokens += usage.get("prompt_tokens", 0)
+            self.completion_tokens += usage.get("completion_tokens", 0)
+
+            # Check session token budget (if configured)
+            if CONFIG.max_session_tokens > 0:
+                # Sum all agents' tokens from the registry
+                total = sum(
+                    a.prompt_tokens + a.completion_tokens
+                    for a in Agent.REGISTRY.values()
+                )
+                if total > CONFIG.max_session_tokens:
+                    self._set_status("error", error="Session token budget exceeded")
+                    return self._result(
+                        kind="error",
+                        error=f"Session token budget of {CONFIG.max_session_tokens} tokens exceeded (used {total})",
+                    )
 
             content = response.get("content", "") or ""
             tool_calls = response.get("tool_calls", []) or []

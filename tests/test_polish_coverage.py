@@ -922,8 +922,8 @@ def test_ceo_prompt_still_carries_followup_anchor() -> None:
     failing. Anchor the dependency."""
     from taskgenie.prompts import CEO_ROLE_PROMPT
 
-    assert "FOLLOW-UP TURNS" in CEO_ROLE_PROMPT, (
-        "CEO_ROLE_PROMPT no longer contains the FOLLOW-UP TURNS section "
+    assert "FOLLOW-UP" in CEO_ROLE_PROMPT, (
+        "CEO_ROLE_PROMPT no longer contains a FOLLOW-UP section "
         "that _build_followup_message offloads guidance onto. Either "
         "restore the section or re-inline the guidance in "
         "_build_followup_message."

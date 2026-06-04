@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,8 @@ from typing import Any
 
 from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
+
+logger = logging.getLogger(__name__)
 
 # Env vars that always pass through to subprocesses. Everything else is stripped
 # so secrets (API keys, etc.) don't leak into untrusted-by-default exec_code.
@@ -610,6 +613,7 @@ def _agent_read_workspace_paths(agent: Any) -> set[str]:
 
 
 async def _write_workspace(agent: Any, args: dict[str, Any]) -> str:
+    logger.debug(f"write_workspace: {args['path']} ({len(args['content'])} chars)")
     base = _workspace_or_error(agent)
     if isinstance(base, str):
         return base
@@ -1057,6 +1061,7 @@ async def _run_subprocess(
 
 async def _exec_code(agent: Any, args: dict[str, Any]) -> str:
     """Run the snippet with CWD = scratch."""
+    logger.debug(f"exec_code: language={args.get('language')}, cwd={agent.scratch_dir}")
     return await _run_subprocess(agent, args, cwd=agent.scratch_dir, label="exec_code")
 
 

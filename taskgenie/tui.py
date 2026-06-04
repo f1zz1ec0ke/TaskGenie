@@ -18,6 +18,8 @@ from rich.text import Text
 from rich.tree import Tree
 
 from taskgenie.events import BUS, Event
+from taskgenie.narrator import StoryNarrator
+from taskgenie.utils import fmt_count, fmt_duration
 
 STATUS_STYLE = {
     "idle": "dim",
@@ -38,6 +40,8 @@ THINKING_THRESHOLD_SECONDS = 2.0
 
 SCREEN_MAIN = 1
 SCREEN_LOG = 2
+SCREEN_STORY = 3
+SCREEN_HELP = 4
 
 
 def _trunc(text: str, n: int) -> str:
@@ -274,26 +278,6 @@ class _ColumnOverflowTree:
         )
 
 
-def _fmt_count(n: int) -> str:
-    """Compact integer: 1234 -> '1.2k', 84200 -> '84.2k', 1230000 -> '1.2M'."""
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{n / 1000:.1f}k"
-    return f"{n / 1_000_000:.1f}M"
-
-
-def _fmt_duration(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    m, s = divmod(int(seconds), 60)
-    if m < 60:
-        return f"{m}m{s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h{m:02d}m"
-
-
 class TUI:
     def __init__(self, task: str) -> None:
         self.task = task
@@ -308,6 +292,8 @@ class TUI:
         self.tool_calls_total: int = 0
         self.start_time: float = time.time()
         self._screen: int = SCREEN_MAIN
+        self.show_fired: bool = True
+        self.narrator: StoryNarrator = StoryNarrator()
         # Keyboard input state. Set in _setup_input(), cleaned by _restore_input().
         self._termios_old: Any = None
         self._stdin_fd: int | None = None
@@ -541,7 +527,7 @@ class TUI:
             view.push_activity(
                 "compaction",
                 f"archivist: compacting {before} messages "
-                f"({_fmt_count(before_tok)} tokens)",
+                f"({fmt_count(before_tok)} tokens)",
             )
             self._log(
                 f"[blue]{_md_escape(view.name)}[/] archivist compacting "
@@ -562,7 +548,7 @@ class TUI:
                 view.push_activity(
                     "compaction",
                     f"archivist: compacted {before}→{after} messages "
-                    f"({_fmt_count(before_tok)}→{_fmt_count(after_tok)} tokens, "
+                    f"({fmt_count(before_tok)}→{fmt_count(after_tok)} tokens, "
                     f"{dur_s:.1f}s)",
                 )
                 self._log(
@@ -676,11 +662,42 @@ class TUI:
 
     def _handle_key(self, ch: str) -> None:
         if ch == "\t":
-            self._screen = SCREEN_LOG if self._screen == SCREEN_MAIN else SCREEN_MAIN
+            cycle = [SCREEN_MAIN, SCREEN_LOG, SCREEN_STORY]
+            try:
+                idx = cycle.index(self._screen)
+                self._screen = cycle[(idx + 1) % len(cycle)]
+            except ValueError:
+                self._screen = SCREEN_MAIN
         elif ch == "1":
             self._screen = SCREEN_MAIN
         elif ch == "2":
             self._screen = SCREEN_LOG
+        elif ch == "3":
+            self._screen = SCREEN_STORY
+        elif ch in ("?", "h"):
+            self._screen = SCREEN_HELP if self._screen != SCREEN_HELP else SCREEN_MAIN
+        elif ch == "j":
+            self._cycle_focus(1)
+        elif ch == "k":
+            self._cycle_focus(-1)
+        elif ch == "f":
+            self._toggle_fired()
+
+    def _cycle_focus(self, direction: int) -> None:
+        """Cycle focus to the next/previous agent in the hierarchy."""
+        if not self.agents:
+            return
+        ids = list(self.agents.keys())
+        if not self.focus_id or self.focus_id not in self.agents:
+            self.focus_id = ids[0]
+            return
+        idx = ids.index(self.focus_id)
+        idx = (idx + direction) % len(ids)
+        self.focus_id = ids[idx]
+
+    def _toggle_fired(self) -> None:
+        """Toggle visibility of fired agents in the tree."""
+        self.show_fired = not self.show_fired
 
     # ---- rendering ---------------------------------------------------------
 
@@ -728,8 +745,16 @@ class TUI:
             parent_node.add(label)
             return
 
-        managers = [c for c in known_children if c.role_type in ("manager", "ceo")]
-        workers = [c for c in known_children if c.role_type == "worker"]
+        managers = [
+            c for c in known_children
+            if c.role_type in ("manager", "ceo")
+            and (self.show_fired or c.status != "fired")
+        ]
+        workers = [
+            c for c in known_children
+            if c.role_type == "worker"
+            and (self.show_fired or c.status != "fired")
+        ]
 
         active_managers = [c for c in managers if c.status not in ("done", "fired")]
         done_managers = [c for c in managers if c.status in ("done", "fired")]
@@ -854,6 +879,52 @@ class TUI:
             line.append(text, style=style)
         return line
 
+    def _build_help(self) -> Panel:
+        help_text = Text()
+        shortcuts = [
+            ("Tab", "Cycle between focus+tree, event log, story mode"),
+            ("1", "Focus + tree view"),
+            ("2", "Event log view"),
+            ("3", "Story mode (sarcastic narrator)"),
+            ("? / h", "Toggle this help screen"),
+            ("j / k", "Cycle focus to next/previous agent"),
+            ("f", "Toggle fired agents visibility"),
+            ("Ctrl+C", "Save state and exit"),
+        ]
+        for key, desc in shortcuts:
+            help_text.append(f"  {key:>10s}", style="bold cyan")
+            help_text.append(f"  {desc}\n")
+        return Panel(help_text, title="keyboard shortcuts", border_style="cyan")
+
+    def _build_story(self) -> Panel:
+        entries = self.narrator.entries
+        if not entries:
+            body = Text(
+                "(the narrator is warming up — give it a moment...)",
+                style="dim italic",
+            )
+            return Panel(body, title="story mode", border_style="magenta")
+        parts: list[Text] = []
+        for entry in reversed(entries[-15:]):
+            age = time.time() - entry.ts
+            if age < 60:
+                ago = f"{int(age)}s ago"
+            elif age < 3600:
+                ago = f"{int(age / 60)}m ago"
+            else:
+                ago = f"{int(age / 3600)}h ago"
+            line = Text()
+            line.append(f"  {ago:>8s}  ", style="dim")
+            line.append(entry.text, style="italic")
+            parts.append(line)
+            parts.append(Text(""))
+        return Panel(
+            Group(*parts),
+            title="story mode",
+            subtitle="[dim]narration updates every ~20s[/]",
+            border_style="magenta",
+        )
+
     def _build_focus(self) -> Panel:
         if not self.focus_id or self.focus_id not in self.agents:
             return Panel(
@@ -939,7 +1010,7 @@ class TUI:
                 line.append(" failed", style="red dim")
             if v.compaction_tokens_saved:
                 line.append(
-                    f"  · saved {_fmt_count(v.compaction_tokens_saved)} tokens",
+                    f"  · saved {fmt_count(v.compaction_tokens_saved)} tokens",
                     style="dim",
                 )
             if v.compaction_duration_ms:
@@ -1009,15 +1080,15 @@ class TUI:
         line.append(f"{self.llm_calls}", style="bold")
         line.append(" calls   ·   ", style="dim")
         line.append("tok ", style="dim")
-        line.append(f"{_fmt_count(self.prompt_tokens)}↑", style="bold")
+        line.append(f"{fmt_count(self.prompt_tokens)}↑", style="bold")
         line.append("/", style="dim")
-        line.append(f"{_fmt_count(self.completion_tokens)}↓", style="bold")
+        line.append(f"{fmt_count(self.completion_tokens)}↓", style="bold")
         line.append("   ·   ", style="dim")
         line.append("tools ", style="dim")
         line.append(f"{self.tool_calls_total}", style="bold")
         line.append("   ·   ", style="dim")
         line.append("elapsed ", style="dim")
-        line.append(_fmt_duration(elapsed), style="bold")
+        line.append(fmt_duration(elapsed), style="bold")
         return Panel(line, border_style="cyan", title="TaskGenie")
 
     def _build_log_panel(self, *, title_suffix: str = "") -> Panel:
@@ -1034,10 +1105,16 @@ class TUI:
         line = Text()
         main_style = "reverse bold" if self._screen == SCREEN_MAIN else "dim"
         log_style = "reverse bold" if self._screen == SCREEN_LOG else "dim"
+        story_style = "reverse bold" if self._screen == SCREEN_STORY else "dim"
+        help_style = "reverse bold" if self._screen == SCREEN_HELP else "dim"
         line.append(" [1] focus + tree ", style=main_style)
-        line.append("   ", style="dim")
+        line.append("  ", style="dim")
         line.append(" [2] event log ", style=log_style)
-        line.append("    [Tab] swap  ·  Ctrl+C exit", style="dim")
+        line.append("  ", style="dim")
+        line.append(" [3] story ", style=story_style)
+        line.append("  ", style="dim")
+        line.append(" [?] help ", style=help_style)
+        line.append("   j/k  f  ^C", style="dim")
         return line
 
     def _render(self) -> Layout:
@@ -1051,7 +1128,11 @@ class TUI:
         layout["header"].update(self._build_header())
         layout["footer"].update(self._build_footer())
 
-        if self._screen == SCREEN_LOG:
+        if self._screen == SCREEN_HELP:
+            layout["body"].update(self._build_help())
+        elif self._screen == SCREEN_STORY:
+            layout["body"].update(self._build_story())
+        elif self._screen == SCREEN_LOG:
             layout["body"].update(
                 self._build_log_panel(title_suffix=f"({len(self.recent_events)})")
             )
@@ -1086,11 +1167,7 @@ class TUI:
     async def run(self, stop_when: asyncio.Task[Any]) -> None:
         self._snapshot_initial_agents()
         q = BUS.subscribe()
-        # use_screen activates the alternate screen buffer (\x1b[?1049h).
-        # Console was constructed with force_terminal=True so its
-        # is_terminal always returns True -- check the REAL stdout to
-        # avoid scribbling escape codes into piped/captured output (CI
-        # logs, tests, redirections).
+        await self.narrator.start()
         use_screen = sys.stdout.isatty() and bool(
             getattr(self.console, "is_terminal", False)
         )
@@ -1123,4 +1200,5 @@ class TUI:
                         break
         finally:
             self._restore_input()
+            await self.narrator.stop()
             BUS.unsubscribe(q)

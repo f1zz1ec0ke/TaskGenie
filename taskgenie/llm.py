@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from typing import Any
@@ -14,6 +15,8 @@ from openai import (
 )
 
 from taskgenie.config import CONFIG
+
+logger = logging.getLogger(__name__)
 
 _TRANSIENT = (APITimeoutError, APIConnectionError, InternalServerError, RateLimitError)
 
@@ -35,6 +38,7 @@ class LMStudioClient:
         if not models.data:
             raise RuntimeError(f"No models loaded at {CONFIG.base_url}")
         self._model = models.data[0].id
+        logger.info(f"Auto-detected model: {self._model}")
         return self._model
 
     async def chat(
@@ -43,6 +47,7 @@ class LMStudioClient:
         tools: list[dict[str, Any]] | None = None,
         *,
         bypass_semaphore: bool = False,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
         """Send a chat-completion request with retry-on-transient errors.
 
@@ -50,8 +55,13 @@ class LMStudioClient:
         concurrency cap that exists to throttle agent fan-out. Without
         this, two workers compacting at once would consume the entire
         `max_concurrent_llm` budget and starve any real agent calls.
+
+        `model_override` selects a specific model for this call. When None
+        (the default), the client's configured or auto-detected model is
+        used. This keeps the change backward-compatible for callers that
+        don't pass it (e.g. the Archivist).
         """
-        model = await self.model_name()
+        model = model_override or await self.model_name()
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -60,6 +70,8 @@ class LMStudioClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+        logger.debug(f"LLM call: {len(messages)} messages, {len(tools or [])} tools")
 
         last_exc: Exception | None = None
         start = time.monotonic()
@@ -73,6 +85,7 @@ class LMStudioClient:
                 break
             except _TRANSIENT as e:
                 last_exc = e
+                logger.warning(f"LLM retry {attempt+1}/3: {type(e).__name__}: {e}")
                 if attempt == 3:
                     raise
                 sleep = (2 ** attempt) + random.uniform(0, 0.5)

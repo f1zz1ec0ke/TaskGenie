@@ -23,8 +23,10 @@ from rich.tree import Tree
 
 from taskgenie.events import Event
 from taskgenie.tui import (
+    SCREEN_HELP,
     SCREEN_LOG,
     SCREEN_MAIN,
+    SCREEN_STORY,
     THINKING_THRESHOLD_SECONDS,
     AgentView,
     TUI,
@@ -144,18 +146,45 @@ def test_thinking_indicator_absent_when_recent() -> None:
 
 
 def test_keys_toggle_screen() -> None:
-    """Tab cycles, ‘1’ pins main, ‘2’ pins log. Unknown keys are no-ops."""
+    """Tab cycles main->log->story, number keys pin, ‘?’/’h’ toggles help.
+    Unknown keys are no-ops."""
     tui = TUI(task="t")
     assert tui._screen == SCREEN_MAIN
 
+    # Tab cycles: main -> log -> story -> main
     tui._handle_key("\t")
     assert tui._screen == SCREEN_LOG
+    tui._handle_key("\t")
+    assert tui._screen == SCREEN_STORY
     tui._handle_key("\t")
     assert tui._screen == SCREEN_MAIN
 
+    # Number keys pin to specific screens.
     tui._handle_key("2")
     assert tui._screen == SCREEN_LOG
     tui._handle_key("1")
+    assert tui._screen == SCREEN_MAIN
+    tui._handle_key("3")
+    assert tui._screen == SCREEN_STORY
+    tui._handle_key("1")
+    assert tui._screen == SCREEN_MAIN
+
+    # Help screen toggle with ‘?’.
+    tui._handle_key("?")
+    assert tui._screen == SCREEN_HELP
+    tui._handle_key("?")
+    assert tui._screen == SCREEN_MAIN
+
+    # Help screen toggle with ‘h’.
+    tui._handle_key("h")
+    assert tui._screen == SCREEN_HELP
+    tui._handle_key("h")
+    assert tui._screen == SCREEN_MAIN
+
+    # Tab from help goes back to main (help not in tab cycle).
+    tui._handle_key("h")
+    assert tui._screen == SCREEN_HELP
+    tui._handle_key("\t")
     assert tui._screen == SCREEN_MAIN
 
     # Unknown keys must not change state.
@@ -179,7 +208,7 @@ def test_screens_render_distinct_content() -> None:
     assert "hierarchy" in main_out
     assert "focus --" in main_out  # panel title is "focus -- <Name>"
     # Footer shown on every screen.
-    assert "Tab" in main_out
+    assert "[3] story" in main_out or "story" in main_out
     # Active panel concept is gone for good.
     assert "(no active agents)" not in main_out
 
@@ -191,7 +220,7 @@ def test_screens_render_distinct_content() -> None:
     # inside the footer hint, which is intentional).
     assert "hierarchy" not in log_out
     assert "focus --" not in log_out
-    assert "Tab" in log_out
+    assert "story" in log_out
     print("[screens_render_distinct_content] OK")
 
 
@@ -275,6 +304,119 @@ def test_setup_input_noop_off_tty() -> None:
     print("[setup_input_noop_off_tty] OK")
 
 
+def test_cycle_focus() -> None:
+    """j/k keys cycle focus_id through the agent list."""
+    tui = TUI(task="t")
+    tui._handle_event(Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0}))
+    tui._handle_event(Event("spawn", "a2", "Mgr", data={"role_type": "manager", "depth": 1, "parent_id": "a1"}))
+    tui._handle_event(Event("spawn", "a3", "Worker", data={"role_type": "worker", "depth": 2, "parent_id": "a2"}))
+
+    # focus_id should be on the last spawned agent
+    assert tui.focus_id == "a3"
+
+    # 'j' moves forward
+    tui._handle_key("j")
+    ids = list(tui.agents.keys())
+    expected_idx = (ids.index("a3") + 1) % len(ids)
+    assert tui.focus_id == ids[expected_idx]
+
+    # 'k' moves backward
+    prev_id = tui.focus_id
+    tui._handle_key("k")
+    assert tui.focus_id == "a3"
+
+    # Cycling wraps around
+    for _ in range(len(tui.agents)):
+        tui._handle_key("j")
+    # After a full cycle we're back where we started
+    assert tui.focus_id == "a3"
+    print("[cycle_focus] OK")
+
+
+def test_cycle_focus_empty() -> None:
+    """Cycling with no agents is a safe no-op."""
+    tui = TUI(task="t")
+    tui._handle_key("j")
+    assert tui.focus_id is None
+    tui._handle_key("k")
+    assert tui.focus_id is None
+    print("[cycle_focus_empty] OK")
+
+
+def test_toggle_fired() -> None:
+    """'f' key toggles show_fired flag."""
+    tui = TUI(task="t")
+    assert tui.show_fired is True
+    tui._handle_key("f")
+    assert tui.show_fired is False
+    tui._handle_key("f")
+    assert tui.show_fired is True
+    print("[toggle_fired] OK")
+
+
+def test_fired_agents_hidden_in_tree() -> None:
+    """When show_fired is False, fired agents should not appear in the tree."""
+    tui = TUI(task="t")
+    tui._handle_event(Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0}))
+    tui._handle_event(Event("spawn", "a2", "Worker1", data={"role_type": "worker", "depth": 1, "parent_id": "a1"}))
+    tui._handle_event(Event("spawn", "a3", "Worker2", data={"role_type": "worker", "depth": 1, "parent_id": "a1"}))
+    tui._handle_event(Event("state", "a2", "Worker1", data={"status": "fired"}))
+
+    # Focus on a non-fired agent so the focus panel doesn't show the fired one.
+    tui.focus_id = "a3"
+
+    # With show_fired=True, fired worker is visible in the tree
+    tui.show_fired = True
+    import io
+    from rich.console import Console as _C
+    buf = _C(file=io.StringIO(), force_terminal=False, width=200)
+    with buf.capture() as cap:
+        buf.print(tui._build_tree())
+    tree_shown = cap.get()
+    assert "Worker1" in tree_shown
+
+    # With show_fired=False, fired worker is hidden from the tree
+    tui.show_fired = False
+    buf2 = _C(file=io.StringIO(), force_terminal=False, width=200)
+    with buf2.capture() as cap2:
+        buf2.print(tui._build_tree())
+    tree_hidden = cap2.get()
+    assert "Worker1" not in tree_hidden
+    assert "Worker2" in tree_hidden
+    print("[fired_agents_hidden_in_tree] OK")
+
+
+def test_help_screen_renders() -> None:
+    """The help screen should contain shortcut descriptions."""
+    tui = TUI(task="t")
+    tui._screen = SCREEN_HELP
+    out = _render_to_string(tui)
+    assert "keyboard shortcuts" in out
+    assert "Toggle this help screen" in out
+    assert "Story mode" in out
+    assert "fired agents" in out.lower()
+    assert "Ctrl+C" in out
+    print("[help_screen_renders] OK")
+
+
+def test_story_screen_renders() -> None:
+    """Story mode screen should render even with no narration entries."""
+    tui = TUI(task="t")
+    tui._screen = SCREEN_STORY
+    out = _render_to_string(tui)
+    assert "story mode" in out
+    assert "warming up" in out
+
+    # With a narration entry, it should render the text.
+    from taskgenie.narrator import NarrationEntry
+    tui.narrator.entries.append(
+        NarrationEntry(text="The CEO has hired a manager. How original.")
+    )
+    out2 = _render_to_string(tui)
+    assert "How original" in out2
+    print("[story_screen_renders] OK")
+
+
 def main() -> int:
     test_activity_log_accumulates()
     test_activity_log_captures_tools_and_assigns()
@@ -288,6 +430,12 @@ def main() -> int:
     test_overflow_tree_spills_into_columns()
     test_overflow_tree_no_height_yields_tree()
     test_setup_input_noop_off_tty()
+    test_cycle_focus()
+    test_cycle_focus_empty()
+    test_toggle_fired()
+    test_fired_agents_hidden_in_tree()
+    test_help_screen_renders()
+    test_story_screen_renders()
     print("\nAll TUI tests passed.")
     return 0
 

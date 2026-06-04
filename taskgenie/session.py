@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,6 +26,8 @@ from typing import Any
 
 from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
+
+logger = logging.getLogger(__name__)
 
 STATE_FILE = "state.json"
 EVENTS_FILE = "events.jsonl"
@@ -84,6 +87,8 @@ class SessionData:
     agents: dict[str, dict[str, Any]] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
     tool_signature: dict[str, dict[str, str]] = field(default_factory=dict)
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
 
     def add_history(self, entry: HistoryEntry) -> None:
         self.history.append(asdict(entry))
@@ -132,6 +137,21 @@ class Session:
     @property
     def workspace_dir(self) -> Path:
         return self.project_dir
+
+    def add_tokens(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """Track cumulative token usage across the session."""
+        self.data.total_prompt_tokens += prompt_tokens
+        self.data.total_completion_tokens += completion_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        return self.data.total_prompt_tokens + self.data.total_completion_tokens
+
+    def estimated_cost(self, cost_per_million: float) -> float:
+        """Estimate cost based on total tokens and configured price."""
+        if cost_per_million <= 0:
+            return 0.0
+        return (self.total_tokens / 1_000_000) * cost_per_million
 
     @classmethod
     def create(cls, task: str, project: str | None = None) -> "Session":
@@ -185,6 +205,7 @@ class Session:
         session = cls(data)
         if unknown:
             session._unknown_fields_on_load = unknown
+        logger.info(f"Session {session.session_id} loaded ({len(data.agents)} agents)")
         return session
 
     @classmethod
@@ -208,6 +229,11 @@ class Session:
                 d = json.loads(state.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
+            agents_dict = d.get("agents", {})
+            total_prompt_tokens = 0
+            for agent_data in agents_dict.values():
+                if isinstance(agent_data, dict):
+                    total_prompt_tokens += agent_data.get("prompt_tokens", 0)
             rows.append(
                 {
                     "session_id": d.get("session_id", sub.name),
@@ -215,12 +241,15 @@ class Session:
                     "started_at": d.get("started_at", ""),
                     "last_saved_at": d.get("last_saved_at", ""),
                     "status": d.get("status", "?"),
+                    "agent_count": len(agents_dict),
+                    "prompt_tokens": total_prompt_tokens,
                 }
             )
         rows.sort(key=lambda r: r["last_saved_at"], reverse=True)
         return rows
 
     def save(self) -> None:
+        logger.debug(f"Saving session {self.session_id}")
         self.data.last_saved_at = _dt.datetime.now().isoformat(timespec="seconds")
         self.data.tool_signature = {
             "management": REGISTRY.signature("management"),
