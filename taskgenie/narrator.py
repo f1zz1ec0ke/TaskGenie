@@ -30,9 +30,9 @@ NARRATOR_SYSTEM_PROMPT = (
     "Reply with ONLY your narration. No preamble."
 )
 
-NARRATE_INTERVAL = 20.0
-MIN_NEW_EVENTS = 5
-MAX_EVENTS_IN_PROMPT = 20
+NARRATE_INTERVAL = 45.0
+MIN_NEW_EVENTS = 3
+MAX_EVENTS_IN_PROMPT = 100
 
 
 @dataclass
@@ -105,8 +105,8 @@ class StoryNarrator:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=1.0)
                     self._buf.append(event)
-                    if len(self._buf) > 50:
-                        self._buf = self._buf[-50:]
+                    if len(self._buf) > 150:
+                        self._buf = self._buf[-150:]
                 except asyncio.TimeoutError:
                     pass
 

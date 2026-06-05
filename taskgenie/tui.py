@@ -921,7 +921,7 @@ class TUI:
         return Panel(
             Group(*parts),
             title="story mode",
-            subtitle="[dim]narration updates every ~20s[/]",
+            subtitle="[dim]narration updates every ~45s[/]",
             border_style="magenta",
         )
 
