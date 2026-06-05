@@ -155,6 +155,7 @@ class Session:
 
     @classmethod
     def create(cls, task: str, project: str | None = None) -> "Session":
+        """Create a new session with a unique ID derived from the task text."""
         session_id = make_session_id(task)
         now = _dt.datetime.now().isoformat(timespec="seconds")
         slug = project or _project_slug(task)
@@ -177,6 +178,7 @@ class Session:
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
+        """Load a session from disk. Raises FileNotFoundError or ValueError on bad state."""
         path = CONFIG.sessions_dir / session_id / STATE_FILE
         if not path.exists():
             raise FileNotFoundError(f"no session: {session_id}")
