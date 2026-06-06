@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from taskgenie import agent as agent_module
 from taskgenie.agent import Agent
+from taskgenie.config import CONFIG
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.session import Session
 from taskgenie.tools.registry import REGISTRY
@@ -34,15 +35,18 @@ def _reset(mock_llm, data_dir):
 
 async def test_save_load_resume() -> None:
     tmp = tempfile.mkdtemp(prefix="tg-test-")
-    os.environ["TASKGENIE_DATA_DIR"] = tmp
     os.environ["TASKGENIE_PROJECTS_DIR"] = tmp + "/projects"
-    # Re-import config so it picks up the override.
-    from importlib import reload
-    from taskgenie import config as cfg_module
-    reload(cfg_module)
-    from taskgenie import session as session_module
-    reload(session_module)
-    from taskgenie.session import Session as S
+    # Point the shared CONFIG singleton at the temp dir by MUTATING the
+    # existing object (every test module holds this same reference).
+    # Do NOT reload() the config/session modules: a reload swaps in a
+    # brand-new CONFIG that session.py then uses, while other test
+    # modules keep the old one -- their object.__setattr__(CONFIG, ...)
+    # mutations stop reaching Session.load and they fail with spurious
+    # FileNotFoundError. _projects_root() reads its env var dynamically,
+    # so TASKGENIE_PROJECTS_DIR alone is enough for the projects path.
+    original_data_dir = CONFIG.data_dir
+    object.__setattr__(CONFIG, "data_dir", tmp)
+    S = Session
 
     try:
         # --- Phase 1: original run ends in a CEO blocker.
@@ -122,22 +126,21 @@ async def test_save_load_resume() -> None:
 
         print("[save_load_resume] OK")
     finally:
+        object.__setattr__(CONFIG, "data_dir", original_data_dir)
         shutil.rmtree(tmp, ignore_errors=True)
-        os.environ.pop("TASKGENIE_DATA_DIR", None)
+        os.environ.pop("TASKGENIE_PROJECTS_DIR", None)
 
 
 async def test_tool_diff_on_resume() -> None:
     """Capture a signature, mutate the registry, resume, and confirm the diff
     surfaces tools as added/removed/updated."""
     tmp = tempfile.mkdtemp(prefix="tg-tooldiff-")
-    os.environ["TASKGENIE_DATA_DIR"] = tmp
     os.environ["TASKGENIE_PROJECTS_DIR"] = tmp + "/projects"
-    from importlib import reload
-    from taskgenie import config as cfg_module
-    reload(cfg_module)
-    from taskgenie import session as session_module
-    reload(session_module)
-    from taskgenie.session import Session as S
+    # Mutate the shared CONFIG singleton instead of reload()-ing config
+    # (see test_save_load_resume for why a reload poisons sibling tests).
+    original_data_dir = CONFIG.data_dir
+    object.__setattr__(CONFIG, "data_dir", tmp)
+    S = Session
     try:
         session = S.create("test tool diff")
         session.save()  # captures the current tool signature
@@ -177,8 +180,9 @@ async def test_tool_diff_on_resume() -> None:
         )
         print("[tool_diff_on_resume] OK")
     finally:
+        object.__setattr__(CONFIG, "data_dir", original_data_dir)
         shutil.rmtree(tmp, ignore_errors=True)
-        os.environ.pop("TASKGENIE_DATA_DIR", None)
+        os.environ.pop("TASKGENIE_PROJECTS_DIR", None)
 
 
 async def main() -> int:

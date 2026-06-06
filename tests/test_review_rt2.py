@@ -838,19 +838,23 @@ def test_dump_filename_unique_per_call_id(tmp_path: Path) -> None:
     long_b = "call_" + "x" * 30 + "_b"
     content = "y" * 1024  # any string > threshold
 
-    p_a, _ = dump_large_tool_result(
+    _, paths_a = dump_large_tool_result(
         content, str(tmp_path), turn_idx=0, call_id=long_a,
-        tool_name="exec_code", threshold_bytes=100,
+        tool_name="exec_code", threshold_bytes=100, chunk_margin=0,
     )
-    p_b, _ = dump_large_tool_result(
+    _, paths_b = dump_large_tool_result(
         content, str(tmp_path), turn_idx=0, call_id=long_b,
-        tool_name="exec_code", threshold_bytes=100,
+        tool_name="exec_code", threshold_bytes=100, chunk_margin=0,
     )
-    # Each pointer references a distinct filename.
-    assert p_a != p_b, (p_a, p_b)
-    # And both files exist on disk.
-    files = sorted(p.name for p in tmp_path.iterdir())
-    assert len(files) == 2, files
+    assert paths_a is not None and paths_b is not None
+    # The two call_ids must produce DISJOINT filename sets -- if the call-id
+    # hash collided, the second call would overwrite the first's chunks.
+    names_a = {Path(p).name for p in paths_a}
+    names_b = {Path(p).name for p in paths_b}
+    assert names_a.isdisjoint(names_b), (names_a, names_b)
+    # Every chunk from both calls coexists on disk (nothing clobbered).
+    files = {p.name for p in tmp_path.iterdir()}
+    assert files == names_a | names_b
     print("[dump_filename_unique_per_call_id] OK")
 
 
