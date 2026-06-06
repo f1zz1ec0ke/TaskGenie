@@ -58,9 +58,7 @@ class EventBus:
 
     # -- public API ----------------------------------------------------------
 
-    def subscribe(
-        self, maxsize: int = DEFAULT_QUEUE_MAXSIZE
-    ) -> asyncio.Queue[Event]:
+    def subscribe(self, maxsize: int = DEFAULT_QUEUE_MAXSIZE) -> asyncio.Queue[Event]:
         """Create a bounded subscription and return its queue.
 
         *maxsize* controls the upper bound on queued events (default

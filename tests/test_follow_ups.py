@@ -2,6 +2,7 @@
 mid-task; the suggestions ride up with their final report and the parent
 decides whether to act on them.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,14 +44,22 @@ class FollowUpLLM(ScriptedLLM):
             return {
                 "content": "Hiring a manager.",
                 "tool_calls": [
-                    tc("c-1", "hire", name="Mgr", role_type="manager", role_prompt="Run analysis.")
+                    tc(
+                        "c-1",
+                        "hire",
+                        name="Mgr",
+                        role_type="manager",
+                        role_prompt="Run analysis.",
+                    )
                 ],
             }
         if turn == 1:
             mgr_id = json.loads(last_results[0][1])["agent_id"]
             return {
                 "content": "Assigning.",
-                "tool_calls": [tc("c-2", "assign", agent_id=mgr_id, task="Do the work.")],
+                "tool_calls": [
+                    tc("c-2", "assign", agent_id=mgr_id, task="Do the work.")
+                ],
             }
         if turn == 2:
             handle = json.loads(last_results[0][1])["task_handle"]
@@ -64,9 +73,8 @@ class FollowUpLLM(ScriptedLLM):
             follow_ups = result.get("follow_ups", [])
             note = ""
             if follow_ups:
-                note = (
-                    " Follow-ups raised: "
-                    + "; ".join(fu.get("what", "") for fu in follow_ups)
+                note = " Follow-ups raised: " + "; ".join(
+                    fu.get("what", "") for fu in follow_ups
                 )
             return {
                 "content": "Wrapping up.",
@@ -78,21 +86,36 @@ class FollowUpLLM(ScriptedLLM):
                     )
                 ],
             }
-        return {"content": "stuck", "tool_calls": [tc("cx", "complete", report="stuck")]}
+        return {
+            "content": "stuck",
+            "tool_calls": [tc("cx", "complete", report="stuck")],
+        }
 
     def _mgr(self, turn, last_results):
         if turn == 0:
             return {
                 "content": "Hire Alpha.",
                 "tool_calls": [
-                    tc("m-1", "hire", name="Alpha", role_type="worker", role_prompt="Pull data.")
+                    tc(
+                        "m-1",
+                        "hire",
+                        name="Alpha",
+                        role_type="worker",
+                        role_prompt="Pull data.",
+                    )
                 ],
             }
         if turn == 1:
             return {
                 "content": "Hire Beta.",
                 "tool_calls": [
-                    tc("m-2", "hire", name="Beta", role_type="worker", role_prompt="Pull data.")
+                    tc(
+                        "m-2",
+                        "hire",
+                        name="Beta",
+                        role_type="worker",
+                        role_prompt="Pull data.",
+                    )
                 ],
             }
         if turn == 2:
@@ -132,7 +155,8 @@ class FollowUpLLM(ScriptedLLM):
                 )
             return {
                 "content": "Relaying follow-ups before completing.",
-                "tool_calls": calls or [tc("m-5", "complete", report="(no follow-ups)")],
+                "tool_calls": calls
+                or [tc("m-5", "complete", report="(no follow-ups)")],
             }
         if turn == 5:
             return {
@@ -145,7 +169,10 @@ class FollowUpLLM(ScriptedLLM):
                     )
                 ],
             }
-        return {"content": "stuck", "tool_calls": [tc("mx", "complete", report="stuck")]}
+        return {
+            "content": "stuck",
+            "tool_calls": [tc("mx", "complete", report="stuck")],
+        }
 
     def _alpha(self, turn):
         if turn == 0:

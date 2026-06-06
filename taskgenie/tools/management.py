@@ -4,6 +4,7 @@ These are dispatched directly by Agent._execute_tool / Agent.run since they
 mutate agent state and the run loop. We still register them so the registry
 can track versions/hashes for resume-time diffs.
 """
+
 from __future__ import annotations
 
 from taskgenie.tools.registry import REGISTRY

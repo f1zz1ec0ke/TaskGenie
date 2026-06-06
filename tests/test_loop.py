@@ -9,6 +9,7 @@ Runs end-to-end tasks without touching the real LM Studio endpoint. Verifies:
 
 Run with: python -m tests.test_loop
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -127,33 +128,55 @@ class HappyPathLLM(ScriptedLLM):
             mgr_id = json.loads(last_results[0][1])["agent_id"]
             return {
                 "content": "Assigning the task.",
-                "tool_calls": [tc("c-2", "assign", agent_id=mgr_id, task="Research coding agents.")],
+                "tool_calls": [
+                    tc("c-2", "assign", agent_id=mgr_id, task="Research coding agents.")
+                ],
             }
         if turn == 2:
             handle = json.loads(last_results[0][1])["task_handle"]
-            return {"content": "Awaiting.", "tool_calls": [tc("c-3", "await_results", task_handles=[handle])]}
+            return {
+                "content": "Awaiting.",
+                "tool_calls": [tc("c-3", "await_results", task_handles=[handle])],
+            }
         if turn == 3:
             results = json.loads(last_results[0][1])
             report = list(results.values())[0]["report"]
             return {
                 "content": "Wrapping up.",
-                "tool_calls": [tc("c-4", "complete", report=f"FINAL ANSWER:\n\n{report}")],
+                "tool_calls": [
+                    tc("c-4", "complete", report=f"FINAL ANSWER:\n\n{report}")
+                ],
             }
-        return {"content": "stuck", "tool_calls": [tc("cx", "complete", report="stuck")]}
+        return {
+            "content": "stuck",
+            "tool_calls": [tc("cx", "complete", report="stuck")],
+        }
 
     def _mgr(self, turn, last_results):
         if turn == 0:
             return {
                 "content": "Hiring Alice.",
                 "tool_calls": [
-                    tc("m-1", "hire", name="Alice", role_type="worker", role_prompt="Cover Claude Code + Cursor."),
+                    tc(
+                        "m-1",
+                        "hire",
+                        name="Alice",
+                        role_type="worker",
+                        role_prompt="Cover Claude Code + Cursor.",
+                    ),
                 ],
             }
         if turn == 1:
             return {
                 "content": "Hiring Bob.",
                 "tool_calls": [
-                    tc("m-2", "hire", name="Bob", role_type="worker", role_prompt="Cover Aider + Codex."),
+                    tc(
+                        "m-2",
+                        "hire",
+                        name="Bob",
+                        role_type="worker",
+                        role_prompt="Cover Aider + Codex.",
+                    ),
                 ],
             }
         if turn == 2:
@@ -163,21 +186,41 @@ class HappyPathLLM(ScriptedLLM):
             return {
                 "content": "Dispatching both in parallel.",
                 "tool_calls": [
-                    tc("m-3a", "assign", agent_id=alice_id, task="Pros/cons of Claude Code and Cursor."),
-                    tc("m-3b", "assign", agent_id=bob_id, task="Pros/cons of Aider and Codex."),
+                    tc(
+                        "m-3a",
+                        "assign",
+                        agent_id=alice_id,
+                        task="Pros/cons of Claude Code and Cursor.",
+                    ),
+                    tc(
+                        "m-3b",
+                        "assign",
+                        agent_id=bob_id,
+                        task="Pros/cons of Aider and Codex.",
+                    ),
                 ],
             }
         if turn == 3:
-            handles = [json.loads(content)["task_handle"] for _, content in last_results]
-            return {"content": "Awaiting both.", "tool_calls": [tc("m-4", "await_results", task_handles=handles)]}
+            handles = [
+                json.loads(content)["task_handle"] for _, content in last_results
+            ]
+            return {
+                "content": "Awaiting both.",
+                "tool_calls": [tc("m-4", "await_results", task_handles=handles)],
+            }
         if turn == 4:
             results = json.loads(last_results[0][1])
             combined = "\n\n".join(f"- {v['report']}" for v in results.values())
             return {
                 "content": "Synthesizing.",
-                "tool_calls": [tc("m-5", "complete", report=f"Comparison:\n\n{combined}")],
+                "tool_calls": [
+                    tc("m-5", "complete", report=f"Comparison:\n\n{combined}")
+                ],
             }
-        return {"content": "stuck", "tool_calls": [tc("mx", "complete", report="stuck")]}
+        return {
+            "content": "stuck",
+            "tool_calls": [tc("mx", "complete", report="stuck")],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +265,16 @@ class EscalationLLM(ScriptedLLM):
                 mgr_id = json.loads(last_results[0][1])["agent_id"]
                 return {
                     "content": "Assigning.",
-                    "tool_calls": [tc("c-2", "assign", agent_id=mgr_id, task="Run analysis.")],
+                    "tool_calls": [
+                        tc("c-2", "assign", agent_id=mgr_id, task="Run analysis.")
+                    ],
                 }
             if turn == 2:
                 handle = json.loads(last_results[0][1])["task_handle"]
-                return {"content": "Awaiting.", "tool_calls": [tc("c-3", "await_results", task_handles=[handle])]}
+                return {
+                    "content": "Awaiting.",
+                    "tool_calls": [tc("c-3", "await_results", task_handles=[handle])],
+                }
             if turn == 3:
                 # Got blocked result from manager → escalate to user.
                 results = json.loads(last_results[0][1])
@@ -276,18 +324,29 @@ class EscalationLLM(ScriptedLLM):
             return {
                 "content": "Hiring a quant worker.",
                 "tool_calls": [
-                    tc("m-1", "hire", name="Quant", role_type="worker", role_prompt="Run numeric analysis."),
+                    tc(
+                        "m-1",
+                        "hire",
+                        name="Quant",
+                        role_type="worker",
+                        role_prompt="Run numeric analysis.",
+                    ),
                 ],
             }
         if turn == 1:
             wk_id = json.loads(last_results[0][1])["agent_id"]
             return {
                 "content": "Assigning.",
-                "tool_calls": [tc("m-2", "assign", agent_id=wk_id, task="Compute summary stats.")],
+                "tool_calls": [
+                    tc("m-2", "assign", agent_id=wk_id, task="Compute summary stats.")
+                ],
             }
         if turn == 2:
             handle = json.loads(last_results[0][1])["task_handle"]
-            return {"content": "Awaiting.", "tool_calls": [tc("m-3", "await_results", task_handles=[handle])]}
+            return {
+                "content": "Awaiting.",
+                "tool_calls": [tc("m-3", "await_results", task_handles=[handle])],
+            }
         if turn == 3:
             # Quant reported blocked → escalate (we have no other worker tools either).
             results = json.loads(last_results[0][1])
@@ -304,7 +363,10 @@ class EscalationLLM(ScriptedLLM):
                     )
                 ],
             }
-        return {"content": "stuck", "tool_calls": [tc("mx", "complete", report="stuck")]}
+        return {
+            "content": "stuck",
+            "tool_calls": [tc("mx", "complete", report="stuck")],
+        }
 
     def _worker(self, turn):
         return {

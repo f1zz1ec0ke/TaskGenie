@@ -11,6 +11,7 @@ Two on-disk locations per session:
                                     the CEO's report. This is what the user
                                     opens after the run.
 """
+
 from __future__ import annotations
 
 import datetime as _dt
@@ -70,7 +71,9 @@ def _unique_project_dir(name: str) -> Path:
 @dataclass
 class HistoryEntry:
     kind: str  # "task" | "blocker" | "unblock" | "done" | "abandoned"
-    ts: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
+    ts: str = field(
+        default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds")
+    )
     text: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
 
@@ -97,6 +100,9 @@ class Session:
 
     def __init__(self, data: SessionData) -> None:
         self.data = data
+        # Populated by load() when state.json carries fields this version
+        # doesn't know about; surfaced for diagnostics.
+        self._unknown_fields_on_load: list[str] = []
 
     @property
     def session_id(self) -> str:
@@ -172,9 +178,7 @@ class Session:
                 f"Session {session_id} has a corrupt state.json: {e}"
             ) from e
         if not isinstance(raw, dict):
-            raise ValueError(
-                f"Session {session_id} state.json is not a JSON object"
-            )
+            raise ValueError(f"Session {session_id} state.json is not a JSON object")
         # Filter to fields the dataclass actually knows about so a state.json
         # written by a newer version (with extra fields) still loads on an
         # older binary. Missing fields fall back to dataclass defaults.
@@ -220,9 +224,7 @@ class Session:
             for agent_data in agents_dict.values():
                 if isinstance(agent_data, dict):
                     total_prompt_tokens += agent_data.get("prompt_tokens", 0)
-                    total_completion_tokens += agent_data.get(
-                        "completion_tokens", 0
-                    )
+                    total_completion_tokens += agent_data.get("completion_tokens", 0)
             rows.append(
                 {
                     "session_id": d.get("session_id", sub.name),
@@ -274,7 +276,9 @@ class Session:
                 delete=False,
                 encoding="utf-8",
             ) as tmp:
-                tmp_path = tmp.name  # CAPTURE FIRST so finally can clean up on any subsequent failure
+                tmp_path = (
+                    tmp.name
+                )  # CAPTURE FIRST so finally can clean up on any subsequent failure
                 json.dump(asdict(self.data), tmp, indent=2, default=str)
                 tmp.flush()
                 os.fsync(tmp.fileno())
@@ -364,9 +368,7 @@ class Session:
         saved_work = self.data.tool_signature.get("work")
         saved_ceo = self.data.tool_signature.get("ceo")
 
-        def diff(
-            saved: dict[str, str] | None, current: dict[str, str]
-        ) -> list[str]:
+        def diff(saved: dict[str, str] | None, current: dict[str, str]) -> list[str]:
             if saved is None:
                 return []  # bucket wasn't recorded; can't diff meaningfully
             lines: list[str] = []

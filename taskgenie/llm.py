@@ -85,10 +85,10 @@ class LMStudioClient:
                 break
             except _TRANSIENT as e:
                 last_exc = e
-                logger.warning(f"LLM retry {attempt+1}/3: {type(e).__name__}: {e}")
+                logger.warning(f"LLM retry {attempt + 1}/3: {type(e).__name__}: {e}")
                 if attempt == 3:
                     raise
-                sleep = (2 ** attempt) + random.uniform(0, 0.5)
+                sleep = (2**attempt) + random.uniform(0, 0.5)
                 await asyncio.sleep(sleep)
         else:  # never executed (loop breaks on success or raises on last attempt)
             raise last_exc  # type: ignore[misc]

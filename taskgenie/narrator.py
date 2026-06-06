@@ -4,6 +4,7 @@ A background asyncio task that periodically feeds recent events to the
 LLM and gets back 2-3 sentences of dry, sarcastic narration. The TUI
 reads `.entries` for rendering on the Story Mode screen.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -144,7 +145,7 @@ class StoryNarrator:
         prev = ""
         if self.entries:
             prev = (
-                f"\n\nYour previous narration: \"{self.entries[-1].text}\"\n"
+                f'\n\nYour previous narration: "{self.entries[-1].text}"\n'
                 "Don't repeat yourself. Build on the story."
             )
         response = await LLM.chat(

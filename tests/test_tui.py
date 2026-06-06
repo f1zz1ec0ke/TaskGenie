@@ -7,6 +7,7 @@
 
 Run with: python -m tests.test_tui
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,7 +48,9 @@ def _render_to_string(tui: TUI) -> str:
 def test_activity_log_accumulates() -> None:
     """Five narrate events => five activity_log entries (not overwrite)."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     for i in range(5):
         tui._handle_event(Event("narrate", "a1", "Worker", data={"text": f"step {i}"}))
 
@@ -65,7 +68,9 @@ def test_activity_log_captures_tools_and_assigns() -> None:
     """Tool calls and assignments both land in the activity log with proper
     kinds, so the focus panel can show ‘what this agent has been doing’."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Mgr", data={"role_type": "manager", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Mgr", data={"role_type": "manager", "depth": 1})
+    )
     tui._handle_event(
         Event("tool_call", "a1", "Mgr", data={"tool": "hire", "args": {"name": "Bob"}})
     )
@@ -100,11 +105,20 @@ def test_activity_log_cap() -> None:
 def test_focus_renders_activity_log() -> None:
     """The focus panel should include each activity entry in its output."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
-    tui._handle_event(Event("state", "a1", "Worker", data={"status": "working", "task": "main task"}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
+    tui._handle_event(
+        Event("state", "a1", "Worker", data={"status": "working", "task": "main task"})
+    )
     tui._handle_event(Event("narrate", "a1", "Worker", data={"text": "first thought"}))
     tui._handle_event(
-        Event("tool_call", "a1", "Worker", data={"tool": "write_workspace", "args": {"path": "foo.py"}})
+        Event(
+            "tool_call",
+            "a1",
+            "Worker",
+            data={"tool": "write_workspace", "args": {"path": "foo.py"}},
+        )
     )
     tui._handle_event(Event("narrate", "a1", "Worker", data={"text": "second thought"}))
 
@@ -120,7 +134,9 @@ def test_thinking_indicator_appears_after_threshold() -> None:
     """When an agent is 'working' and hasn't emitted for THINKING_THRESHOLD
     seconds, the focus panel header shows ‘thinking Ns’."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     tui._handle_event(Event("state", "a1", "Worker", data={"status": "working"}))
     # Fast-forward last_activity into the past so the silence threshold trips.
     view = tui.agents["a1"]
@@ -136,7 +152,9 @@ def test_thinking_indicator_appears_after_threshold() -> None:
 def test_thinking_indicator_absent_when_recent() -> None:
     """Fresh activity => no thinking spinner."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     tui._handle_event(Event("state", "a1", "Worker", data={"status": "working"}))
     tui._handle_event(Event("narrate", "a1", "Worker", data={"text": "just spoke"}))
 
@@ -197,7 +215,9 @@ def test_screens_render_distinct_content() -> None:
     """Screen 1 contains the hierarchy panel; screen 2 contains the log panel.
     The footer stays present on both."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     tui._handle_event(
         Event("tool_call", "a1", "Worker", data={"tool": "edit_workspace", "args": {}})
     )
@@ -293,6 +313,7 @@ def test_overflow_tree_no_height_yields_tree() -> None:
 def test_setup_input_noop_off_tty() -> None:
     """Tests are not a tty; _setup_input must be a safe no-op so we don't
     accidentally clobber the test runner's terminal state."""
+
     async def go() -> None:
         tui = TUI(task="t")
         tui._setup_input()
@@ -300,6 +321,7 @@ def test_setup_input_noop_off_tty() -> None:
         assert tui._termios_old is None
         # Cleanup is a no-op too.
         tui._restore_input()
+
     asyncio.run(go())
     print("[setup_input_noop_off_tty] OK")
 
@@ -307,9 +329,25 @@ def test_setup_input_noop_off_tty() -> None:
 def test_cycle_focus() -> None:
     """j/k keys cycle focus_id through the agent list."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0}))
-    tui._handle_event(Event("spawn", "a2", "Mgr", data={"role_type": "manager", "depth": 1, "parent_id": "a1"}))
-    tui._handle_event(Event("spawn", "a3", "Worker", data={"role_type": "worker", "depth": 2, "parent_id": "a2"}))
+    tui._handle_event(
+        Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0})
+    )
+    tui._handle_event(
+        Event(
+            "spawn",
+            "a2",
+            "Mgr",
+            data={"role_type": "manager", "depth": 1, "parent_id": "a1"},
+        )
+    )
+    tui._handle_event(
+        Event(
+            "spawn",
+            "a3",
+            "Worker",
+            data={"role_type": "worker", "depth": 2, "parent_id": "a2"},
+        )
+    )
 
     # focus_id should be on the last spawned agent
     assert tui.focus_id == "a3"
@@ -321,7 +359,6 @@ def test_cycle_focus() -> None:
     assert tui.focus_id == ids[expected_idx]
 
     # 'k' moves backward
-    prev_id = tui.focus_id
     tui._handle_key("k")
     assert tui.focus_id == "a3"
 
@@ -357,9 +394,25 @@ def test_toggle_fired() -> None:
 def test_fired_agents_hidden_in_tree() -> None:
     """When show_fired is False, fired agents should not appear in the tree."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0}))
-    tui._handle_event(Event("spawn", "a2", "Worker1", data={"role_type": "worker", "depth": 1, "parent_id": "a1"}))
-    tui._handle_event(Event("spawn", "a3", "Worker2", data={"role_type": "worker", "depth": 1, "parent_id": "a1"}))
+    tui._handle_event(
+        Event("spawn", "a1", "CEO", data={"role_type": "ceo", "depth": 0})
+    )
+    tui._handle_event(
+        Event(
+            "spawn",
+            "a2",
+            "Worker1",
+            data={"role_type": "worker", "depth": 1, "parent_id": "a1"},
+        )
+    )
+    tui._handle_event(
+        Event(
+            "spawn",
+            "a3",
+            "Worker2",
+            data={"role_type": "worker", "depth": 1, "parent_id": "a1"},
+        )
+    )
     tui._handle_event(Event("state", "a2", "Worker1", data={"status": "fired"}))
 
     # Focus on a non-fired agent so the focus panel doesn't show the fired one.
@@ -369,6 +422,7 @@ def test_fired_agents_hidden_in_tree() -> None:
     tui.show_fired = True
     import io
     from rich.console import Console as _C
+
     buf = _C(file=io.StringIO(), force_terminal=False, width=200)
     with buf.capture() as cap:
         buf.print(tui._build_tree())
@@ -409,6 +463,7 @@ def test_story_screen_renders() -> None:
 
     # With a narration entry, it should render the text.
     from taskgenie.narrator import NarrationEntry
+
     tui.narrator.entries.append(
         NarrationEntry(text="The CEO has hired a manager. How original.")
     )

@@ -17,6 +17,7 @@ A3. tui.py:_build_log_panel ran the event log through Text.from_markup,
 
 Run with: python -m tests.test_review_pra
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -59,10 +60,7 @@ def _assert_no_dangling_tool_calls(messages: list[dict]) -> None:
             # Find a matching tool message AFTER this assistant message.
             ok = False
             for later in messages[i + 1 :]:
-                if (
-                    later.get("role") == "tool"
-                    and later.get("tool_call_id") == tc_id
-                ):
+                if later.get("role") == "tool" and later.get("tool_call_id") == tc_id:
                     ok = True
                     break
             assert ok, (
@@ -204,9 +202,7 @@ async def test_complete_seals_trailing_tool_calls_in_same_turn() -> None:
     _assert_no_dangling_tool_calls(ceo.messages)
     # Both tool_call_ids should have replies.
     tool_replies = {
-        m.get("tool_call_id")
-        for m in ceo.messages
-        if m.get("role") == "tool"
+        m.get("tool_call_id") for m in ceo.messages if m.get("role") == "tool"
     }
     assert "call_fu_1" in tool_replies
     assert "call_complete_2" in tool_replies
@@ -309,7 +305,9 @@ def test_blocker_reason_with_markup_is_escaped_in_log() -> None:
     """A blocker reason containing Rich markup must not break out into
     styling on the log screen."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     tui._handle_event(
         Event(
             "blocked",
@@ -331,7 +329,9 @@ def test_blocker_reason_with_markup_is_escaped_in_log() -> None:
 def test_tool_args_with_markup_is_escaped_in_log() -> None:
     """Tool arguments are LLM-generated; markup in them must not escape."""
     tui = TUI(task="t")
-    tui._handle_event(Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1}))
+    tui._handle_event(
+        Event("spawn", "a1", "Worker", data={"role_type": "worker", "depth": 1})
+    )
     tui._handle_event(
         Event(
             "tool_call",

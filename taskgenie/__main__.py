@@ -49,9 +49,7 @@ def _print_banner(console: Console, session: Session, mcp: MCPClient) -> None:
     if mcp.connect_errors:
         for server, err in mcp.connect_errors.items():
             lines.append(f"[bold red]MCP error[/] {server}: {err}")
-    console.print(
-        Panel.fit("\n".join(lines), title="TaskGenie", border_style="cyan")
-    )
+    console.print(Panel.fit("\n".join(lines), title="TaskGenie", border_style="cyan"))
 
 
 def _print_blocker(console: Console, result: RunResult) -> None:
@@ -71,9 +69,7 @@ def _print_blocker(console: Console, result: RunResult) -> None:
 
 
 def _read_unblock_input(console: Console, prompt: str = "you > ") -> str | None:
-    console.print(
-        "[dim]Reply with guidance to resume, or empty/'abandon' to stop.[/]"
-    )
+    console.print("[dim]Reply with guidance to resume, or empty/'abandon' to stop.[/]")
     try:
         response = console.input(f"[bold yellow]{prompt}[/] ").strip()
     except EOFError:
@@ -203,9 +199,7 @@ async def _headless_event_printer(stop_event: asyncio.Event) -> None:
                 continue
             if event.kind not in _HEADLESS_EVENT_KINDS:
                 continue
-            ts = datetime.fromtimestamp(event.ts, tz=timezone.utc).strftime(
-                "%H:%M:%S"
-            )
+            ts = datetime.fromtimestamp(event.ts, tz=timezone.utc).strftime("%H:%M:%S")
             detail_parts: list[str] = []
             if event.kind == "hire" and "child_name" in event.data:
                 detail_parts.append(f"hired {event.data['child_name']}")
@@ -228,9 +222,7 @@ async def _headless_event_printer(stop_event: asyncio.Event) -> None:
             elif event.kind == "question" and "question" in event.data:
                 detail_parts.append(event.data["question"])
             elif event.kind == "spawn":
-                detail_parts.append(
-                    f"status: {event.data.get('status', 'working')}"
-                )
+                detail_parts.append(f"status: {event.data.get('status', 'working')}")
             detail = " ".join(detail_parts) if detail_parts else event.kind
             print(
                 f"[{ts}] {event.agent_name}: {event.kind} {detail}",
@@ -266,9 +258,7 @@ def _workspace_file_list(session: Session) -> list[str]:
     base = session.project_dir
     if not base.exists():
         return []
-    return sorted(
-        str(p.relative_to(base)) for p in base.rglob("*") if p.is_file()
-    )
+    return sorted(str(p.relative_to(base)) for p in base.rglob("*") if p.is_file())
 
 
 def _emit_json_result(
@@ -286,9 +276,7 @@ def _emit_json_result(
             "session_id": session.session_id if session else "",
             "project_dir": str(session.project_dir) if session else "",
             "stats": stats_dict or {},
-            "workspace_files": (
-                _workspace_file_list(session) if session else []
-            ),
+            "workspace_files": (_workspace_file_list(session) if session else []),
         }
     else:
         obj = {"status": "error", "error": error}
@@ -408,10 +396,7 @@ async def _print_status_panel(
 
     def _walk(parent_node: Any, agent: Agent) -> None:
         for child in agent.children:
-            label = (
-                f"[bold]{child.name}[/]  "
-                f"[dim]{child.role_type}/{child.status}[/]"
-            )
+            label = f"[bold]{child.name}[/]  [dim]{child.role_type}/{child.status}[/]"
             node = parent_node.add(label)
             _walk(node, child)
 
@@ -539,9 +524,7 @@ async def _drive_session(
 
             if headless:
                 # Minimal stderr summary, then JSON or plain-text to stdout.
-                print(
-                    f"done: session {session.session_id}", file=sys.stderr
-                )
+                print(f"done: session {session.session_id}", file=sys.stderr)
             else:
                 console.print(Rule(style="green"))
                 console.print(
@@ -556,9 +539,7 @@ async def _drive_session(
             readme_path = _write_project_readme(session, result.report)
             if not headless:
                 _print_workspace_panel(console, session)
-            stats_dict = await _compute_stats_for_artifact(
-                session, ceo, logger
-            )
+            stats_dict = await _compute_stats_for_artifact(session, ceo, logger)
             try:
                 paths = write_final(
                     session,
@@ -574,13 +555,9 @@ async def _drive_session(
                         f"  [cyan]json[/]:     {paths['json']}",
                     ]
                     if readme_path is not None:
-                        lines.append(
-                            f"  [bold green]README[/]:   {readme_path}"
-                        )
+                        lines.append(f"  [bold green]README[/]:   {readme_path}")
                     if "extra" in paths:
-                        lines.append(
-                            f"  [bold green]--output[/]: {paths['extra']}"
-                        )
+                        lines.append(f"  [bold green]--output[/]: {paths['extra']}")
                     console.print(
                         Panel(
                             "\n".join(lines),
@@ -611,9 +588,7 @@ async def _drive_session(
                 print(result.report or "(no answer)", file=sys.stdout)
                 return 0
 
-            console.print(
-                f"[dim]Session saved as[/] [bold]{session.session_id}[/]"
-            )
+            console.print(f"[dim]Session saved as[/] [bold]{session.session_id}[/]")
 
             # Follow-up loop. Stay until user types /done or sends EOF.
             next_followup: str | None = None
@@ -627,19 +602,13 @@ async def _drive_session(
                     )
                     return 0
                 if raw == "/status":
-                    await _print_status_panel(
-                        console, session, ceo, logger
-                    )
+                    await _print_status_panel(console, session, ceo, logger)
                     continue
                 if raw == "/retry":
                     if last_followup is None:
-                        console.print(
-                            "[yellow]No previous follow-up to retry.[/]"
-                        )
+                        console.print("[yellow]No previous follow-up to retry.[/]")
                         continue
-                    console.print(
-                        f"[dim]/retry — replaying:[/] {last_followup}"
-                    )
+                    console.print(f"[dim]/retry — replaying:[/] {last_followup}")
                     next_followup = last_followup
                     break
                 if raw == "/reset":
@@ -655,7 +624,9 @@ async def _drive_session(
                         continue
                     try:
                         archive_path = shutil.make_archive(
-                            str(project_dir), "zip", root_dir=str(project_dir.parent),
+                            str(project_dir),
+                            "zip",
+                            root_dir=str(project_dir.parent),
                             base_dir=project_dir.name,
                         )
                         console.print(
@@ -744,8 +715,7 @@ async def _drive_session(
                 console.print("[yellow]Task abandoned (state saved).[/]")
                 console.print(
                     Panel(
-                        result.partial_progress
-                        or "(no partial progress reported)",
+                        result.partial_progress or "(no partial progress reported)",
                         title="Partial progress",
                         border_style="yellow",
                     )
@@ -776,8 +746,7 @@ async def _drive_session(
         else:
             console.print(
                 Panel(
-                    f"[red]{result.kind.upper()}[/]\n\n"
-                    f"{result.error or '(no detail)'}",
+                    f"[red]{result.kind.upper()}[/]\n\n{result.error or '(no detail)'}",
                     title="Run ended",
                     border_style="red",
                 )
@@ -807,8 +776,7 @@ async def _run_new(
             _print_banner(console, session, mcp)
         else:
             print(
-                f"session: {session.session_id} | "
-                f"project: {session.project_dir}",
+                f"session: {session.session_id} | project: {session.project_dir}",
                 file=sys.stderr,
             )
         ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
@@ -867,9 +835,7 @@ async def _run_resume(
         if not headless:
             _print_banner(console, session, mcp)
         else:
-            print(
-                f"resuming session: {session.session_id}", file=sys.stderr
-            )
+            print(f"resuming session: {session.session_id}", file=sys.stderr)
 
         tool_diff = session.diff_tools_against(
             REGISTRY.signature("management"),
@@ -899,7 +865,8 @@ async def _run_resume(
                 resolved_idx = _i
         last_pause = next(
             (
-                h for h in reversed(session.data.history[resolved_idx + 1 :])
+                h
+                for h in reversed(session.data.history[resolved_idx + 1 :])
                 if h["kind"] in ("blocker", "question")
             ),
             None,
@@ -949,7 +916,7 @@ async def _run_resume(
             # rather than the blocker-style "what unblocks you?" prompt.
             console.print(
                 Panel(
-                    f"[bold]Last answer:[/] this session was last marked done. "
+                    "[bold]Last answer:[/] this session was last marked done. "
                     "Give a follow-up task to extend or refine the work, or "
                     "type [cyan]/done[/] to leave it as-is.",
                     title="Session was completed",
@@ -986,16 +953,13 @@ async def _run_resume(
             # Try to surface the last error/abandon detail from history.
             last_terminal = next(
                 (
-                    h for h in reversed(session.data.history)
+                    h
+                    for h in reversed(session.data.history)
                     if h["kind"] in ("error", "abandoned")
                 ),
                 None,
             )
-            detail = (
-                last_terminal.get("text", "")
-                if last_terminal
-                else ""
-            )
+            detail = last_terminal.get("text", "") if last_terminal else ""
             body = (
                 f"[bold]Status:[/] {session.data.status}\n"
                 + (f"[bold]Detail:[/] {detail}\n" if detail else "")
@@ -1104,9 +1068,7 @@ def _list_sessions(filter_text: str | None = None) -> int:
         style = status_styles.get(status, "white")
         duration = _compute_duration(r["started_at"], r["last_saved_at"])
         agent_count = r.get("agent_count", 0)
-        total_tokens = r.get(
-            "total_tokens", r.get("prompt_tokens", 0)
-        )
+        total_tokens = r.get("total_tokens", r.get("prompt_tokens", 0))
         token_str = f"{total_tokens:,}" if total_tokens else "-"
         table.add_row(
             r["session_id"],
@@ -1136,9 +1098,13 @@ def _delete_session(session_id: str, force: bool = False) -> int:
         return 1
     if not force:
         try:
-            answer = console.input(
-                f"Delete session [cyan]{session_id}[/] and all its data? [y/N] "
-            ).strip().lower()
+            answer = (
+                console.input(
+                    f"Delete session [cyan]{session_id}[/] and all its data? [y/N] "
+                )
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]Cancelled.[/]")
             return 1
@@ -1162,9 +1128,7 @@ def _show_stats(session_id: str) -> int:
         console.print(f"[red]No events log found for session:[/] {session_id}")
         return 1
     try:
-        stats = stats_module.compute(
-            session.events_path, ceo_id=session.data.ceo_id
-        )
+        stats = stats_module.compute(session.events_path, ceo_id=session.data.ceo_id)
     except Exception as e:
         console.print(f"[red]Failed to compute stats:[/] {e}")
         return 1
@@ -1239,7 +1203,11 @@ def cli() -> None:
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("task", nargs="*", help="The task to give the CEO (omit when using --resume or --list).")
+    parser.add_argument(
+        "task",
+        nargs="*",
+        help="The task to give the CEO (omit when using --resume or --list).",
+    )
     parser.add_argument(
         "--resume",
         nargs="?",

@@ -6,6 +6,7 @@
 
 Run with: python -m tests.test_interactivity
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +27,6 @@ from taskgenie.agent import Agent
 from taskgenie.artifacts import write_final
 from taskgenie.config import CONFIG
 from taskgenie.prompts import CEO_ROLE_PROMPT
-from taskgenie.result import RunResult
 from taskgenie.session import Session, PROJECTS_ROOT_ENV
 
 from tests.test_loop import ScriptedLLM, tc

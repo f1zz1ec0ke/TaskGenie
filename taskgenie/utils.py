@@ -1,4 +1,5 @@
 """Shared formatting utilities used across the TaskGenie codebase."""
+
 from __future__ import annotations
 
 

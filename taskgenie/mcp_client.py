@@ -4,6 +4,7 @@ Lives for the duration of a TaskGenie run. Owns an AsyncExitStack that holds
 each server's stdio + ClientSession contexts; closing the client cleanly
 shuts every subprocess down.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -97,9 +98,7 @@ class MCPClient:
                     "name conflict even after prefixing"
                 )
                 prior = self._connect_errors.get(server_name)
-                self._connect_errors[server_name] = (
-                    f"{prior}; {msg}" if prior else msg
-                )
+                self._connect_errors[server_name] = f"{prior}; {msg}" if prior else msg
                 return
 
         schema = {
@@ -170,7 +169,6 @@ class MCPClient:
             # of the Rich console so it doesn't get swallowed by an alt-screen
             # TUI that's already torn down.
             print(
-                f"[mcp_client] cleanup error in close(): "
-                f"{type(e).__name__}: {e}",
+                f"[mcp_client] cleanup error in close(): {type(e).__name__}: {e}",
                 file=sys.stderr,
             )

@@ -21,6 +21,7 @@ D4. Agent integration:
 
 Run with: python -m tests.test_review_prd
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +41,6 @@ from taskgenie.context import (
     dump_large_tool_result,
     should_compact,
 )
-from taskgenie.prompts import CEO_ROLE_PROMPT
 
 
 def _tc(call_id: str, tool_name: str, **args):
@@ -213,7 +213,9 @@ async def test_archivist_compacts_middle_messages() -> None:
     original_llm = archivist_module.LLM
     archivist_module.LLM = fake
     try:
-        new_msgs = await archivist_module.compact_messages("Worker", msgs, keep_recent=6)
+        new_msgs = await archivist_module.compact_messages(
+            "Worker", msgs, keep_recent=6
+        )
     finally:
         archivist_module.LLM = original_llm
 
@@ -242,10 +244,7 @@ async def test_archivist_falls_back_on_llm_failure() -> None:
     msgs = [
         {"role": "system", "content": "..."},
         {"role": "user", "content": "task"},
-        *[
-            {"role": "assistant", "content": f"step {i}"}
-            for i in range(10)
-        ],
+        *[{"role": "assistant", "content": f"step {i}"} for i in range(10)],
     ]
     original_llm = archivist_module.LLM
     archivist_module.LLM = _FailingLLM()
@@ -368,9 +367,7 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
     async def dispatcher(agent, args):
         return "Z" * 40000
 
-    REGISTRY.register(
-        big_schema, kind="work", version="1.0", dispatcher=dispatcher
-    )
+    REGISTRY.register(big_schema, kind="work", version="1.0", dispatcher=dispatcher)
     # Drive the threshold below the 40KB fake output so this test stays
     # independent of CONFIG.dump_tool_output_above_bytes's default. Keep it
     # above the agent's default 4096 chunk_margin so chunks are a sane size
@@ -378,6 +375,7 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
     original_dump_threshold = CONFIG.dump_tool_output_above_bytes
     object.__setattr__(CONFIG, "dump_tool_output_above_bytes", 8192)
     try:
+
         class _LLM:
             _n = 0
 
@@ -406,22 +404,23 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
         assert result.kind == "done", result
         # Find the tool message for c1.
         tool_msgs = [
-            m for m in worker.messages
+            m
+            for m in worker.messages
             if m.get("role") == "tool" and m.get("tool_call_id") == "c1"
         ]
         assert len(tool_msgs) == 1
         content = tool_msgs[0]["content"]
         # Must be the pointer, not the 8KB blob.
-        assert len(content) < 1000, f"in-memory tool content not dumped: {len(content)} bytes"
+        assert len(content) < 1000, (
+            f"in-memory tool content not dumped: {len(content)} bytes"
+        )
         assert "tool output dumped" in content
         assert "read_file" in content
         # And the 40KB really is on disk in scratch, split across chunks
         # that concatenate (in filename order) back to the original.
         scratch_files = sorted(Path(worker.scratch_dir).glob("tool-*.log"))
         assert scratch_files, "no dumped log file in scratch"
-        reconstructed = "".join(
-            f.read_text(encoding="utf-8") for f in scratch_files
-        )
+        reconstructed = "".join(f.read_text(encoding="utf-8") for f in scratch_files)
         assert reconstructed == "Z" * 40000
     finally:
         REGISTRY.unregister("_fake_huge_tool")

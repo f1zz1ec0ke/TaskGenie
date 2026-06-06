@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,8 +149,6 @@ class Config:
 
 
 CONFIG = Config()
-
-import logging
 
 
 def setup_logging(level: str = "WARNING") -> None:

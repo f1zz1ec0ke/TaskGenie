@@ -99,7 +99,9 @@ class Agent:
         self.parent = parent
         self.depth = depth
         self.children: list[Agent] = []
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
         self.status: Status = "idle"
         self.task_assignments: dict[str, asyncio.Task[RunResult]] = {}
         self.task_targets: dict[str, str] = {}
@@ -122,12 +124,12 @@ class Agent:
         # for one agent, split it next time". Updated in
         # _maybe_compact's finally block.
         self.compaction_stats: dict[str, int | float] = {
-            "count": 0,             # successful compactions
-            "skipped": 0,           # CompactionSkipped + "no shrink"
-            "failed": 0,            # CompactionTransientFailure + unexpected
-            "messages_compacted": 0,   # cumulative (before - after) on success
-            "tokens_saved": 0,         # cumulative token reduction on success
-            "duration_ms": 0.0,        # cumulative archivist LLM time
+            "count": 0,  # successful compactions
+            "skipped": 0,  # CompactionSkipped + "no shrink"
+            "failed": 0,  # CompactionTransientFailure + unexpected
+            "messages_compacted": 0,  # cumulative (before - after) on success
+            "tokens_saved": 0,  # cumulative token reduction on success
+            "duration_ms": 0.0,  # cumulative archivist LLM time
         }
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
@@ -240,7 +242,9 @@ class Agent:
             if parent_id:
                 agent.parent = cls.REGISTRY.get(parent_id)
             agent.children = [
-                cls.REGISTRY[cid] for cid in d.get("child_ids", []) if cid in cls.REGISTRY
+                cls.REGISTRY[cid]
+                for cid in d.get("child_ids", [])
+                if cid in cls.REGISTRY
             ]
             BUS.publish(
                 Event(
@@ -304,9 +308,7 @@ class Agent:
         `await_results` -> `RunResult.to_tool_payload`) sees the same
         snapshot regardless of which exit branch fired.
         """
-        return RunResult(
-            compaction_stats=dict(self.compaction_stats), **kwargs
-        )
+        return RunResult(compaction_stats=dict(self.compaction_stats), **kwargs)
 
     async def _maybe_compact(self, force: bool = False) -> bool:
         """If the message history is approaching the context window,
@@ -406,7 +408,9 @@ class Agent:
             self._compaction_floor = len(self.messages)
             new_messages_len = len(new_messages)
             after_tokens = count_tokens(self.messages)
-            logger.info(f"Agent {self.name} compaction: {before} -> {new_messages_len} messages")
+            logger.info(
+                f"Agent {self.name} compaction: {before} -> {new_messages_len} messages"
+            )
             end_payload.update(
                 success=True,
                 after_messages=new_messages_len,
@@ -423,9 +427,7 @@ class Agent:
             self.compaction_stats["duration_ms"] += duration_ms
             if outcome == "success":
                 self.compaction_stats["count"] += 1
-                self.compaction_stats["messages_compacted"] += (
-                    before - new_messages_len
-                )
+                self.compaction_stats["messages_compacted"] += before - new_messages_len
                 if after_tokens is not None:
                     self.compaction_stats["tokens_saved"] += max(
                         0, before_tokens - after_tokens
@@ -460,9 +462,7 @@ class Agent:
         itself are suppressed so they don't mask the original return
         value (or the original exception unwinding through `run()`).
         """
-        pending = [
-            t for t in self.task_assignments.values() if not t.done()
-        ]
+        pending = [t for t in self.task_assignments.values() if not t.done()]
         if not pending:
             return
         for t in pending:
@@ -540,14 +540,18 @@ class Agent:
             await self._maybe_compact()
 
             try:
-                response = await LLM.chat(self.messages, tools=self.tools, model_override=model_override)
+                response = await LLM.chat(
+                    self.messages, tools=self.tools, model_override=model_override
+                )
             except Exception as e:
                 # Reactive recovery: if the API said we exceeded the
                 # context window, force a compaction and retry ONCE. The
                 # heuristic in count_tokens occasionally under-counts a
                 # heavy tool_result so this path catches the long tail.
                 if _is_context_length_error(e):
-                    logger.warning(f"Agent {self.name} context length error, attempting recovery")
+                    logger.warning(
+                        f"Agent {self.name} context length error, attempting recovery"
+                    )
                     self._emit(
                         "error",
                         message=(
@@ -557,7 +561,11 @@ class Agent:
                     compacted = await self._maybe_compact(force=True)
                     if compacted:
                         try:
-                            response = await LLM.chat(self.messages, tools=self.tools, model_override=model_override)
+                            response = await LLM.chat(
+                                self.messages,
+                                tools=self.tools,
+                                model_override=model_override,
+                            )
                         except Exception as e2:
                             self._set_status("error", error=str(e2))
                             self._emit(
@@ -839,9 +847,7 @@ class Agent:
             if i == finishing_index:
                 content = finishing_content
             else:
-                content = (
-                    f"[skipped: agent returned after `{finishing_name}` in the same turn]"
-                )
+                content = f"[skipped: agent returned after `{finishing_name}` in the same turn]"
             self.messages.append(
                 {"role": "tool", "tool_call_id": tc["id"], "content": content}
             )
@@ -939,9 +945,15 @@ class Agent:
             agent_name=child.name,
             task=task,
         )
-        return {"task_handle": task_handle, "agent_id": agent_id, "agent_name": child.name}
+        return {
+            "task_handle": task_handle,
+            "agent_id": agent_id,
+            "agent_name": child.name,
+        }
 
-    async def _tool_await_results(self, task_handles: list[str]) -> dict[str, dict[str, Any]]:
+    async def _tool_await_results(
+        self, task_handles: list[str]
+    ) -> dict[str, dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}
         for h in task_handles:
             t = self.task_assignments.get(h)
@@ -950,10 +962,14 @@ class Agent:
                 continue
             try:
                 r = await t
-                results[h] = r.to_tool_payload() if isinstance(r, RunResult) else {
-                    "status": "done",
-                    "report": str(r),
-                }
+                results[h] = (
+                    r.to_tool_payload()
+                    if isinstance(r, RunResult)
+                    else {
+                        "status": "done",
+                        "report": str(r),
+                    }
+                )
             except asyncio.CancelledError:
                 results[h] = {"status": "cancelled"}
             except Exception as e:

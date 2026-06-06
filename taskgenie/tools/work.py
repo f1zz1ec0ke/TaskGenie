@@ -3,11 +3,11 @@
 Dispatchers are registered with the global ToolRegistry and look up the
 calling agent's scratch directory to scope file operations.
 """
+
 from __future__ import annotations
 
 import asyncio
 import errno
-import json
 import logging
 import os
 import re
@@ -63,7 +63,10 @@ _WRITE_FILE_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to your scratch directory."},
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to your scratch directory.",
+                },
                 "content": {"type": "string"},
             },
             "required": ["path", "content"],
@@ -361,9 +364,7 @@ class _UnsafeOpenError(OSError):
     """
 
 
-def _safe_open(
-    p: Path, base: Path, base_flags: int, perm: int = 0o600
-) -> int:
+def _safe_open(p: Path, base: Path, base_flags: int, perm: int = 0o600) -> int:
     """Open `p` defensively against the full path-safety attack surface:
 
       1. Leaf symlink -- `O_NOFOLLOW` on the open call (kernel-level).
@@ -432,10 +433,7 @@ def _safe_open(
             if actual is not None:
                 actual_p = Path(actual)
                 base_resolved = Path(base).resolve()
-                if (
-                    actual_p != base_resolved
-                    and base_resolved not in actual_p.parents
-                ):
+                if actual_p != base_resolved and base_resolved not in actual_p.parents:
                     raise _UnsafeOpenError(
                         errno.ENOTRECOVERABLE
                         if hasattr(errno, "ENOTRECOVERABLE")
@@ -747,10 +745,7 @@ async def _edit_workspace(agent: Any, args: dict[str, Any]) -> str:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-    return (
-        f"edited workspace/{args['path']} "
-        f"({len(old)} chars -> {len(new)} chars)"
-    )
+    return f"edited workspace/{args['path']} ({len(old)} chars -> {len(new)} chars)"
 
 
 async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
@@ -788,13 +783,13 @@ async def _list_workspace(agent: Any, args: dict[str, Any]) -> str:
     if not entries and not symlinks:
         return "(workspace is empty)"
     lines = [f"workspace root: {base}"]
-    for rel, annot in entries:
-        lines.append(f"  {rel}  ({annot})")
+    for rel_str, annot in entries:
+        lines.append(f"  {rel_str}  ({annot})")
     if symlinks:
         lines.append("")
         lines.append("symlinks (not opened by read/write tools):")
-        for rel, annot in symlinks:
-            lines.append(f"  {rel}  {annot}")
+        for rel_str, annot in symlinks:
+            lines.append(f"  {rel_str}  {annot}")
     return "\n".join(lines)
 
 
@@ -836,9 +831,8 @@ async def _copy_to_workspace(agent: Any, args: dict[str, Any]) -> str:
     # path from workspace. Mirrors the write_workspace(mode='overwrite')
     # check so cross-tool behaviour is consistent.
     norm_dst = _normalize_workspace_path(workspace_rel)
-    previously_read = (
-        mode == "overwrite"
-        and norm_dst in _agent_read_workspace_paths(agent)
+    previously_read = mode == "overwrite" and norm_dst in _agent_read_workspace_paths(
+        agent
     )
 
     # Open source first; if it doesn't exist or is a symlink/hardlink we
@@ -879,8 +873,7 @@ async def _copy_to_workspace(agent: Any, args: dict[str, Any]) -> str:
         os.close(src_fd)
 
     msg = (
-        f"copied {total} bytes from scratch/{scratch_rel} "
-        f"to workspace/{workspace_rel}"
+        f"copied {total} bytes from scratch/{scratch_rel} to workspace/{workspace_rel}"
     )
     if previously_read:
         msg += (
@@ -908,9 +901,7 @@ async def _copy_from_workspace(agent: Any, args: dict[str, Any]) -> str:
     try:
         src_fd = _safe_open(src, ws_base, os.O_RDONLY)
     except FileNotFoundError:
-        return (
-            f"ERROR: workspace source file does not exist: {workspace_rel}"
-        )
+        return f"ERROR: workspace source file does not exist: {workspace_rel}"
     except OSError as e:
         m = _path_safety_error(f"workspace/{workspace_rel}", e)
         if m is not None:
@@ -944,14 +935,15 @@ async def _copy_from_workspace(agent: Any, args: dict[str, Any]) -> str:
         paths.add(_normalize_workspace_path(workspace_rel))
 
     return (
-        f"copied {total} bytes from workspace/{workspace_rel} "
-        f"to scratch/{scratch_rel}"
+        f"copied {total} bytes from workspace/{workspace_rel} to scratch/{scratch_rel}"
     )
 
 
 def _scrubbed_env(agent: Any | None = None) -> dict[str, str]:
     extras = os.environ.get("TASKGENIE_EXEC_ENV_PASSTHROUGH", "")
-    passthrough = _DEFAULT_PASSTHROUGH | {k.strip() for k in extras.split(",") if k.strip()}
+    passthrough = _DEFAULT_PASSTHROUGH | {
+        k.strip() for k in extras.split(",") if k.strip()
+    }
     env = {k: v for k, v in os.environ.items() if k in passthrough}
     # Expose the workspace + scratch paths so exec_code snippets can act on
     # files the worker wrote with `write_workspace`. Without this the agent
@@ -1088,15 +1080,29 @@ def register_builtin_work_tools() -> None:
     # (read/write/exec triplet on scratch), then the workspace tools
     # (list/read/write/edit/exec quintet). Cross-references in tool
     # descriptions resolve in reading order this way.
-    REGISTRY.register(_READ_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_read_file)
-    REGISTRY.register(_WRITE_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_write_file)
-    REGISTRY.register(_EXEC_CODE_SCHEMA, kind="work", version="0.3", dispatcher=_exec_code)
+    REGISTRY.register(
+        _READ_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_read_file
+    )
+    REGISTRY.register(
+        _WRITE_FILE_SCHEMA, kind="work", version="1.0", dispatcher=_write_file
+    )
+    REGISTRY.register(
+        _EXEC_CODE_SCHEMA, kind="work", version="0.3", dispatcher=_exec_code
+    )
     # Workspace is shared across all agents in a session: workers write/edit/exec,
     # managers and CEO read to verify deliverables.
-    REGISTRY.register(_LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace)
-    REGISTRY.register(_READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace)
-    REGISTRY.register(_WRITE_WORKSPACE_SCHEMA, kind="work", version="1.1", dispatcher=_write_workspace)
-    REGISTRY.register(_EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace)
+    REGISTRY.register(
+        _LIST_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_list_workspace
+    )
+    REGISTRY.register(
+        _READ_WORKSPACE_SCHEMA, kind="both", version="1.0", dispatcher=_read_workspace
+    )
+    REGISTRY.register(
+        _WRITE_WORKSPACE_SCHEMA, kind="work", version="1.1", dispatcher=_write_workspace
+    )
+    REGISTRY.register(
+        _EDIT_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_edit_workspace
+    )
     REGISTRY.register(
         _EXEC_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_exec_workspace
     )
@@ -1104,10 +1110,16 @@ def register_builtin_work_tools() -> None:
     # 'overwrite' semantics + same hardlink/symlink/TOCTOU defense via
     # _safe_open at both source and destination.
     REGISTRY.register(
-        _COPY_TO_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_copy_to_workspace
+        _COPY_TO_WORKSPACE_SCHEMA,
+        kind="work",
+        version="1.0",
+        dispatcher=_copy_to_workspace,
     )
     REGISTRY.register(
-        _COPY_FROM_WORKSPACE_SCHEMA, kind="work", version="1.0", dispatcher=_copy_from_workspace
+        _COPY_FROM_WORKSPACE_SCHEMA,
+        kind="work",
+        version="1.0",
+        dispatcher=_copy_from_workspace,
     )
 
 

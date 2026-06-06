@@ -4,6 +4,7 @@ Exercises the full save/load cycle so a real user can quit during a blocker,
 restart the process, and resume from the saved state. Also exercises the
 tool-diff message when the registry changes between save and load.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -119,7 +120,9 @@ async def test_save_load_resume() -> None:
         assert "FINAL ANSWER" in result2.report
 
         reloaded.mark_done(result2.report)
-        reloaded.snapshot_agents({aid: a.to_dict() for aid, a in Agent.REGISTRY.items()})
+        reloaded.snapshot_agents(
+            {aid: a.to_dict() for aid, a in Agent.REGISTRY.items()}
+        )
         reloaded.save()
         final_disk = json.loads(reloaded.state_path.read_text())
         assert final_disk["status"] == "done"
@@ -175,6 +178,7 @@ async def test_tool_diff_on_resume() -> None:
         # test inspecting the registry would see a fake older
         # exec_code. Round-three confirmed exec_code is at version 0.3.
         from taskgenie.tools.work import _EXEC_CODE_SCHEMA, _exec_code
+
         REGISTRY.register(
             _EXEC_CODE_SCHEMA, kind="work", version="0.3", dispatcher=_exec_code
         )

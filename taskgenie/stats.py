@@ -4,6 +4,7 @@ Used to render the post-run summary panel — a meta-debugging view that
 complements the CEO's qualitative `Process retrospective` section in the
 final report.
 """
+
 from __future__ import annotations
 
 from collections import Counter
@@ -166,11 +167,7 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
 
     blockers_resolved_internally = max(0, blockers_total - blockers_escalated_to_user)
 
-    duration = (
-        (last_ts - first_ts).total_seconds()
-        if first_ts and last_ts
-        else None
-    )
+    duration = (last_ts - first_ts).total_seconds() if first_ts and last_ts else None
 
     from taskgenie.config import CONFIG
 
@@ -214,8 +211,12 @@ def render_panel(stats: RunStats):
     overview = Table.grid(padding=(0, 2))
     overview.add_column(style="dim")
     overview.add_column()
-    overview.add_row("Agents", f"{len(stats.agents)} total — {role_summary or '(none)'}")
-    overview.add_row("Hires / fires / rehires", f"{stats.hires} / {stats.fires} / {stats.rehires}")
+    overview.add_row(
+        "Agents", f"{len(stats.agents)} total — {role_summary or '(none)'}"
+    )
+    overview.add_row(
+        "Hires / fires / rehires", f"{stats.hires} / {stats.fires} / {stats.rehires}"
+    )
     overview.add_row(
         "Blockers",
         f"{stats.blockers_total} total "
@@ -265,9 +266,12 @@ def render_panel(stats: RunStats):
     }
     for agent in sorted(stats.agents.values(), key=lambda a: (a.role_type, a.name)):
         style = status_style.get(agent.status, "white")
-        top_tools = ", ".join(
-            f"{tool}×{count}" for tool, count in agent.tool_calls.most_common(4)
-        ) or "—"
+        top_tools = (
+            ", ".join(
+                f"{tool}×{count}" for tool, count in agent.tool_calls.most_common(4)
+            )
+            or "—"
+        )
         blocker_text = ""
         if agent.blocker:
             blocker_text = f"{agent.blocker.get('needs', '')[:60]}".strip()

@@ -3,6 +3,7 @@ managers (and CEO) verify by listing/reading.
 
 Run with: python -m tests.test_workspace
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -140,9 +141,7 @@ async def test_write_modes(tmp_path: Path) -> None:
     assert (session.project_dir / "log.txt").read_text() == "line1\nline2\n"
 
     # Unknown mode error
-    res = await write(
-        worker, {"path": "x.txt", "content": "x", "mode": "smash"}
-    )
+    res = await write(worker, {"path": "x.txt", "content": "x", "mode": "smash"})
     assert "unknown mode" in res.lower()
 
     print("[write_modes] OK")
@@ -164,9 +163,7 @@ async def test_edit_workspace(tmp_path: Path) -> None:
     assert edit is not None
 
     # Edit on missing file fails with a helpful message
-    res = await edit(
-        worker, {"path": "missing.py", "old_text": "x", "new_text": "y"}
-    )
+    res = await edit(worker, {"path": "missing.py", "old_text": "x", "new_text": "y"})
     assert "does not exist" in res
 
     # Set up a file
@@ -321,7 +318,9 @@ async def test_utf8_roundtrip(tmp_path: Path) -> None:
         {"path": "log.txt", "content": "Größe\n", "mode": "append"},
     )
     assert "appended" in res
-    assert (session.project_dir / "log.txt").read_text(encoding="utf-8") == "ñoño\nGröße\n"
+    assert (session.project_dir / "log.txt").read_text(
+        encoding="utf-8"
+    ) == "ñoño\nGröße\n"
 
     # Scratch file ops use utf-8 too
     res = await write_scratch(worker, {"path": "notes.txt", "content": payload})

@@ -1,4 +1,5 @@
 """Shared fixtures for TaskGenie tests."""
+
 from __future__ import annotations
 
 import pytest

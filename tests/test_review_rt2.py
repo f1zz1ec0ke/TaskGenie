@@ -3,26 +3,23 @@
 One test per non-trivial round-two finding (R1-R35 in REVIEW_NOTES.md).
 Run with: python -m tests.test_review_rt2
 """
+
 from __future__ import annotations
 
 import asyncio
 import errno
 import json
 import os
-import re
 import sys
 import tempfile
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from taskgenie import agent as agent_module
-from taskgenie import context as context_module
 from taskgenie.agent import Agent, _is_context_length_error
 from taskgenie.archivist import _safe_recent_keep
-from taskgenie.config import CONFIG
 from taskgenie.context import dump_large_tool_result
 from taskgenie.event_logger import _truncate_for_log
 from taskgenie.events import BUS, Event
@@ -31,11 +28,9 @@ from taskgenie.stats import compute as stats_compute
 from taskgenie.tools.work import (
     _exec_code,
     _exec_workspace,
-    _read_file,
     _read_workspace,
     _safe_path,
     _scrubbed_env,
-    _write_file,
     _write_workspace,
 )
 
@@ -76,7 +71,9 @@ def _has_symlink_support() -> bool:
             return False
 
 
-async def test_write_workspace_refuses_to_follow_planted_symlink(tmp_path: Path) -> None:
+async def test_write_workspace_refuses_to_follow_planted_symlink(
+    tmp_path: Path,
+) -> None:
     """Two layers of defense:
 
     1. `_safe_path`'s .resolve() chases a pre-existing symlink and, if it
@@ -243,14 +240,14 @@ async def test_tool_pipeline_guard_seals_on_dump_failure() -> None:
             continue
         for tc in msg.get("tool_calls") or []:
             ok = any(
-                later.get("role") == "tool"
-                and later.get("tool_call_id") == tc["id"]
+                later.get("role") == "tool" and later.get("tool_call_id") == tc["id"]
                 for later in ceo.messages[i + 1 :]
             )
             assert ok, f"dangling tool_call_id {tc['id']!r} after pipeline error"
     # Specifically: the call_lsws_1 reply should be [tool_pipeline_error].
     pipeline_replies = [
-        m for m in ceo.messages
+        m
+        for m in ceo.messages
         if m.get("role") == "tool" and m.get("tool_call_id") == "call_lsws_1"
     ]
     assert pipeline_replies, "no reply for call_lsws_1"
@@ -338,6 +335,7 @@ async def test_exec_workspace_errors_when_no_workspace(tmp_path: Path) -> None:
     """If workspace_dir isn't configured, exec_workspace returns the
     standard 'workspace not configured' error rather than running with
     an empty/wrong cwd."""
+
     class _NoWsAgent:
         workspace_dir = None
         scratch_dir = str(tmp_path / "sc")
@@ -367,7 +365,11 @@ def test_archivist_snaps_recent_off_tool_boundary() -> None:
             "role": "assistant",
             "content": "a",
             "tool_calls": [
-                {"id": "x", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                {
+                    "id": "x",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "x", "content": "t"},
@@ -382,9 +384,21 @@ def test_archivist_snaps_recent_off_tool_boundary() -> None:
             "role": "assistant",
             "content": "a",
             "tool_calls": [
-                {"id": "x", "type": "function", "function": {"name": "f", "arguments": "{}"}},
-                {"id": "y", "type": "function", "function": {"name": "g", "arguments": "{}"}},
-                {"id": "z", "type": "function", "function": {"name": "h", "arguments": "{}"}},
+                {
+                    "id": "x",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                },
+                {
+                    "id": "y",
+                    "type": "function",
+                    "function": {"name": "g", "arguments": "{}"},
+                },
+                {
+                    "id": "z",
+                    "type": "function",
+                    "function": {"name": "h", "arguments": "{}"},
+                },
             ],
         },
         {"role": "tool", "tool_call_id": "x", "content": "1"},
@@ -427,9 +441,7 @@ async def test_compaction_emits_events_on_target_agent(tmp_path: Path) -> None:
             # Fill agent with enough messages that should_compact triggers.
             # We bypass should_compact by calling _maybe_compact(force=True).
             ceo.messages.extend(
-                [
-                    {"role": "user", "content": "fill"} for _ in range(10)
-                ]
+                [{"role": "user", "content": "fill"} for _ in range(10)]
             )
             await ceo._maybe_compact(force=True)
         finally:
@@ -446,8 +458,7 @@ async def test_compaction_emits_events_on_target_agent(tmp_path: Path) -> None:
     starts = [e for e in events if e.kind == "compaction_start"]
     ends = [e for e in events if e.kind == "compaction_end"]
     archivist_spawns = [
-        e for e in events
-        if e.kind == "spawn" and "Archivist" in e.agent_name
+        e for e in events if e.kind == "spawn" and "Archivist" in e.agent_name
     ]
     assert len(starts) == 1, starts
     assert len(ends) == 1, ends
@@ -526,9 +537,7 @@ async def test_maybe_compact_repeat_guard(tmp_path: Path) -> None:
 
     agent_module.compact_messages = _noop_compact
     try:
-        ceo.messages.extend(
-            [{"role": "user", "content": "x"} for _ in range(10)]
-        )
+        ceo.messages.extend([{"role": "user", "content": "x"} for _ in range(10)])
         # First call (forced) -> invokes compact, no shrink, sets floor.
         await ceo._maybe_compact(force=True)
         first_call = call_count[0]
@@ -553,6 +562,7 @@ async def test_maybe_compact_repeat_guard(tmp_path: Path) -> None:
     finally:
         # Restore the real one for other tests.
         from taskgenie.archivist import compact_messages as real
+
         agent_module.compact_messages = real
 
 
@@ -616,10 +626,7 @@ async def test_tool_fire_emits_state_event(tmp_path: Path) -> None:
     finally:
         BUS.unsubscribe(probe)
 
-    state_events = [
-        e for e in events
-        if e.kind == "state" and e.agent_id == child_id
-    ]
+    state_events = [e for e in events if e.kind == "state" and e.agent_id == child_id]
     assert state_events, f"no state event for {child_id}; got {events}"
     fired = [e for e in state_events if e.data.get("status") == "fired"]
     assert fired, f"no fired-state event; events were: {state_events}"
@@ -650,8 +657,12 @@ async def test_append_mode_atomic_for_small_payloads(tmp_path: Path) -> None:
     a = _FakeAgent()
     b = _FakeAgent()
     await asyncio.gather(
-        _write_workspace(a, {"path": "log.txt", "content": payload_a, "mode": "append"}),
-        _write_workspace(b, {"path": "log.txt", "content": payload_b, "mode": "append"}),
+        _write_workspace(
+            a, {"path": "log.txt", "content": payload_a, "mode": "append"}
+        ),
+        _write_workspace(
+            b, {"path": "log.txt", "content": payload_b, "mode": "append"}
+        ),
     )
 
     content = (ws / "log.txt").read_text(encoding="utf-8")
@@ -810,9 +821,7 @@ async def test_complete_first_seals_trailing_call() -> None:
     assert result.kind == "done"
 
     replies = {
-        m["tool_call_id"]: m["content"]
-        for m in ceo.messages
-        if m.get("role") == "tool"
+        m["tool_call_id"]: m["content"] for m in ceo.messages if m.get("role") == "tool"
     }
     assert "call_complete_first" in replies, replies
     assert "call_trailing_fu" in replies, (
@@ -839,12 +848,22 @@ def test_dump_filename_unique_per_call_id(tmp_path: Path) -> None:
     content = "y" * 1024  # any string > threshold
 
     _, paths_a = dump_large_tool_result(
-        content, str(tmp_path), turn_idx=0, call_id=long_a,
-        tool_name="exec_code", threshold_bytes=100, chunk_margin=0,
+        content,
+        str(tmp_path),
+        turn_idx=0,
+        call_id=long_a,
+        tool_name="exec_code",
+        threshold_bytes=100,
+        chunk_margin=0,
     )
     _, paths_b = dump_large_tool_result(
-        content, str(tmp_path), turn_idx=0, call_id=long_b,
-        tool_name="exec_code", threshold_bytes=100, chunk_margin=0,
+        content,
+        str(tmp_path),
+        turn_idx=0,
+        call_id=long_b,
+        tool_name="exec_code",
+        threshold_bytes=100,
+        chunk_margin=0,
     )
     assert paths_a is not None and paths_b is not None
     # The two call_ids must produce DISJOINT filename sets -- if the call-id
@@ -900,8 +919,17 @@ def main() -> int:
         root = Path(d)
         # Make subdirs the async tests need.
         for sub in (
-            "r1", "r1c", "r4b", "r4c", "r4d", "r7", "r8a", "r8b",
-            "r9", "r11", "r14",
+            "r1",
+            "r1c",
+            "r4b",
+            "r4c",
+            "r4d",
+            "r7",
+            "r8a",
+            "r8b",
+            "r9",
+            "r11",
+            "r14",
         ):
             (root / sub).mkdir()
         asyncio.run(_async_tests(root))

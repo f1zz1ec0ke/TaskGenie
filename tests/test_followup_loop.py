@@ -3,11 +3,11 @@ CEO completes again. Exercise the /done, /status, /retry, /reset commands.
 
 Run with: python -m tests.test_followup_loop
 """
+
 from __future__ import annotations
 
 import asyncio
 import io
-import json
 import os
 import sys
 import tempfile
@@ -227,7 +227,9 @@ async def test_reset_fires_team_but_keeps_ceo(tmp_path: Path) -> None:
     assert last_msg["role"] == "user"
     assert "/reset" in last_msg["content"]
     # Workspace files preserved
-    assert (session.project_dir / "keepme.txt").read_text(encoding="utf-8") == "preserved"
+    assert (session.project_dir / "keepme.txt").read_text(
+        encoding="utf-8"
+    ) == "preserved"
     # Session history recorded the reset
     reset_entries = [h for h in session.data.history if h["kind"] == "reset"]
     assert len(reset_entries) == 1

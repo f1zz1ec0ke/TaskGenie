@@ -225,9 +225,7 @@ class _ColumnOverflowTree:
         # for trees with very long agent names (300+ chars from a
         # role_type/status suffix on top of the name); 4096 covers any
         # realistic case without meaningfully changing render cost.
-        wide_opts = options.update(
-            width=max(avail_w, 4096), height=None
-        )
+        wide_opts = options.update(width=max(avail_w, 4096), height=None)
         wide_lines = console.render_lines(self._tree, wide_opts, pad=False)
         # Drop trailing blank lines Rich sometimes adds.
         while wide_lines and not any(s.text.strip() for s in wide_lines[-1]):
@@ -746,14 +744,15 @@ class TUI:
             return
 
         managers = [
-            c for c in known_children
+            c
+            for c in known_children
             if c.role_type in ("manager", "ceo")
             and (self.show_fired or c.status != "fired")
         ]
         workers = [
-            c for c in known_children
-            if c.role_type == "worker"
-            and (self.show_fired or c.status != "fired")
+            c
+            for c in known_children
+            if c.role_type == "worker" and (self.show_fired or c.status != "fired")
         ]
 
         active_managers = [c for c in managers if c.status not in ("done", "fired")]
@@ -842,9 +841,7 @@ class TUI:
             self._add_node(node, child.id, now)
         hidden = len(ordered_managers) - min(cap, len(ordered_managers))
         if hidden > 0:
-            node.add(
-                Text(f"…+{hidden} more managers", style="dim italic")
-            )
+            node.add(Text(f"…+{hidden} more managers", style="dim italic"))
 
     def _format_activity_entry(self, entry: dict[str, Any]) -> Text:
         """One row of an agent's activity log. Kind drives color + prefix."""
@@ -971,7 +968,9 @@ class TUI:
             body_parts.append(Text(f"reason: {v.blocker_reason}", style="orange1"))
             body_parts.append(Text(f"needs:  {v.blocker_needs}", style="orange1"))
             if v.partial_progress:
-                body_parts.append(Text(f"partial: {v.partial_progress}", style="orange1 dim"))
+                body_parts.append(
+                    Text(f"partial: {v.partial_progress}", style="orange1 dim")
+                )
 
         if v.status == "asking" or v.question:
             body_parts.append(Text(""))
@@ -979,7 +978,9 @@ class TUI:
             body_parts.append(Text(v.question, style="cyan"))
             if v.question_context:
                 body_parts.append(
-                    Text(f"context: {_trunc(v.question_context, 400)}", style="cyan dim")
+                    Text(
+                        f"context: {_trunc(v.question_context, 400)}", style="cyan dim"
+                    )
                 )
             if v.question_options:
                 body_parts.append(Text("options:", style="cyan dim"))
@@ -999,11 +1000,7 @@ class TUI:
         # least once. Lets the operator see "this worker burned 3
         # archivist calls" without scrolling activity log for compaction
         # entries.
-        if (
-            v.compaction_count
-            or v.compaction_skipped
-            or v.compaction_failed
-        ):
+        if v.compaction_count or v.compaction_skipped or v.compaction_failed:
             body_parts.append(Text(""))
             line = Text()
             line.append("context compaction: ", style="dim")
@@ -1030,14 +1027,18 @@ class TUI:
         if v.follow_ups:
             body_parts.append(Text(""))
             body_parts.append(
-                Text(f"follow-ups suggested ({len(v.follow_ups)}):", style="magenta dim")
+                Text(
+                    f"follow-ups suggested ({len(v.follow_ups)}):", style="magenta dim"
+                )
             )
             for i, fu in enumerate(v.follow_ups[:5], 1):
                 line = Text()
                 line.append(f"  {i}. ", style="magenta dim")
                 line.append(_trunc(fu.get("what", ""), 90), style="magenta")
                 if fu.get("rationale"):
-                    line.append(f" -- {_trunc(fu['rationale'], 60)}", style="magenta dim")
+                    line.append(
+                        f" -- {_trunc(fu['rationale'], 60)}", style="magenta dim"
+                    )
                 body_parts.append(line)
             if len(v.follow_ups) > 5:
                 body_parts.append(
