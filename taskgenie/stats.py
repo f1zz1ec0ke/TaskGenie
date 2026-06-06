@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from taskgenie.event_logger import read_events
-from taskgenie.utils import fmt_count
+from taskgenie.utils import fmt_count, fmt_duration
 
 
 @dataclass
@@ -244,7 +244,7 @@ def render_panel(stats: RunStats):
     if stats.estimated_cost > 0:
         overview.add_row("Estimated cost", f"${stats.estimated_cost:.4f}")
     if stats.duration_seconds is not None:
-        overview.add_row("Wall time", f"{stats.duration_seconds:.1f}s")
+        overview.add_row("Wall time", fmt_duration(stats.duration_seconds))
 
     per_agent = Table(show_header=True, header_style="bold", expand=False)
     per_agent.add_column("agent", style="cyan")

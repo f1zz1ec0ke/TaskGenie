@@ -28,6 +28,7 @@ from taskgenie.result import RunResult
 from taskgenie.session import Session
 from taskgenie.tools.registry import REGISTRY
 from taskgenie.tui import TUI
+from taskgenie.utils import fmt_duration
 
 ABANDON_TOKENS = {"", "quit", "exit", "abandon", "stop"}
 
@@ -220,8 +221,10 @@ async def _headless_event_printer(stop_event: asyncio.Event) -> None:
                 detail_parts.append(report_text)
             elif event.kind == "blocked" and "reason" in event.data:
                 detail_parts.append(event.data["reason"])
-            elif event.kind == "error" and "error" in event.data:
-                detail_parts.append(event.data["error"])
+            elif event.kind == "error" and "message" in event.data:
+                # Agent error events carry their detail under 'message'
+                # (see Agent._emit("error", message=...)).
+                detail_parts.append(event.data["message"])
             elif event.kind == "question" and "question" in event.data:
                 detail_parts.append(event.data["question"])
             elif event.kind == "spawn":
@@ -1061,17 +1064,10 @@ def _compute_duration(started_at: str, last_saved_at: str) -> str:
     try:
         start = datetime.fromisoformat(started_at)
         end = datetime.fromisoformat(last_saved_at)
-        delta = end - start
-        total_secs = int(delta.total_seconds())
+        total_secs = (end - start).total_seconds()
         if total_secs < 0:
             return "-"
-        if total_secs < 60:
-            return f"{total_secs}s"
-        minutes, secs = divmod(total_secs, 60)
-        if minutes < 60:
-            return f"{minutes}m{secs}s"
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}h{minutes}m"
+        return fmt_duration(total_secs)
     except Exception:
         return "-"
 
@@ -1108,8 +1104,10 @@ def _list_sessions(filter_text: str | None = None) -> int:
         style = status_styles.get(status, "white")
         duration = _compute_duration(r["started_at"], r["last_saved_at"])
         agent_count = r.get("agent_count", 0)
-        prompt_tokens = r.get("prompt_tokens", 0)
-        token_str = f"{prompt_tokens:,}" if prompt_tokens else "-"
+        total_tokens = r.get(
+            "total_tokens", r.get("prompt_tokens", 0)
+        )
+        token_str = f"{total_tokens:,}" if total_tokens else "-"
         table.add_row(
             r["session_id"],
             r["started_at"],
@@ -1126,7 +1124,13 @@ def _list_sessions(filter_text: str | None = None) -> int:
 def _delete_session(session_id: str, force: bool = False) -> int:
     """Delete a session directory and all its data."""
     console = Console()
-    session_dir = CONFIG.sessions_dir / session_id
+    sessions_root = CONFIG.sessions_dir.resolve()
+    session_dir = (sessions_root / session_id).resolve()
+    # Containment guard: a session_id like '../../etc' would otherwise
+    # resolve outside the sessions tree and rmtree an unrelated directory.
+    if session_dir.parent != sessions_root:
+        console.print(f"[red]Invalid session id:[/] {session_id}")
+        return 1
     if not session_dir.exists():
         console.print(f"[red]Session not found:[/] {session_id}")
         return 1
@@ -1197,7 +1201,7 @@ def _show_tree(session_id: str) -> int:
 
     def _label(a: dict) -> str:
         return (
-            f"[bold]{a['name']}[/]  "
+            f"[bold]{a.get('name', '?')}[/]  "
             f"[dim]{a.get('role_type', '?')}/{a.get('status', '?')}[/]"
         )
 

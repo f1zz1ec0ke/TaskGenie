@@ -87,8 +87,6 @@ class SessionData:
     agents: dict[str, dict[str, Any]] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
     tool_signature: dict[str, dict[str, str]] = field(default_factory=dict)
-    total_prompt_tokens: int = 0
-    total_completion_tokens: int = 0
 
     def add_history(self, entry: HistoryEntry) -> None:
         self.history.append(asdict(entry))
@@ -137,21 +135,6 @@ class Session:
     @property
     def workspace_dir(self) -> Path:
         return self.project_dir
-
-    def add_tokens(self, prompt_tokens: int, completion_tokens: int) -> None:
-        """Track cumulative token usage across the session."""
-        self.data.total_prompt_tokens += prompt_tokens
-        self.data.total_completion_tokens += completion_tokens
-
-    @property
-    def total_tokens(self) -> int:
-        return self.data.total_prompt_tokens + self.data.total_completion_tokens
-
-    def estimated_cost(self, cost_per_million: float) -> float:
-        """Estimate cost based on total tokens and configured price."""
-        if cost_per_million <= 0:
-            return 0.0
-        return (self.total_tokens / 1_000_000) * cost_per_million
 
     @classmethod
     def create(cls, task: str, project: str | None = None) -> "Session":
@@ -233,9 +216,13 @@ class Session:
                 continue
             agents_dict = d.get("agents", {})
             total_prompt_tokens = 0
+            total_completion_tokens = 0
             for agent_data in agents_dict.values():
                 if isinstance(agent_data, dict):
                     total_prompt_tokens += agent_data.get("prompt_tokens", 0)
+                    total_completion_tokens += agent_data.get(
+                        "completion_tokens", 0
+                    )
             rows.append(
                 {
                     "session_id": d.get("session_id", sub.name),
@@ -245,6 +232,8 @@ class Session:
                     "status": d.get("status", "?"),
                     "agent_count": len(agents_dict),
                     "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens,
                 }
             )
         rows.sort(key=lambda r: r["last_saved_at"], reverse=True)

@@ -105,6 +105,15 @@ class StoryNarrator:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=1.0)
                     self._buf.append(event)
+                    # Drain anything else already queued in one go. Otherwise
+                    # a burst trickles in one-per-second, and events that
+                    # arrive during the multi-second _generate() call below
+                    # back up; this keeps the narration context fresh.
+                    while True:
+                        try:
+                            self._buf.append(queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
                     if len(self._buf) > 150:
                         self._buf = self._buf[-150:]
                 except asyncio.TimeoutError:

@@ -757,9 +757,11 @@ class TUI:
         ]
 
         active_managers = [c for c in managers if c.status not in ("done", "fired")]
-        done_managers = [c for c in managers if c.status in ("done", "fired")]
+        done_managers = [c for c in managers if c.status == "done"]
+        fired_managers = [c for c in managers if c.status == "fired"]
         active_workers = [c for c in workers if c.status not in ("done", "fired")]
-        done_workers = [c for c in workers if c.status in ("done", "fired")]
+        done_workers = [c for c in workers if c.status == "done"]
+        fired_workers = [c for c in workers if c.status == "fired"]
         blocked_workers = [c for c in workers if c.status in ("blocked", "asking")]
         working_workers = [c for c in workers if c.status == "working"]
 
@@ -785,6 +787,10 @@ class TUI:
                 if active_workers or blocked_workers:
                     label.append(" ", style="dim")
                 label.append(f"{len(done_workers)}✓", style="green")
+            if fired_workers:
+                if active_workers or blocked_workers or done_workers:
+                    label.append(" ", style="dim")
+                label.append(f"{len(fired_workers)}✗", style="red dim")
             label.append(" workers]", style="dim")
 
         node = parent_node.add(label)
@@ -800,6 +806,7 @@ class TUI:
         else:
             ordered_workers.extend(active_workers)
         ordered_workers.extend(done_workers)
+        ordered_workers.extend(fired_workers)
 
         worker_cap = 10
         for w in ordered_workers[:worker_cap]:
@@ -830,7 +837,7 @@ class TUI:
             )
 
         cap = 10
-        ordered_managers = active_managers + done_managers
+        ordered_managers = active_managers + done_managers + fired_managers
         for child in ordered_managers[:cap]:
             self._add_node(node, child.id, now)
         hidden = len(ordered_managers) - min(cap, len(ordered_managers))
