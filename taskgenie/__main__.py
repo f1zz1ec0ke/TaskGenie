@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import shutil
 import sys
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +18,7 @@ from rich.table import Table
 
 from taskgenie.agent import Agent
 from taskgenie.artifacts import write_final
-from taskgenie.config import CONFIG
+from taskgenie.config import CONFIG, setup_logging
 from taskgenie.event_logger import JSONLEventLogger
 from taskgenie.events import BUS, Event
 from taskgenie import stats as stats_module
@@ -25,6 +28,7 @@ from taskgenie.result import RunResult
 from taskgenie.session import Session
 from taskgenie.tools.registry import REGISTRY
 from taskgenie.tui import TUI
+from taskgenie.utils import fmt_duration
 
 ABANDON_TOKENS = {"", "quit", "exit", "abandon", "stop"}
 
@@ -45,9 +49,7 @@ def _print_banner(console: Console, session: Session, mcp: MCPClient) -> None:
     if mcp.connect_errors:
         for server, err in mcp.connect_errors.items():
             lines.append(f"[bold red]MCP error[/] {server}: {err}")
-    console.print(
-        Panel.fit("\n".join(lines), title="TaskGenie", border_style="cyan")
-    )
+    console.print(Panel.fit("\n".join(lines), title="TaskGenie", border_style="cyan"))
 
 
 def _print_blocker(console: Console, result: RunResult) -> None:
@@ -67,9 +69,7 @@ def _print_blocker(console: Console, result: RunResult) -> None:
 
 
 def _read_unblock_input(console: Console, prompt: str = "you > ") -> str | None:
-    console.print(
-        "[dim]Reply with guidance to resume, or empty/'abandon' to stop.[/]"
-    )
+    console.print("[dim]Reply with guidance to resume, or empty/'abandon' to stop.[/]")
     try:
         response = console.input(f"[bold yellow]{prompt}[/] ").strip()
     except EOFError:
@@ -182,7 +182,108 @@ async def _run_session(ceo: Agent, tui: TUI, message: str) -> RunResult:
         await asyncio.gather(ceo_task, tui_task, return_exceptions=True)
 
 
-FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset"}
+_HEADLESS_EVENT_KINDS = frozenset(
+    {"spawn", "hire", "assign", "complete", "blocked", "error", "question"}
+)
+
+
+async def _headless_event_printer(stop_event: asyncio.Event) -> None:
+    """Background task that prints key BUS events to stderr in a simple
+    one-line-per-event format for headless/CI mode."""
+    queue = BUS.subscribe()
+    try:
+        while not stop_event.is_set():
+            try:
+                event: Event = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if event.kind not in _HEADLESS_EVENT_KINDS:
+                continue
+            ts = datetime.fromtimestamp(event.ts, tz=timezone.utc).strftime("%H:%M:%S")
+            detail_parts: list[str] = []
+            if event.kind == "hire" and "child_name" in event.data:
+                detail_parts.append(f"hired {event.data['child_name']}")
+            elif event.kind == "assign" and "task" in event.data:
+                task_text = event.data["task"]
+                if len(task_text) > 80:
+                    task_text = task_text[:77] + "..."
+                detail_parts.append(task_text)
+            elif event.kind == "complete" and "report" in event.data:
+                report_text = event.data["report"]
+                if len(report_text) > 80:
+                    report_text = report_text[:77] + "..."
+                detail_parts.append(report_text)
+            elif event.kind == "blocked" and "reason" in event.data:
+                detail_parts.append(event.data["reason"])
+            elif event.kind == "error" and "message" in event.data:
+                # Agent error events carry their detail under 'message'
+                # (see Agent._emit("error", message=...)).
+                detail_parts.append(event.data["message"])
+            elif event.kind == "question" and "question" in event.data:
+                detail_parts.append(event.data["question"])
+            elif event.kind == "spawn":
+                detail_parts.append(f"status: {event.data.get('status', 'working')}")
+            detail = " ".join(detail_parts) if detail_parts else event.kind
+            print(
+                f"[{ts}] {event.agent_name}: {event.kind} {detail}",
+                file=sys.stderr,
+            )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        BUS.unsubscribe(queue)
+
+
+async def _run_session_headless(ceo: Agent, message: str) -> RunResult:
+    """Run the CEO without the Rich TUI. Prints key events to stderr."""
+    stop_event = asyncio.Event()
+    printer_task = asyncio.create_task(
+        _headless_event_printer(stop_event), name="headless-printer"
+    )
+    ceo_task = asyncio.create_task(ceo.run(message), name="ceo")
+    try:
+        result = await ceo_task
+        return result
+    finally:
+        stop_event.set()
+        if not printer_task.done():
+            printer_task.cancel()
+        if not ceo_task.done():
+            ceo_task.cancel()
+        await asyncio.gather(ceo_task, printer_task, return_exceptions=True)
+
+
+def _workspace_file_list(session: Session) -> list[str]:
+    """Return relative paths of all files in the project dir."""
+    base = session.project_dir
+    if not base.exists():
+        return []
+    return sorted(str(p.relative_to(base)) for p in base.rglob("*") if p.is_file())
+
+
+def _emit_json_result(
+    status: str,
+    session: Session | None = None,
+    report: str = "",
+    stats_dict: dict | None = None,
+    error: str = "",
+) -> None:
+    """Print a JSON result object to stdout for --json mode."""
+    if status == "done":
+        obj: dict[str, Any] = {
+            "status": "done",
+            "report": report,
+            "session_id": session.session_id if session else "",
+            "project_dir": str(session.project_dir) if session else "",
+            "stats": stats_dict or {},
+            "workspace_files": (_workspace_file_list(session) if session else []),
+        }
+    else:
+        obj = {"status": "error", "error": error}
+    print(json.dumps(obj, indent=2), file=sys.stdout)
+
+
+FOLLOWUP_COMMANDS = {"/done", "/status", "/retry", "/reset", "/export"}
 
 
 def _read_followup_input(console: Console) -> str | None:
@@ -195,7 +296,7 @@ def _read_followup_input(console: Console) -> str | None:
     """
     console.print(
         "[dim]Type a follow-up task, or one of: "
-        "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/][/]"
+        "[cyan]/done[/] [cyan]/status[/] [cyan]/retry[/] [cyan]/reset[/] [cyan]/export[/][/]"
     )
     try:
         response = console.input("[bold cyan]you > [/] ").strip()
@@ -295,10 +396,7 @@ async def _print_status_panel(
 
     def _walk(parent_node: Any, agent: Agent) -> None:
         for child in agent.children:
-            label = (
-                f"[bold]{child.name}[/]  "
-                f"[dim]{child.role_type}/{child.status}[/]"
-            )
+            label = f"[bold]{child.name}[/]  [dim]{child.role_type}/{child.status}[/]"
             node = parent_node.add(label)
             _walk(node, child)
 
@@ -388,62 +486,109 @@ async def _drive_session(
     session: Session,
     mcp: MCPClient,
     ceo: Agent,
-    tui: TUI,
+    tui: TUI | None,
     first_message: str,
     logger: JSONLEventLogger | None = None,
     extra_output: Path | None = None,
+    *,
+    headless: bool = False,
+    json_output: bool = False,
 ) -> int:
     message = first_message
     last_followup: str | None = None
     while True:
         try:
-            result = await _run_session(ceo, tui, message)
+            if headless:
+                result = await _run_session_headless(ceo, message)
+            else:
+                assert tui is not None
+                result = await _run_session(ceo, tui, message)
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Python 3.11+ asyncio.Runner converts SIGINT to a
             # CancelledError on the running task; catching KeyboardInterrupt
             # alone would miss it and the in-flight snapshot promise would
             # silently break. Snapshot and exit 130 either way.
-            console.print("[yellow]interrupted[/]")
+            if headless:
+                print("interrupted", file=sys.stderr)
+            else:
+                console.print("[yellow]interrupted[/]")
             _snapshot(session, ceo)
+            if json_output:
+                _emit_json_result("error", error="interrupted")
             return 130
 
         # Always snapshot at quiescent points.
         if result.kind == "done":
             session.mark_done(result.report)
             _snapshot(session, ceo)
-            console.print(Rule(style="green"))
-            console.print(
-                Panel(
-                    Markdown(result.report or "(no answer)"),
-                    title="Final answer",
-                    border_style="green",
+
+            if headless:
+                # Minimal stderr summary, then JSON or plain-text to stdout.
+                print(f"done: session {session.session_id}", file=sys.stderr)
+            else:
+                console.print(Rule(style="green"))
+                console.print(
+                    Panel(
+                        Markdown(result.report or "(no answer)"),
+                        title="Final answer",
+                        border_style="green",
+                    )
                 )
-            )
-            await _render_stats_panel(console, session, ceo, logger)
+                await _render_stats_panel(console, session, ceo, logger)
+
             readme_path = _write_project_readme(session, result.report)
-            _print_workspace_panel(console, session)
+            if not headless:
+                _print_workspace_panel(console, session)
             stats_dict = await _compute_stats_for_artifact(session, ceo, logger)
             try:
                 paths = write_final(
-                    session, ceo, result.report, stats_dict, extra_output=extra_output
+                    session,
+                    ceo,
+                    result.report,
+                    stats_dict,
+                    extra_output=extra_output,
                 )
-                lines = [
-                    f"  [cyan]markdown[/]: {paths['md']}",
-                    f"  [cyan]html[/]:     {paths['html']}",
-                    f"  [cyan]json[/]:     {paths['json']}",
-                ]
-                if readme_path is not None:
-                    lines.append(f"  [bold green]README[/]:   {readme_path}")
-                if "extra" in paths:
-                    lines.append(f"  [bold green]--output[/]: {paths['extra']}")
-                console.print(
-                    Panel("\n".join(lines), title="Artifacts", border_style="cyan")
-                )
+                if not headless:
+                    lines = [
+                        f"  [cyan]markdown[/]: {paths['md']}",
+                        f"  [cyan]html[/]:     {paths['html']}",
+                        f"  [cyan]json[/]:     {paths['json']}",
+                    ]
+                    if readme_path is not None:
+                        lines.append(f"  [bold green]README[/]:   {readme_path}")
+                    if "extra" in paths:
+                        lines.append(f"  [bold green]--output[/]: {paths['extra']}")
+                    console.print(
+                        Panel(
+                            "\n".join(lines),
+                            title="Artifacts",
+                            border_style="cyan",
+                        )
+                    )
             except Exception as e:
-                console.print(f"[red]Failed to write artifacts: {e}[/]")
-            console.print(
-                f"[dim]Session saved as[/] [bold]{session.session_id}[/]"
-            )
+                if headless:
+                    print(
+                        f"warning: failed to write artifacts: {e}",
+                        file=sys.stderr,
+                    )
+                else:
+                    console.print(f"[red]Failed to write artifacts: {e}[/]")
+
+            if json_output:
+                _emit_json_result(
+                    "done",
+                    session=session,
+                    report=result.report or "",
+                    stats_dict=stats_dict,
+                )
+                return 0
+
+            if headless:
+                # No follow-up loop in headless mode -- just print and exit.
+                print(result.report or "(no answer)", file=sys.stdout)
+                return 0
+
+            console.print(f"[dim]Session saved as[/] [bold]{session.session_id}[/]")
 
             # Follow-up loop. Stay until user types /done or sends EOF.
             next_followup: str | None = None
@@ -461,19 +606,35 @@ async def _drive_session(
                     continue
                 if raw == "/retry":
                     if last_followup is None:
-                        console.print(
-                            "[yellow]No previous follow-up to retry.[/]"
-                        )
+                        console.print("[yellow]No previous follow-up to retry.[/]")
                         continue
-                    console.print(
-                        f"[dim]/retry — replaying:[/] {last_followup}"
-                    )
+                    console.print(f"[dim]/retry — replaying:[/] {last_followup}")
                     next_followup = last_followup
                     break
                 if raw == "/reset":
                     await _reset_team(session, ceo, console)
                     _snapshot(session, ceo)
                     continue  # back to prompt; next non-command input is the fresh task
+                if raw == "/export":
+                    project_dir = session.project_dir
+                    if not project_dir.exists() or not any(project_dir.iterdir()):
+                        console.print(
+                            "[yellow]/export:[/] project directory is empty, nothing to export."
+                        )
+                        continue
+                    try:
+                        archive_path = shutil.make_archive(
+                            str(project_dir),
+                            "zip",
+                            root_dir=str(project_dir.parent),
+                            base_dir=project_dir.name,
+                        )
+                        console.print(
+                            f"[green]/export:[/] created [bold]{archive_path}[/]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]/export failed:[/] {e}")
+                    continue
                 if raw.startswith("/"):
                     console.print(
                         f"[yellow]Unknown command:[/] {raw}. "
@@ -497,6 +658,18 @@ async def _drive_session(
                 }
             )
             _snapshot(session, ceo)
+            if headless:
+                # Cannot prompt interactively in headless mode.
+                error_msg = (
+                    f"CEO asked a question (not supported in headless "
+                    f"mode): {result.question}"
+                )
+                print(error_msg, file=sys.stderr)
+                session.mark_abandoned()
+                _snapshot(session, ceo)
+                if json_output:
+                    _emit_json_result("error", error=error_msg)
+                return 2
             _print_question(console, result)
             user_answer = _read_answer_input(console, result.options)
             if user_answer is None:
@@ -518,6 +691,17 @@ async def _drive_session(
                 }
             )
             _snapshot(session, ceo)
+            if headless:
+                error_msg = (
+                    f"CEO is blocked: {result.reason or '(no reason)'} "
+                    f"| needs: {result.needs or '(none)'}"
+                )
+                print(error_msg, file=sys.stderr)
+                session.mark_abandoned()
+                _snapshot(session, ceo)
+                if json_output:
+                    _emit_json_result("error", error=error_msg)
+                return 2
             _print_blocker(console, result)
             console.print(
                 f"[dim]Session saved as[/] [bold]{session.session_id}[/] "
@@ -549,20 +733,36 @@ async def _drive_session(
         # exhausted / error
         session.mark_error(result.error or result.kind)
         _snapshot(session, ceo)
-        console.print(
-            Panel(
-                f"[red]{result.kind.upper()}[/]\n\n{result.error or '(no detail)'}",
-                title="Run ended",
-                border_style="red",
+        if json_output:
+            _emit_json_result(
+                "error",
+                error=result.error or result.kind or "(unknown)",
             )
-        )
+        if headless:
+            print(
+                f"error: {result.kind}: {result.error or '(no detail)'}",
+                file=sys.stderr,
+            )
+        else:
+            console.print(
+                Panel(
+                    f"[red]{result.kind.upper()}[/]\n\n{result.error or '(no detail)'}",
+                    title="Run ended",
+                    border_style="red",
+                )
+            )
         return 1
 
 
 async def _run_new(
-    task: str, extra_output: Path | None = None, project: str | None = None
+    task: str,
+    extra_output: Path | None = None,
+    project: str | None = None,
+    *,
+    headless: bool = False,
+    json_output: bool = False,
 ) -> int:
-    console = Console()
+    console = Console(stderr=True) if headless else Console()
     mcp = await MCPClient.from_config(CONFIG.mcp_config_path)
     logger: JSONLEventLogger | None = None
     try:
@@ -572,11 +772,26 @@ async def _run_new(
         session.project_dir.mkdir(parents=True, exist_ok=True)
         logger = JSONLEventLogger(session.events_path)
         logger.start()
-        _print_banner(console, session, mcp)
+        if not headless:
+            _print_banner(console, session, mcp)
+        else:
+            print(
+                f"session: {session.session_id} | project: {session.project_dir}",
+                file=sys.stderr,
+            )
         ceo = Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
-        tui = TUI(task=task)
+        tui: TUI | None = None if headless else TUI(task=task)
         return await _drive_session(
-            console, session, mcp, ceo, tui, task, logger, extra_output=extra_output
+            console,
+            session,
+            mcp,
+            ceo,
+            tui,
+            task,
+            logger,
+            extra_output=extra_output,
+            headless=headless,
+            json_output=json_output,
         )
     finally:
         if logger is not None:
@@ -584,8 +799,14 @@ async def _run_new(
         await mcp.close()
 
 
-async def _run_resume(session_id: str | None, extra_output: Path | None = None) -> int:
-    console = Console()
+async def _run_resume(
+    session_id: str | None,
+    extra_output: Path | None = None,
+    *,
+    headless: bool = False,
+    json_output: bool = False,
+) -> int:
+    console = Console(stderr=True) if headless else Console()
     mcp = await MCPClient.from_config(CONFIG.mcp_config_path)
     logger: JSONLEventLogger | None = None
     try:
@@ -611,21 +832,24 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             return 1
         ceo = Agent.REGISTRY[session.data.ceo_id]
 
-        _print_banner(console, session, mcp)
+        if not headless:
+            _print_banner(console, session, mcp)
+        else:
+            print(f"resuming session: {session.session_id}", file=sys.stderr)
 
         tool_diff = session.diff_tools_against(
             REGISTRY.signature("management"),
             REGISTRY.signature("work"),
             REGISTRY.signature("ceo"),
         )
-        if tool_diff:
+        if tool_diff and not headless:
             console.print(Panel(tool_diff, title="Tool changes", border_style="cyan"))
 
         # Find the most-recent terminal/resolution entry. Pauses BEFORE
         # that one are historical (already answered / unblocked /
         # completed), not what we're paused on right now. Without this
         # qualification, resuming a session that went
-        # question→answer→done would find the long-resolved question and
+        # question->answer->done would find the long-resolved question and
         # re-ask it -- the CEO would end up with back-to-back answer
         # messages for the same question.
         resolved_idx = -1
@@ -641,13 +865,24 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
                 resolved_idx = _i
         last_pause = next(
             (
-                h for h in reversed(session.data.history[resolved_idx + 1 :])
+                h
+                for h in reversed(session.data.history[resolved_idx + 1 :])
                 if h["kind"] in ("blocker", "question")
             ),
             None,
         )
         message: str
         if last_pause and last_pause["kind"] == "question":
+            if headless:
+                # Cannot prompt interactively in headless mode.
+                error_msg = (
+                    "Session paused on a question; cannot resume "
+                    "in headless mode without user input."
+                )
+                print(error_msg, file=sys.stderr)
+                if json_output:
+                    _emit_json_result("error", error=error_msg)
+                return 2
             payload = last_pause.get("payload", {})
             console.print(
                 Panel(
@@ -665,11 +900,23 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             _snapshot(session, ceo)
             message = _build_answer_message(user_answer)
         elif session.data.status == "done":
+            if headless:
+                # Headless resume of a completed session: nothing to do.
+                print(
+                    "Session already completed; nothing to resume.",
+                    file=sys.stderr,
+                )
+                if json_output:
+                    _emit_json_result(
+                        "error",
+                        error="Session already completed.",
+                    )
+                return 0
             # Session previously completed -- resume into a follow-up turn
             # rather than the blocker-style "what unblocks you?" prompt.
             console.print(
                 Panel(
-                    f"[bold]Last answer:[/] this session was last marked done. "
+                    "[bold]Last answer:[/] this session was last marked done. "
                     "Give a follow-up task to extend or refine the work, or "
                     "type [cyan]/done[/] to leave it as-is.",
                     title="Session was completed",
@@ -684,6 +931,15 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             _snapshot(session, ceo)
             message = _build_followup_message(followup)
         elif session.data.status in ("abandoned", "error"):
+            if headless:
+                error_msg = (
+                    f"Session status is '{session.data.status}'; cannot "
+                    "resume in headless mode without user input."
+                )
+                print(error_msg, file=sys.stderr)
+                if json_output:
+                    _emit_json_result("error", error=error_msg)
+                return 2
             # Resuming a session that previously ended (user abandoned
             # or it errored out). Don't pretend it's a regular blocker
             # -- tell the user what happened, then offer a fresh
@@ -697,16 +953,13 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             # Try to surface the last error/abandon detail from history.
             last_terminal = next(
                 (
-                    h for h in reversed(session.data.history)
+                    h
+                    for h in reversed(session.data.history)
                     if h["kind"] in ("error", "abandoned")
                 ),
                 None,
             )
-            detail = (
-                last_terminal.get("text", "")
-                if last_terminal
-                else ""
-            )
+            detail = last_terminal.get("text", "") if last_terminal else ""
             body = (
                 f"[bold]Status:[/] {session.data.status}\n"
                 + (f"[bold]Detail:[/] {detail}\n" if detail else "")
@@ -722,6 +975,16 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             _snapshot(session, ceo)
             message = _build_followup_message(followup)
         else:
+            if headless:
+                # Blocked session -- can't prompt for unblock guidance.
+                error_msg = (
+                    "Session is blocked; cannot resume in headless mode "
+                    "without user input."
+                )
+                print(error_msg, file=sys.stderr)
+                if json_output:
+                    _emit_json_result("error", error=error_msg)
+                return 2
             if last_pause and last_pause["kind"] == "blocker":
                 payload = last_pause.get("payload", {})
                 console.print(
@@ -741,9 +1004,18 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
             _snapshot(session, ceo)
             message = _build_unblock_message(user_response, tool_diff)
 
-        tui = TUI(task=session.data.task)
+        tui: TUI | None = None if headless else TUI(task=session.data.task)
         return await _drive_session(
-            console, session, mcp, ceo, tui, message, logger, extra_output=extra_output
+            console,
+            session,
+            mcp,
+            ceo,
+            tui,
+            message,
+            logger,
+            extra_output=extra_output,
+            headless=headless,
+            json_output=json_output,
         )
     finally:
         if logger is not None:
@@ -751,16 +1023,38 @@ async def _run_resume(session_id: str | None, extra_output: Path | None = None) 
         await mcp.close()
 
 
-def _list_sessions() -> int:
+def _compute_duration(started_at: str, last_saved_at: str) -> str:
+    """Return a human-readable duration string, or '-' if unparseable."""
+    try:
+        start = datetime.fromisoformat(started_at)
+        end = datetime.fromisoformat(last_saved_at)
+        total_secs = (end - start).total_seconds()
+        if total_secs < 0:
+            return "-"
+        return fmt_duration(total_secs)
+    except Exception:
+        return "-"
+
+
+def _list_sessions(filter_text: str | None = None) -> int:
     console = Console()
     rows = Session.list_all()
+    if filter_text:
+        needle = filter_text.lower()
+        rows = [r for r in rows if needle in r["task"].lower()]
     if not rows:
-        console.print("[dim]No sessions yet.[/]")
+        if filter_text:
+            console.print(f"[dim]No sessions matching '{filter_text}'.[/]")
+        else:
+            console.print("[dim]No sessions yet.[/]")
         return 0
     table = Table(title="TaskGenie sessions", show_lines=False, expand=False)
     table.add_column("session id", style="cyan", no_wrap=True)
     table.add_column("started", style="dim", no_wrap=True)
+    table.add_column("duration", style="dim", no_wrap=True)
     table.add_column("status")
+    table.add_column("agents", justify="right")
+    table.add_column("tokens", justify="right", style="dim")
     table.add_column("task", overflow="fold")
     status_styles = {
         "done": "green",
@@ -772,22 +1066,148 @@ def _list_sessions() -> int:
     for r in rows:
         status = r["status"]
         style = status_styles.get(status, "white")
+        duration = _compute_duration(r["started_at"], r["last_saved_at"])
+        agent_count = r.get("agent_count", 0)
+        total_tokens = r.get("total_tokens", r.get("prompt_tokens", 0))
+        token_str = f"{total_tokens:,}" if total_tokens else "-"
         table.add_row(
             r["session_id"],
             r["started_at"],
+            duration,
             f"[{style}]{status}[/]",
+            str(agent_count) if agent_count else "-",
+            token_str,
             r["task"],
         )
     console.print(table)
     return 0
 
 
+def _delete_session(session_id: str, force: bool = False) -> int:
+    """Delete a session directory and all its data."""
+    console = Console()
+    sessions_root = CONFIG.sessions_dir.resolve()
+    session_dir = (sessions_root / session_id).resolve()
+    # Containment guard: a session_id like '../../etc' would otherwise
+    # resolve outside the sessions tree and rmtree an unrelated directory.
+    if session_dir.parent != sessions_root:
+        console.print(f"[red]Invalid session id:[/] {session_id}")
+        return 1
+    if not session_dir.exists():
+        console.print(f"[red]Session not found:[/] {session_id}")
+        return 1
+    if not force:
+        try:
+            answer = (
+                console.input(
+                    f"Delete session [cyan]{session_id}[/] and all its data? [y/N] "
+                )
+                .strip()
+                .lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Cancelled.[/]")
+            return 1
+        if answer not in ("y", "yes"):
+            console.print("[yellow]Cancelled.[/]")
+            return 1
+    shutil.rmtree(session_dir)
+    console.print(f"[green]Deleted session:[/] {session_id}")
+    return 0
+
+
+def _show_stats(session_id: str) -> int:
+    """Show the run stats panel for a past session without resuming it."""
+    console = Console()
+    try:
+        session = Session.load(session_id)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/]")
+        return 1
+    if not session.events_path.exists():
+        console.print(f"[red]No events log found for session:[/] {session_id}")
+        return 1
+    try:
+        stats = stats_module.compute(session.events_path, ceo_id=session.data.ceo_id)
+    except Exception as e:
+        console.print(f"[red]Failed to compute stats:[/] {e}")
+        return 1
+    console.print(stats_module.render_panel(stats))
+    return 0
+
+
+def _show_tree(session_id: str) -> int:
+    """Print the agent hierarchy for a past session and exit."""
+    from rich.tree import Tree as RTree
+
+    console = Console()
+    try:
+        session = Session.load(session_id)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/]")
+        return 1
+    agents = session.data.agents
+    if not agents:
+        console.print(f"[dim]No agents recorded in session:[/] {session_id}")
+        return 0
+    ceo_id = session.data.ceo_id
+    if ceo_id and ceo_id in agents:
+        root_data = agents[ceo_id]
+    else:
+        # Fall back to first agent without a parent.
+        root_data = next(
+            (a for a in agents.values() if not a.get("parent_id")),
+            None,
+        )
+    if root_data is None:
+        console.print("[red]Cannot determine root agent.[/]")
+        return 1
+
+    def _label(a: dict) -> str:
+        return (
+            f"[bold]{a.get('name', '?')}[/]  "
+            f"[dim]{a.get('role_type', '?')}/{a.get('status', '?')}[/]"
+        )
+
+    rtree = RTree(_label(root_data))
+
+    def _walk(parent_node, agent_data: dict) -> None:
+        for child_id in agent_data.get("child_ids", []):
+            child_data = agents.get(child_id)
+            if child_data is None:
+                continue
+            node = parent_node.add(_label(child_data))
+            _walk(node, child_data)
+
+    _walk(rtree, root_data)
+    console.print(Panel(rtree, title="Agent hierarchy", border_style="cyan"))
+    return 0
+
+
 def cli() -> None:
+    setup_logging(getattr(CONFIG, "log_level", "WARNING"))
+
+    epilog = """examples:
+  taskgenie "Build a physics game"          # new task
+  taskgenie --resume                        # resume latest session
+  taskgenie --list                          # list all sessions
+  taskgenie --list --filter "game"          # search sessions
+  taskgenie --stats <session-id>            # view past run stats
+  taskgenie --tree <session-id>             # view agent hierarchy
+  taskgenie --delete <session-id>           # delete a session
+  taskgenie --delete <session-id> --force   # delete without confirmation
+"""
     parser = argparse.ArgumentParser(
         prog="taskgenie",
         description="A hierarchical multi-agent system where managers hire workers by writing role prompts.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("task", nargs="*", help="The task to give the CEO (omit when using --resume or --list).")
+    parser.add_argument(
+        "task",
+        nargs="*",
+        help="The task to give the CEO (omit when using --resume or --list).",
+    )
     parser.add_argument(
         "--resume",
         nargs="?",
@@ -799,6 +1219,39 @@ def cli() -> None:
         "--list",
         action="store_true",
         help="List all sessions and exit.",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help="Filter sessions by task text (case-insensitive substring match). Use with --list.",
+    )
+    parser.add_argument(
+        "--delete",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help="Delete a session and all its data.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt when deleting a session.",
+    )
+    parser.add_argument(
+        "--stats",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help="Show the run stats panel for a past session without resuming it.",
+    )
+    parser.add_argument(
+        "--tree",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help="Print the agent hierarchy for a past session and exit.",
     )
     parser.add_argument(
         "-o",
@@ -825,19 +1278,76 @@ def cli() -> None:
             "is already taken."
         ),
     )
+    parser.add_argument(
+        "--no-tui",
+        "--headless",
+        action="store_true",
+        dest="headless",
+        default=False,
+        help=(
+            "Run without the Rich TUI. Status updates are printed to stderr "
+            "and the final result to stdout. Useful for CI/scripting."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=False,
+        help=(
+            "Output the final result as JSON to stdout (implies --no-tui). "
+            "On success: {status, report, session_id, project_dir, stats, "
+            "workspace_files}. On error: {status, error}."
+        ),
+    )
     args = parser.parse_args()
 
+    # --json implies --no-tui / headless.
+    headless: bool = args.headless or args.json_output or CONFIG.headless
+    json_output: bool = args.json_output
+
+    # --delete: early return
+    if args.delete is not None:
+        sys.exit(_delete_session(args.delete, force=args.force))
+
+    # --stats: early return
+    if args.stats is not None:
+        sys.exit(_show_stats(args.stats))
+
+    # --tree: early return
+    if args.tree is not None:
+        sys.exit(_show_tree(args.tree))
+
     if args.list:
-        sys.exit(_list_sessions())
+        sys.exit(_list_sessions(filter_text=args.filter))
 
     if args.resume is not None:
         session_id = args.resume or None
-        sys.exit(asyncio.run(_run_resume(session_id, extra_output=args.output)))
+        sys.exit(
+            asyncio.run(
+                _run_resume(
+                    session_id,
+                    extra_output=args.output,
+                    headless=headless,
+                    json_output=json_output,
+                )
+            )
+        )
 
     if not args.task:
-        parser.error("provide a task, --resume, or --list")
+        parser.error("provide a task, --resume, --list, --stats, --tree, or --delete")
     task = " ".join(args.task)
-    sys.exit(asyncio.run(_run_new(task, extra_output=args.output, project=args.project)))
+    sys.exit(
+        asyncio.run(
+            _run_new(
+                task,
+                extra_output=args.output,
+                project=args.project,
+                headless=headless,
+                json_output=json_output,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":

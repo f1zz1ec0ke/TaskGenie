@@ -23,6 +23,7 @@ If the LLM call fails or returns nothing useful, we return the original
 messages unchanged. Caller is responsible for not retrying forever
 (see `Agent._maybe_compact`'s `_compaction_floor` tracking).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -156,7 +157,10 @@ async def compact_messages(
     system_msg = messages[0]
     # Find the first non-system message; that's the original task.
     first_real_idx = 1
-    while first_real_idx < len(messages) and messages[first_real_idx].get("role") == "system":
+    while (
+        first_real_idx < len(messages)
+        and messages[first_real_idx].get("role") == "system"
+    ):
         first_real_idx += 1
     if first_real_idx >= len(messages):
         raise CompactionSkipped("no non-system messages in history")
@@ -167,9 +171,8 @@ async def compact_messages(
     # the next API call 400s. Bail in that specific case. Plain
     # assistant messages without tool_calls are fine (tests pre-populate
     # this shape; production always starts with role="user").
-    if (
-        original_task.get("role") == "assistant"
-        and (original_task.get("tool_calls") or [])
+    if original_task.get("role") == "assistant" and (
+        original_task.get("tool_calls") or []
     ):
         raise CompactionSkipped(
             f"original task at index {first_real_idx} is an assistant "
@@ -215,14 +218,10 @@ async def compact_messages(
 
     summary = (response.get("content") or "").strip()
     if not summary:
-        raise CompactionTransientFailure(
-            "archivist LLM returned empty content"
-        )
+        raise CompactionTransientFailure("archivist LLM returned empty content")
 
     summary_msg = {
         "role": "user",
-        "content": (
-            f"[archived summary of {len(middle)} earlier messages]: {summary}"
-        ),
+        "content": (f"[archived summary of {len(middle)} earlier messages]: {summary}"),
     }
     return [system_msg, original_task, summary_msg, *recent]

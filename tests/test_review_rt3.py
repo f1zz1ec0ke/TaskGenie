@@ -6,10 +6,10 @@ explicitly; medium/low fixes ride on coverage of the helpers they touched.
 
 Run with: python -m tests.test_review_rt3
 """
+
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import os
 import sys
@@ -30,22 +30,20 @@ from taskgenie.archivist import (
 from taskgenie.config import CONFIG
 from taskgenie.event_logger import _truncate_for_log
 from taskgenie.events import BUS, Event
-from taskgenie.mcp_client import MCPClient
 from taskgenie.prompts import CEO_ROLE_PROMPT
-from taskgenie.session import Session, SessionData
+from taskgenie.session import Session
 from taskgenie.stats import compute as stats_compute
 from taskgenie.tools.registry import REGISTRY
 from taskgenie.tools.work import (
     _list_workspace,
     _normalize_workspace_path,
-    _read_text_safe,
     _read_workspace,
     _safe_path,
     _UnsafeOpenError,
     _write_text_safe,
     _write_workspace,
 )
-from taskgenie.tui import TUI, _trim_for_activity
+from taskgenie.tui import _trim_for_activity
 
 
 def _has_symlink_support() -> bool:
@@ -182,14 +180,12 @@ def test_parent_component_symlink_refused_by_realpath_check(tmp_path: Path) -> N
     leaf = base / "subdir" / "file.txt"
     try:
         _write_text_safe(leaf, base, "PWN", "create")
-    except (_UnsafeOpenError, OSError) as e:
+    except (_UnsafeOpenError, OSError):
         # Either ELOOP, EMLINK, or our custom error -- all acceptable
         # "I refused to write" outcomes.
         pass
     else:
-        raise AssertionError(
-            "expected _write_text_safe to refuse parent-symlink path"
-        )
+        raise AssertionError("expected _write_text_safe to refuse parent-symlink path")
 
     # The sentinel directory should NOT contain a file.txt that we wrote.
     assert not (outside / "file.txt").exists(), (
@@ -282,9 +278,8 @@ def test_compaction_floor_old_snapshot_defaults_to_len_messages() -> None:
         "child_ids": [],
         "depth": 0,
         "status": "idle",
-        "messages": [{"role": "system", "content": "..."}] + [
-            {"role": "user", "content": "x"} for _ in range(50)
-        ],
+        "messages": [{"role": "system", "content": "..."}]
+        + [{"role": "user", "content": "x"} for _ in range(50)],
         "scratch_dir": Agent.SCRATCH_ROOT,
         "blocker_reason": "",
         "blocker_needs": "",
@@ -320,9 +315,7 @@ def test_truncate_for_log_recurses_into_nested_dicts() -> None:
     assert row["tool"] == "write_workspace"
 
     # Also recurse into lists.
-    row = _truncate_for_log(
-        {"items": ["short", big, {"nested": big}]}
-    )
+    row = _truncate_for_log({"items": ["short", big, {"nested": big}]})
     assert len(row["items"][1]) < len(big)
     assert len(row["items"][2]["nested"]) < len(big)
     print("[truncate_for_log_recurses_into_nested_dicts] OK")
@@ -376,14 +369,22 @@ async def test_archivist_raises_skipped_when_safe_recent_eats_middle() -> None:
         {
             "role": "assistant",
             "tool_calls": [
-                {"id": "t0", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+                {
+                    "id": "t0",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "t0", "content": "ok"},
         {
             "role": "assistant",
             "tool_calls": [
-                {"id": "t1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+                {
+                    "id": "t1",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "t1", "content": "ok"},
@@ -396,7 +397,9 @@ async def test_archivist_raises_skipped_when_safe_recent_eats_middle() -> None:
         except CompactionSkipped:
             pass
         else:
-            raise AssertionError("expected CompactionSkipped for degenerate alternation")
+            raise AssertionError(
+                "expected CompactionSkipped for degenerate alternation"
+            )
     finally:
         archivist_module.LLM = original
     print("[archivist_raises_skipped_when_safe_recent_eats_middle] OK")
@@ -410,7 +413,11 @@ async def test_archivist_raises_skipped_when_original_task_has_tool_calls() -> N
         {
             "role": "assistant",
             "tool_calls": [
-                {"id": "t0", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+                {
+                    "id": "t0",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "t0", "content": "r"},
@@ -424,7 +431,9 @@ async def test_archivist_raises_skipped_when_original_task_has_tool_calls() -> N
         except CompactionSkipped as e:
             assert "tool_call" in str(e).lower(), e
         else:
-            raise AssertionError("expected CompactionSkipped for assistant-with-tool_calls task")
+            raise AssertionError(
+                "expected CompactionSkipped for assistant-with-tool_calls task"
+            )
     finally:
         archivist_module.LLM = original
     print("[archivist_raises_skipped_when_original_task_has_tool_calls] OK")
@@ -608,7 +617,9 @@ async def test_failed_read_does_not_trigger_lost_update_warning(tmp_path: Path) 
 # ---------------------------------------------------------------------------
 
 
-async def test_list_workspace_filters_tempfiles_and_surfaces_symlinks(tmp_path: Path) -> None:
+async def test_list_workspace_filters_tempfiles_and_surfaces_symlinks(
+    tmp_path: Path,
+) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "real.py").write_text("x", encoding="utf-8")
@@ -673,7 +684,9 @@ def test_is_context_length_error_handles_anthropic_body() -> None:
 def test_seal_tool_batch_rejects_out_of_range_index() -> None:
     agent = _new_ceo()
     try:
-        agent._seal_tool_batch([{"id": "x", "name": "y"}], finishing_index=5, finishing_content="c")
+        agent._seal_tool_batch(
+            [{"id": "x", "name": "y"}], finishing_index=5, finishing_content="c"
+        )
     except ValueError as e:
         assert "out of range" in str(e), e
     else:
@@ -771,9 +784,7 @@ async def test_lost_update_warning_survives_path_form_drift(tmp_path: Path) -> N
         _FakeAgent(),
         {"path": "./game.py", "content": "v2", "mode": "overwrite"},
     )
-    assert "WARNING" in result, (
-        f"normalisation broken; warning didn't fire: {result!r}"
-    )
+    assert "WARNING" in result, f"normalisation broken; warning didn't fire: {result!r}"
     print("[lost_update_warning_survives_path_form_drift] OK")
 
 
@@ -877,8 +888,16 @@ def test_exec_workspace_is_worker_only() -> None:
 
 async def _async_tests(tmp_root: Path) -> None:
     for sub in (
-        "r36", "r38", "r53", "r52", "r59", "r43-eats", "r43-tc",
-        "r45", "r47", "r41-tui",
+        "r36",
+        "r38",
+        "r53",
+        "r52",
+        "r59",
+        "r43-eats",
+        "r43-tc",
+        "r45",
+        "r47",
+        "r41-tui",
     ):
         (tmp_root / sub).mkdir()
     await test_hardlink_write_through_refused(tmp_root / "r36")
@@ -894,7 +913,13 @@ async def _async_tests(tmp_root: Path) -> None:
 
 def _sync_tests(tmp_root: Path) -> None:
     for sub in (
-        "r37", "r39", "r48", "r58", "r60", "r68", "r41",
+        "r37",
+        "r39",
+        "r48",
+        "r58",
+        "r60",
+        "r68",
+        "r41",
     ):
         (tmp_root / sub).mkdir()
     test_parent_component_symlink_refused_by_realpath_check(tmp_root / "r37")

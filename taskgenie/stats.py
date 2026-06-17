@@ -4,6 +4,7 @@ Used to render the post-run summary panel — a meta-debugging view that
 complements the CEO's qualitative `Process retrospective` section in the
 final report.
 """
+
 from __future__ import annotations
 
 from collections import Counter
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from taskgenie.event_logger import read_events
+from taskgenie.utils import fmt_count, fmt_duration
 
 
 @dataclass
@@ -49,6 +51,7 @@ class RunStats:
     duration_seconds: float | None
     started_at: str | None
     ended_at: str | None
+    estimated_cost: float = 0.0  # Estimated cost in dollars
 
 
 def _parse_ts(ts: Any) -> datetime | None:
@@ -164,11 +167,14 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
 
     blockers_resolved_internally = max(0, blockers_total - blockers_escalated_to_user)
 
-    duration = (
-        (last_ts - first_ts).total_seconds()
-        if first_ts and last_ts
-        else None
-    )
+    duration = (last_ts - first_ts).total_seconds() if first_ts and last_ts else None
+
+    from taskgenie.config import CONFIG
+
+    total_tokens = prompt_tokens_total + completion_tokens_total
+    estimated_cost = 0.0
+    if CONFIG.token_cost_per_million > 0:
+        estimated_cost = (total_tokens / 1_000_000) * CONFIG.token_cost_per_million
 
     return RunStats(
         agents=agents,
@@ -189,15 +195,8 @@ def compute(events_path: Path, ceo_id: str | None = None) -> RunStats:
         duration_seconds=duration,
         started_at=first_ts.isoformat(timespec="seconds") if first_ts else None,
         ended_at=last_ts.isoformat(timespec="seconds") if last_ts else None,
+        estimated_cost=estimated_cost,
     )
-
-
-def _fmt_count(n: int) -> str:
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{n / 1000:.1f}k"
-    return f"{n / 1_000_000:.1f}M"
 
 
 def render_panel(stats: RunStats):
@@ -212,8 +211,12 @@ def render_panel(stats: RunStats):
     overview = Table.grid(padding=(0, 2))
     overview.add_column(style="dim")
     overview.add_column()
-    overview.add_row("Agents", f"{len(stats.agents)} total — {role_summary or '(none)'}")
-    overview.add_row("Hires / fires / rehires", f"{stats.hires} / {stats.fires} / {stats.rehires}")
+    overview.add_row(
+        "Agents", f"{len(stats.agents)} total — {role_summary or '(none)'}"
+    )
+    overview.add_row(
+        "Hires / fires / rehires", f"{stats.hires} / {stats.fires} / {stats.rehires}"
+    )
     overview.add_row(
         "Blockers",
         f"{stats.blockers_total} total "
@@ -236,11 +239,13 @@ def render_panel(stats: RunStats):
     overview.add_row(
         "LLM calls",
         f"{stats.llm_calls_total} calls — "
-        f"{_fmt_count(stats.prompt_tokens_total)} prompt / "
-        f"{_fmt_count(stats.completion_tokens_total)} completion tokens",
+        f"{fmt_count(stats.prompt_tokens_total)} prompt / "
+        f"{fmt_count(stats.completion_tokens_total)} completion tokens",
     )
+    if stats.estimated_cost > 0:
+        overview.add_row("Estimated cost", f"${stats.estimated_cost:.4f}")
     if stats.duration_seconds is not None:
-        overview.add_row("Wall time", f"{stats.duration_seconds:.1f}s")
+        overview.add_row("Wall time", fmt_duration(stats.duration_seconds))
 
     per_agent = Table(show_header=True, header_style="bold", expand=False)
     per_agent.add_column("agent", style="cyan")
@@ -261,9 +266,12 @@ def render_panel(stats: RunStats):
     }
     for agent in sorted(stats.agents.values(), key=lambda a: (a.role_type, a.name)):
         style = status_style.get(agent.status, "white")
-        top_tools = ", ".join(
-            f"{tool}×{count}" for tool, count in agent.tool_calls.most_common(4)
-        ) or "—"
+        top_tools = (
+            ", ".join(
+                f"{tool}×{count}" for tool, count in agent.tool_calls.most_common(4)
+            )
+            or "—"
+        )
         blocker_text = ""
         if agent.blocker:
             blocker_text = f"{agent.blocker.get('needs', '')[:60]}".strip()
@@ -273,7 +281,7 @@ def render_panel(stats: RunStats):
             f"[{style}]{agent.status}[/]",
             str(agent.turns),
             str(agent.llm_calls),
-            f"{_fmt_count(agent.prompt_tokens)}/{_fmt_count(agent.completion_tokens)}",
+            f"{fmt_count(agent.prompt_tokens)}/{fmt_count(agent.completion_tokens)}",
             top_tools,
             blocker_text or "—",
         )

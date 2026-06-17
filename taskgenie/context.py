@@ -20,6 +20,7 @@ A 3-char-per-token heuristic optimises for code a bit (tokens average
 budget. The compaction threshold is set conservatively (80% of the
 window by default) so the slack absorbs heuristic error.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -92,8 +93,9 @@ def dump_large_tool_result(
     base = f"tool-t{turn_idx}-{safe_tool}-{safe_call}-{call_hash}"
 
     chunk_size = max(1, threshold_bytes - chunk_margin)
-    chunks = [result_str[i:i + chunk_size]
-              for i in range(0, len(result_str), chunk_size)]
+    chunks = [
+        result_str[i : i + chunk_size] for i in range(0, len(result_str), chunk_size)
+    ]
     n = len(chunks)
     width = len(str(n))
 
@@ -109,8 +111,10 @@ def dump_large_tool_result(
     if n <= 12:
         how = "the parts in order: " + ", ".join(repr(p) for p in part_names)
     else:
-        how = (f"{n} parts, {part_names[0]!r} through {part_names[-1]!r} "
-               f"(part k is '{base}-<k>.log', zero-padded to {width} digits)")
+        how = (
+            f"{n} parts, {part_names[0]!r} through {part_names[-1]!r} "
+            f"(part k is '{base}-<k>.log', zero-padded to {width} digits)"
+        )
     pointer = (
         f"[tool output dumped: {total_kb}KB from {tool_name!r}, too large to "
         f"inline; split into {how}. Call `read_file` on each part in order and "

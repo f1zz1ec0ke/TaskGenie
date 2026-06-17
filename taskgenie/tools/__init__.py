@@ -2,6 +2,7 @@
 
 MCP tools are added at runtime by taskgenie.mcp_client.
 """
+
 from __future__ import annotations
 
 # Importing these modules registers their tools with REGISTRY as a side effect.

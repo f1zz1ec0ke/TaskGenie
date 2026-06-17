@@ -4,6 +4,7 @@ Runs as a background asyncio task; one JSON object per line. Used both for
 post-hoc debugging and as the source for the deterministic stats panel
 shown after a run completes.
 """
+
 from __future__ import annotations
 
 import asyncio

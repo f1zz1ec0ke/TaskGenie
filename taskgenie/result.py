@@ -45,7 +45,10 @@ class RunResult:
                 "context": self.context,
             }
         elif self.kind == "exhausted":
-            payload = {"status": "exhausted", "error": self.error or "turn limit reached"}
+            payload = {
+                "status": "exhausted",
+                "error": self.error or "turn limit reached",
+            }
         else:
             payload = {"status": "error", "error": self.error}
         if self.follow_ups:
@@ -55,8 +58,7 @@ class RunResult:
         # archivist at all; padding their payload with zeros would just
         # be noise in the parent's tool reply.
         if self.compaction_stats and any(
-            self.compaction_stats.get(k, 0)
-            for k in ("count", "skipped", "failed")
+            self.compaction_stats.get(k, 0) for k in ("count", "skipped", "failed")
         ):
             payload["compaction"] = _compact_telemetry(self.compaction_stats)
         return payload

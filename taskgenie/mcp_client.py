@@ -4,10 +4,12 @@ Lives for the duration of a TaskGenie run. Owns an AsyncExitStack that holds
 each server's stdio + ClientSession contexts; closing the client cleanly
 shuts every subprocess down.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -18,6 +20,8 @@ from mcp.client.stdio import stdio_client
 
 from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
+
+logger = logging.getLogger(__name__)
 
 
 class MCPClient:
@@ -58,7 +62,9 @@ class MCPClient:
                 continue
             try:
                 await self._connect_server(name, spec)
+                logger.info(f"Connected to MCP server: {name}")
             except Exception as e:
+                logger.error(f"MCP server {name} failed: {e}")
                 self._connect_errors[name] = f"{type(e).__name__}: {e}"
 
     async def _connect_server(self, name: str, spec: dict[str, Any]) -> None:
@@ -92,9 +98,7 @@ class MCPClient:
                     "name conflict even after prefixing"
                 )
                 prior = self._connect_errors.get(server_name)
-                self._connect_errors[server_name] = (
-                    f"{prior}; {msg}" if prior else msg
-                )
+                self._connect_errors[server_name] = f"{prior}; {msg}" if prior else msg
                 return
 
         schema = {
@@ -165,7 +169,6 @@ class MCPClient:
             # of the Rich console so it doesn't get swallowed by an alt-screen
             # TUI that's already torn down.
             print(
-                f"[mcp_client] cleanup error in close(): "
-                f"{type(e).__name__}: {e}",
+                f"[mcp_client] cleanup error in close(): {type(e).__name__}: {e}",
                 file=sys.stderr,
             )

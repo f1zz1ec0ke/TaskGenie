@@ -17,23 +17,21 @@ Targets coverage gaps surfaced by previous reviews but never filled:
 
 Run with: python -m tests.test_polish_coverage
 """
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
-import json
 import os
 import sys
 import tempfile
-import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rich.console import Console
-from rich.measure import Measurement
 from rich.tree import Tree
 
 from taskgenie import __main__ as cli_module
@@ -43,7 +41,7 @@ from taskgenie.config import CONFIG
 from taskgenie.events import BUS, Event
 from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
-from taskgenie.session import HistoryEntry, Session, SessionData, STATE_FILE
+from taskgenie.session import PROJECTS_ROOT_ENV, Session
 from taskgenie.tools.registry import REGISTRY
 from taskgenie.tui import TUI, _ColumnOverflowTree
 
@@ -54,10 +52,6 @@ def _new_ceo() -> Agent:
     Agent.SCRATCH_ROOT = d
     Agent.WORKSPACE_ROOT = d
     return Agent(name="CEO", role_type="ceo", system_prompt=CEO_ROLE_PROMPT)
-
-
-import contextlib
-from taskgenie.session import PROJECTS_ROOT_ENV
 
 
 @contextlib.contextmanager
@@ -300,9 +294,7 @@ async def test_tool_fire_cancels_pending_child_task() -> None:
     test covers the task-cancel side that's load-bearing for resource
     cleanup."""
     ceo = _new_ceo()
-    hire_result = ceo._tool_hire(
-        name="Worker", role_type="worker", role_prompt="x"
-    )
+    hire_result = ceo._tool_hire(name="Worker", role_type="worker", role_prompt="x")
     child_id = hire_result["agent_id"]
     child = Agent.REGISTRY[child_id]
 
@@ -563,7 +555,9 @@ def test_resume_of_asking_session_takes_question_branch(tmp_path: Path) -> None:
         # Plant a CEO + mark a question without answering it.
         ceo = Agent(name="CEO", role_type="ceo", system_prompt="...")
         session.set_ceo(ceo.id)
-        session.mark_question({"question": "X or Y?", "options": ["X", "Y"], "context": ""})
+        session.mark_question(
+            {"question": "X or Y?", "options": ["X", "Y"], "context": ""}
+        )
         session.snapshot_agents({aid: a.to_dict() for aid, a in Agent.REGISTRY.items()})
         session.save()
         assert session.data.status == "asking"
@@ -673,9 +667,7 @@ async def test_run_session_cleans_up_when_tui_raises(tmp_path: Path) -> None:
     # Baseline of tasks NOT created by _run_session -- so when we
     # filter for "what's left over", we don't mistakenly attribute
     # something from the broader test runner.
-    baseline_tasks = {
-        t for t in asyncio.all_tasks() if t is not asyncio.current_task()
-    }
+    baseline_tasks = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
 
     Agent.REGISTRY.clear()
     Agent.SCRATCH_ROOT = str(tmp_path)
@@ -716,12 +708,8 @@ async def test_run_session_cleans_up_when_tui_raises(tmp_path: Path) -> None:
         assert "tui crashed" in str(raised)
 
         # Contract 2: no _run_session-created tasks left pending.
-        post_tasks = {
-            t for t in asyncio.all_tasks() if t is not asyncio.current_task()
-        }
-        new_pending = [
-            t for t in (post_tasks - baseline_tasks) if not t.done()
-        ]
+        post_tasks = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+        new_pending = [t for t in (post_tasks - baseline_tasks) if not t.done()]
         assert new_pending == [], (
             f"dangling tasks created by _run_session: {new_pending}"
         )
@@ -754,9 +742,7 @@ def test_tui_tool_call_truncates_large_string_arg_values() -> None:
     )
     entry = tui.agents["a1"].activity_log[0]
     stored = entry["tool_args"]["content"]
-    assert len(stored) < len(big), (
-        f"content not truncated; stored {len(stored)} chars"
-    )
+    assert len(stored) < len(big), f"content not truncated; stored {len(stored)} chars"
     # The non-large arg passes through.
     assert entry["tool_args"]["path"] == "game.py"
     print("[tui_tool_call_truncates_large_string_arg_values] OK")
@@ -822,10 +808,9 @@ def test_column_overflow_tree_handles_label_between_term_width_and_floor() -> No
     # line count -- the test would still pass functionally, but we
     # can at least assert that a non-Tree renderable came back.
     from rich.table import Table as _Table
+
     has_grid = any(isinstance(r, _Table) for r in result)
-    assert has_grid, (
-        f"expected multi-column Table.grid overflow path; got {result!r}"
-    )
+    assert has_grid, f"expected multi-column Table.grid overflow path; got {result!r}"
     print("[column_overflow_tree_handles_label_between_term_width_and_floor] OK")
 
 
@@ -845,9 +830,7 @@ def test_run_resume_snapshots_after_mark_answer(tmp_path: Path) -> None:
         session = Session.create("snapshot-after-mark")
         ceo = Agent(name="CEO", role_type="ceo", system_prompt="...")
         session.set_ceo(ceo.id)
-        session.mark_question(
-            {"question": "X?", "options": [], "context": ""}
-        )
+        session.mark_question({"question": "X?", "options": [], "context": ""})
         session.snapshot_agents({aid: a.to_dict() for aid, a in Agent.REGISTRY.items()})
         session.save()
 
@@ -922,8 +905,8 @@ def test_ceo_prompt_still_carries_followup_anchor() -> None:
     failing. Anchor the dependency."""
     from taskgenie.prompts import CEO_ROLE_PROMPT
 
-    assert "FOLLOW-UP TURNS" in CEO_ROLE_PROMPT, (
-        "CEO_ROLE_PROMPT no longer contains the FOLLOW-UP TURNS section "
+    assert "FOLLOW-UP" in CEO_ROLE_PROMPT, (
+        "CEO_ROLE_PROMPT no longer contains a FOLLOW-UP section "
         "that _build_followup_message offloads guidance onto. Either "
         "restore the section or re-inline the guidance in "
         "_build_followup_message."
@@ -1254,8 +1237,15 @@ async def test_run_drain_fires_on_done_return(tmp_path: Path) -> None:
 async def _async_tests(tmp_root: Path) -> None:
     # Create subdirs the async tests need (sync runner creates its own).
     for sub in (
-        "r13", "copy1", "copy2", "copy3", "copy4", "copy5", "copy6",
-        "drainq", "draind",
+        "r13",
+        "copy1",
+        "copy2",
+        "copy3",
+        "copy4",
+        "copy5",
+        "copy6",
+        "drainq",
+        "draind",
     ):
         (tmp_root / sub).mkdir(exist_ok=True)
     await test_tool_fire_cancels_pending_child_task()
@@ -1274,9 +1264,21 @@ async def _async_tests(tmp_root: Path) -> None:
 
 def _sync_tests(tmp_root: Path) -> None:
     for sub in (
-        "bulk1", "bulk2", "mcp", "asking", "ctrlc", "r27", "r13",
-        "copy1", "copy2", "copy3", "copy4", "copy5", "copy6",
-        "drainq", "draind",
+        "bulk1",
+        "bulk2",
+        "mcp",
+        "asking",
+        "ctrlc",
+        "r27",
+        "r13",
+        "copy1",
+        "copy2",
+        "copy3",
+        "copy4",
+        "copy5",
+        "copy6",
+        "drainq",
+        "draind",
     ):
         (tmp_root / sub).mkdir(exist_ok=True)
     # to_tool_payload

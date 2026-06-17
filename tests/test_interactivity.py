@@ -6,6 +6,7 @@
 
 Run with: python -m tests.test_interactivity
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +27,6 @@ from taskgenie.agent import Agent
 from taskgenie.artifacts import write_final
 from taskgenie.config import CONFIG
 from taskgenie.prompts import CEO_ROLE_PROMPT
-from taskgenie.result import RunResult
 from taskgenie.session import Session, PROJECTS_ROOT_ENV
 
 from tests.test_loop import ScriptedLLM, tc
@@ -101,6 +101,17 @@ async def test_ask_user_round_trip(tmp_path: Path) -> None:
 
     cli_module._read_answer_input = fake_read_answer  # type: ignore[assignment]
 
+    # After the CEO completes, _drive_session drops into the follow-up
+    # loop and prompts for the next task on stdin. Simulate the user
+    # ending the session (EOF/None) so it returns rc=0 instead of
+    # blocking on a captured stdin under pytest.
+    real_read_followup = cli_module._read_followup_input
+
+    def fake_read_followup(_console):
+        return None
+
+    cli_module._read_followup_input = fake_read_followup  # type: ignore[assignment]
+
     # Stub MCP client + logger to no-ops.
     class _NoopMCP:
         registered_tools: list[str] = []
@@ -126,6 +137,7 @@ async def test_ask_user_round_trip(tmp_path: Path) -> None:
         )
     finally:
         cli_module._read_answer_input = real_read_answer  # type: ignore[assignment]
+        cli_module._read_followup_input = real_read_followup  # type: ignore[assignment]
 
     assert rc == 0
     # Session ends marked done.

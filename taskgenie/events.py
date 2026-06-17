@@ -39,24 +39,77 @@ class Event:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+DEFAULT_QUEUE_MAXSIZE: int = 10_000
+
+
+class _BoundedSubscription:
+    """Internal wrapper pairing a bounded queue with a drop counter."""
+
+    __slots__ = ("queue", "dropped")
+
+    def __init__(self, maxsize: int) -> None:
+        self.queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=maxsize)
+        self.dropped: int = 0
+
+
 class EventBus:
     def __init__(self) -> None:
-        self._subscribers: list[asyncio.Queue[Event]] = []
+        self._subscribers: list[_BoundedSubscription] = []
 
-    def subscribe(self) -> asyncio.Queue[Event]:
-        q: asyncio.Queue[Event] = asyncio.Queue()
-        self._subscribers.append(q)
-        return q
+    # -- public API ----------------------------------------------------------
+
+    def subscribe(self, maxsize: int = DEFAULT_QUEUE_MAXSIZE) -> asyncio.Queue[Event]:
+        """Create a bounded subscription and return its queue.
+
+        *maxsize* controls the upper bound on queued events (default
+        :data:`DEFAULT_QUEUE_MAXSIZE`).  When a slow consumer lets the
+        queue fill up, the oldest event is silently dropped so that
+        publishers are never blocked.
+        """
+        sub = _BoundedSubscription(maxsize)
+        self._subscribers.append(sub)
+        return sub.queue
 
     def unsubscribe(self, q: asyncio.Queue[Event]) -> None:
-        try:
-            self._subscribers.remove(q)
-        except ValueError:
-            pass
+        for i, sub in enumerate(self._subscribers):
+            if sub.queue is q:
+                del self._subscribers[i]
+                return
 
     def publish(self, event: Event) -> None:
-        for q in self._subscribers:
-            q.put_nowait(event)
+        for sub in self._subscribers:
+            try:
+                sub.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Drop the oldest event to make room.
+                try:
+                    sub.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass  # theoretically impossible, but be safe
+                sub.dropped += 1
+                try:
+                    sub.queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    # Should not happen after a successful get_nowait,
+                    # but guard against unlikely races.
+                    sub.dropped += 1
+
+    # -- diagnostics ---------------------------------------------------------
+
+    @property
+    def subscriber_count(self) -> int:
+        """Number of active subscribers."""
+        return len(self._subscribers)
+
+    def dropped_count(self, q: asyncio.Queue[Event]) -> int:
+        """Return the number of events dropped for *q* due to overflow.
+
+        Returns ``0`` if *q* is not (or no longer) a subscriber.
+        """
+        for sub in self._subscribers:
+            if sub.queue is q:
+                return sub.dropped
+        return 0
 
 
 BUS = EventBus()

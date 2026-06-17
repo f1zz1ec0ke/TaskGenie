@@ -15,6 +15,7 @@ B6. Malformed tool JSON arguments don't crash; agent recovers and
 
 Run with: python -m tests.test_review_prb
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -350,9 +351,7 @@ def test_hire_below_max_depth_succeeds() -> None:
         Agent.WORKSPACE_ROOT = d
         ceo = Agent(name="CEO", role_type="ceo", system_prompt="...")
         assert ceo.depth == 0
-        result = ceo._tool_hire(
-            name="Mgr", role_type="manager", role_prompt="..."
-        )
+        result = ceo._tool_hire(name="Mgr", role_type="manager", role_prompt="...")
         # _tool_hire returns a dict with "agent_id" on success.
         assert isinstance(result, dict)
         assert "error" not in result, result
@@ -374,7 +373,8 @@ async def test_malformed_tool_args_does_not_crash() -> None:
     assert result.kind == "done", result
     # Find the [tool_args_error] message in history.
     err_msgs = [
-        m for m in ceo.messages
+        m
+        for m in ceo.messages
         if m.get("role") == "tool" and "[tool_args_error]" in m.get("content", "")
     ]
     assert len(err_msgs) == 1, f"expected one tool_args_error, got {err_msgs}"

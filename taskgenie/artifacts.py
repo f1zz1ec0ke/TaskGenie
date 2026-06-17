@@ -9,13 +9,13 @@ session directory:
 Plus an optional --output PATH copy in a user-chosen location, with the
 format inferred from the file extension.
 """
+
 from __future__ import annotations
 
 import datetime as _dt
 import html as _htmllib
 import json
 import shutil
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 

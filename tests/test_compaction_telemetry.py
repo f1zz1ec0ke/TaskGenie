@@ -7,6 +7,7 @@ count is a useful "task was too big, split it next time" signal.
 
 Run with: python -m tests.test_compaction_telemetry
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from taskgenie import agent as agent_module
 from taskgenie.agent import Agent
 from taskgenie.archivist import CompactionSkipped, CompactionTransientFailure
-from taskgenie.prompts import CEO_ROLE_PROMPT
 from taskgenie.result import RunResult
 
 
@@ -249,9 +249,14 @@ def test_payload_blocked_includes_compaction() -> None:
         kind="blocked",
         reason="stuck",
         needs="help",
-        compaction_stats={"count": 2, "skipped": 0, "failed": 0,
-                          "messages_compacted": 30, "tokens_saved": 8000,
-                          "duration_ms": 2000.0},
+        compaction_stats={
+            "count": 2,
+            "skipped": 0,
+            "failed": 0,
+            "messages_compacted": 30,
+            "tokens_saved": 8000,
+            "duration_ms": 2000.0,
+        },
     )
     payload = r.to_tool_payload()
     assert payload["status"] == "blocked"
@@ -279,6 +284,7 @@ class _OneCompactionLLM:
     async def chat(self, messages, tools=None, **_kwargs):
         self.turn += 1
         import json
+
         return {
             "content": "wrapping up",
             "tool_calls": [

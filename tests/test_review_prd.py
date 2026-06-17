@@ -21,6 +21,7 @@ D4. Agent integration:
 
 Run with: python -m tests.test_review_prd
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +41,6 @@ from taskgenie.context import (
     dump_large_tool_result,
     should_compact,
 )
-from taskgenie.prompts import CEO_ROLE_PROMPT
 
 
 def _tc(call_id: str, tool_name: str, **args):
@@ -119,46 +119,54 @@ def test_dump_below_threshold_is_noop(tmp_path: Path) -> None:
 
 
 def test_dump_above_threshold_writes_file(tmp_path: Path) -> None:
-    """Large result: dumped to scratch, in-memory content becomes a pointer."""
+    """Large result: dumped to scratch (in one or more chunks), in-memory
+    content becomes a pointer."""
     big = "X" * 8000
-    content, path = dump_large_tool_result(
+    # chunk_margin=0 so chunk_size == threshold (4096); avoids the degenerate
+    # 1-byte-per-chunk case that the default 4096 margin produces when the
+    # threshold is itself <= the margin.
+    content, paths = dump_large_tool_result(
         big,
         scratch_dir=str(tmp_path),
         turn_idx=14,
         call_id="call_xyz",
         tool_name="exec_code",
         threshold_bytes=4096,
+        chunk_margin=0,
     )
-    assert path is not None
-    # The pointer mentions the tool and gives the filename to read_file.
+    assert paths is not None
+    # The pointer mentions the tool and tells the agent to read_file.
     assert "tool output dumped" in content
     assert "exec_code" in content
     assert "read_file" in content
-    # The on-disk file has the full content verbatim.
-    written = Path(path).read_text(encoding="utf-8")
-    assert written == big
-    # And the filename in the pointer matches what's on disk.
-    assert Path(path).name in content
+    # The on-disk chunks concatenate back to the full content verbatim.
+    reconstructed = "".join(Path(p).read_text(encoding="utf-8") for p in paths)
+    assert reconstructed == big
+    # Each chunk filename is named in the pointer so the agent can fetch them.
+    for p in paths:
+        assert Path(p).name in content
     print("[dump_above_threshold_writes_file] OK")
 
 
 def test_dump_sanitises_filename(tmp_path: Path) -> None:
     """call_id with weird chars must not poison the filename."""
     big = "Y" * 8000
-    _, path = dump_large_tool_result(
+    _, paths = dump_large_tool_result(
         big,
         scratch_dir=str(tmp_path),
         turn_idx=0,
         call_id="../escape; rm -rf /",
         tool_name="evil/tool/name",
         threshold_bytes=4096,
+        chunk_margin=0,
     )
-    assert path is not None
-    assert ".." not in Path(path).name
-    assert "/" not in Path(path).name
-    assert ";" not in Path(path).name
-    # File still landed inside scratch dir.
-    assert tmp_path in Path(path).parents
+    assert paths is not None
+    for path in paths:
+        assert ".." not in Path(path).name
+        assert "/" not in Path(path).name
+        assert ";" not in Path(path).name
+        # Every chunk still landed inside the scratch dir.
+        assert tmp_path in Path(path).parents
     print("[dump_sanitises_filename] OK")
 
 
@@ -205,7 +213,9 @@ async def test_archivist_compacts_middle_messages() -> None:
     original_llm = archivist_module.LLM
     archivist_module.LLM = fake
     try:
-        new_msgs = await archivist_module.compact_messages("Worker", msgs, keep_recent=6)
+        new_msgs = await archivist_module.compact_messages(
+            "Worker", msgs, keep_recent=6
+        )
     finally:
         archivist_module.LLM = original_llm
 
@@ -234,10 +244,7 @@ async def test_archivist_falls_back_on_llm_failure() -> None:
     msgs = [
         {"role": "system", "content": "..."},
         {"role": "user", "content": "task"},
-        *[
-            {"role": "assistant", "content": f"step {i}"}
-            for i in range(10)
-        ],
+        *[{"role": "assistant", "content": f"step {i}"} for i in range(10)],
     ]
     original_llm = archivist_module.LLM
     archivist_module.LLM = _FailingLLM()
@@ -358,16 +365,17 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
     }
 
     async def dispatcher(agent, args):
-        return "Z" * 8192
+        return "Z" * 40000
 
-    REGISTRY.register(
-        big_schema, kind="work", version="1.0", dispatcher=dispatcher
-    )
-    # Drive the threshold from below the 8KB fake output so this test
-    # stays independent of CONFIG.dump_tool_output_above_bytes's default.
+    REGISTRY.register(big_schema, kind="work", version="1.0", dispatcher=dispatcher)
+    # Drive the threshold below the 40KB fake output so this test stays
+    # independent of CONFIG.dump_tool_output_above_bytes's default. Keep it
+    # above the agent's default 4096 chunk_margin so chunks are a sane size
+    # (threshold - margin) rather than collapsing to one byte each.
     original_dump_threshold = CONFIG.dump_tool_output_above_bytes
-    object.__setattr__(CONFIG, "dump_tool_output_above_bytes", 4096)
+    object.__setattr__(CONFIG, "dump_tool_output_above_bytes", 8192)
     try:
+
         class _LLM:
             _n = 0
 
@@ -396,19 +404,24 @@ async def test_large_tool_result_dumped_to_scratch(tmp_path: Path) -> None:
         assert result.kind == "done", result
         # Find the tool message for c1.
         tool_msgs = [
-            m for m in worker.messages
+            m
+            for m in worker.messages
             if m.get("role") == "tool" and m.get("tool_call_id") == "c1"
         ]
         assert len(tool_msgs) == 1
         content = tool_msgs[0]["content"]
         # Must be the pointer, not the 8KB blob.
-        assert len(content) < 1000, f"in-memory tool content not dumped: {len(content)} bytes"
+        assert len(content) < 1000, (
+            f"in-memory tool content not dumped: {len(content)} bytes"
+        )
         assert "tool output dumped" in content
         assert "read_file" in content
-        # And the 8KB really is on disk somewhere in scratch.
-        scratch_files = list(Path(worker.scratch_dir).glob("tool-*.log"))
+        # And the 40KB really is on disk in scratch, split across chunks
+        # that concatenate (in filename order) back to the original.
+        scratch_files = sorted(Path(worker.scratch_dir).glob("tool-*.log"))
         assert scratch_files, "no dumped log file in scratch"
-        assert scratch_files[0].read_text(encoding="utf-8") == "Z" * 8192
+        reconstructed = "".join(f.read_text(encoding="utf-8") for f in scratch_files)
+        assert reconstructed == "Z" * 40000
     finally:
         REGISTRY.unregister("_fake_huge_tool")
         object.__setattr__(

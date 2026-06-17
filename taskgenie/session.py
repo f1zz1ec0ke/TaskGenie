@@ -11,10 +11,12 @@ Two on-disk locations per session:
                                     the CEO's report. This is what the user
                                     opens after the run.
 """
+
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,6 +27,8 @@ from typing import Any
 
 from taskgenie.config import CONFIG
 from taskgenie.tools.registry import REGISTRY
+
+logger = logging.getLogger(__name__)
 
 STATE_FILE = "state.json"
 EVENTS_FILE = "events.jsonl"
@@ -67,7 +71,9 @@ def _unique_project_dir(name: str) -> Path:
 @dataclass
 class HistoryEntry:
     kind: str  # "task" | "blocker" | "unblock" | "done" | "abandoned"
-    ts: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
+    ts: str = field(
+        default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds")
+    )
     text: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
 
@@ -94,6 +100,9 @@ class Session:
 
     def __init__(self, data: SessionData) -> None:
         self.data = data
+        # Populated by load() when state.json carries fields this version
+        # doesn't know about; surfaced for diagnostics.
+        self._unknown_fields_on_load: list[str] = []
 
     @property
     def session_id(self) -> str:
@@ -135,6 +144,7 @@ class Session:
 
     @classmethod
     def create(cls, task: str, project: str | None = None) -> "Session":
+        """Create a new session with a unique ID derived from the task text."""
         session_id = make_session_id(task)
         now = _dt.datetime.now().isoformat(timespec="seconds")
         slug = project or _project_slug(task)
@@ -157,6 +167,7 @@ class Session:
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
+        """Load a session from disk. Raises FileNotFoundError or ValueError on bad state."""
         path = CONFIG.sessions_dir / session_id / STATE_FILE
         if not path.exists():
             raise FileNotFoundError(f"no session: {session_id}")
@@ -167,9 +178,7 @@ class Session:
                 f"Session {session_id} has a corrupt state.json: {e}"
             ) from e
         if not isinstance(raw, dict):
-            raise ValueError(
-                f"Session {session_id} state.json is not a JSON object"
-            )
+            raise ValueError(f"Session {session_id} state.json is not a JSON object")
         # Filter to fields the dataclass actually knows about so a state.json
         # written by a newer version (with extra fields) still loads on an
         # older binary. Missing fields fall back to dataclass defaults.
@@ -185,6 +194,7 @@ class Session:
         session = cls(data)
         if unknown:
             session._unknown_fields_on_load = unknown
+        logger.info(f"Session {session.session_id} loaded ({len(data.agents)} agents)")
         return session
 
     @classmethod
@@ -208,6 +218,13 @@ class Session:
                 d = json.loads(state.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
+            agents_dict = d.get("agents", {})
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            for agent_data in agents_dict.values():
+                if isinstance(agent_data, dict):
+                    total_prompt_tokens += agent_data.get("prompt_tokens", 0)
+                    total_completion_tokens += agent_data.get("completion_tokens", 0)
             rows.append(
                 {
                     "session_id": d.get("session_id", sub.name),
@@ -215,12 +232,17 @@ class Session:
                     "started_at": d.get("started_at", ""),
                     "last_saved_at": d.get("last_saved_at", ""),
                     "status": d.get("status", "?"),
+                    "agent_count": len(agents_dict),
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens,
                 }
             )
         rows.sort(key=lambda r: r["last_saved_at"], reverse=True)
         return rows
 
     def save(self) -> None:
+        logger.debug(f"Saving session {self.session_id}")
         self.data.last_saved_at = _dt.datetime.now().isoformat(timespec="seconds")
         self.data.tool_signature = {
             "management": REGISTRY.signature("management"),
@@ -254,7 +276,9 @@ class Session:
                 delete=False,
                 encoding="utf-8",
             ) as tmp:
-                tmp_path = tmp.name  # CAPTURE FIRST so finally can clean up on any subsequent failure
+                tmp_path = (
+                    tmp.name
+                )  # CAPTURE FIRST so finally can clean up on any subsequent failure
                 json.dump(asdict(self.data), tmp, indent=2, default=str)
                 tmp.flush()
                 os.fsync(tmp.fileno())
@@ -344,9 +368,7 @@ class Session:
         saved_work = self.data.tool_signature.get("work")
         saved_ceo = self.data.tool_signature.get("ceo")
 
-        def diff(
-            saved: dict[str, str] | None, current: dict[str, str]
-        ) -> list[str]:
+        def diff(saved: dict[str, str] | None, current: dict[str, str]) -> list[str]:
             if saved is None:
                 return []  # bucket wasn't recorded; can't diff meaningfully
             lines: list[str] = []

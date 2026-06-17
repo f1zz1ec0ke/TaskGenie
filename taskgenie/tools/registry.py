@@ -24,9 +24,7 @@ def _schema_hash(schema: dict[str, Any]) -> str:
     return hashlib.sha256(serial.encode()).hexdigest()[:12]
 
 
-def _annotate(
-    schema: dict[str, Any], version: str, source: str
-) -> dict[str, Any]:
+def _annotate(schema: dict[str, Any], version: str, source: str) -> dict[str, Any]:
     out = copy.deepcopy(schema)
     fn = out.setdefault("function", {})
     fn["version"] = version
